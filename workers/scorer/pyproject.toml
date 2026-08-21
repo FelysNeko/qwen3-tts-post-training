@@ -1,0 +1,14 @@
+[project]
+name = "q3tts-worker-scorer"
+version = "0.1.0"
+description = "Unified scoring worker: SV (ERes2NetV2/CAM++) + MOS (UTMOSv2) + WER (Qwen3-ASR), one process, one CUDA context (cuda:0)"
+requires-python = ">=3.12"
+dependencies = [
+    "transformers>=5.15",
+    "timm",
+    "librosa",
+    "qwen3-tts-post-training",
+]
+
+[tool.uv.sources]
+qwen3-tts-post-training = { path = "../..", editable = true }

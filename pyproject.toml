@@ -1,10 +1,10 @@
 [project]
 name = "qwen3-tts-post-training"
 version = "0.1.0"
-description = "Add your description here"
+description = "GRPO post-training pipeline for Qwen3-TTS CustomVoice (Cyrene)"
 readme = "README.md"
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "FelysNeko" }
 ]
 requires-python = ">=3.12"
 dependencies = [
@@ -12,9 +12,6 @@ dependencies = [
     "torchvision==0.23.0",
     "torchaudio==2.8.0",
 ]
-
-[project.scripts]
-qwen3-tts-post-training = "qwen3_tts_post_training:main"
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

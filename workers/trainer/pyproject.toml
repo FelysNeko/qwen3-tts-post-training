@@ -1,0 +1,13 @@
+[project]
+name = "q3tts-worker-trainer"
+version = "0.1.0"
+description = "GRPO trainer worker: rollout + training loop on cuda:1; imports core lib (reward/train/rollout) from the root package"
+requires-python = ">=3.12"
+dependencies = [
+    "qwen-tts==0.1.1",
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
+    "qwen3-tts-post-training",
+]
+
+[tool.uv.sources]
+qwen3-tts-post-training = { path = "../..", editable = true }
