@@ -71,9 +71,7 @@ def normalize(s: str) -> str:
     s = NUM_RE.sub(canon_numeral, s)
     out = []
     for c in s:
-        if c.isascii() and c.isalnum():
-            out.append(c)
-        elif "\u4e00" <= c <= "\u9fff":
+        if (c.isascii() and c.isalnum()) or "\u4e00" <= c <= "\u9fff":
             out.append(c)
     return "".join(out)
 

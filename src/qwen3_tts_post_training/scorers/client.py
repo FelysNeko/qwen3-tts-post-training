@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Self
 
 from .protocol import ScoreItem, ScorerError, make_ping, make_request, parse_response
 
@@ -105,11 +106,11 @@ class ScorerClient:
             if self._proc.stdin:
                 self._proc.stdin.close()
             self._proc.wait(timeout=30)
-        except Exception:
+        except Exception:  # noqa: BLE001 — cleanup must kill on any failure
             self._proc.kill()
         self._proc = None
 
-    def __enter__(self) -> "ScorerClient":
+    def __enter__(self) -> Self:
         self.start()
         return self
 
