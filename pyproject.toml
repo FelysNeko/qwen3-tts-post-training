@@ -31,3 +31,8 @@ build-backend = "uv_build"
 dev = [
     "ruff>=0.16.4",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# vendored 3D-Speaker model defs (verbatim upstream — kept byte-faithful so the
+# SV ckpts load bit-identically; do not "fix" style here)
+"workers/scorer/src/scorer/speakerlab/**" = ["ALL"]

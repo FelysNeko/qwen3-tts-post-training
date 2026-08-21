@@ -112,7 +112,7 @@ def handle_score(scorers: Scorers, items: list[dict]) -> dict:
             info = sf.info(it["wav"])
             results[i]["dur"] = info.frames / info.samplerate
             ok_idx.append(i)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error containment
             results[i]["error"] = f"wav unreadable: {e}"
     if not ok_idx:
         return {"results": results, "timing": {}}
@@ -124,21 +124,21 @@ def handle_score(scorers: Scorers, items: list[dict]) -> dict:
             results[i]["sim"] = scorers.sv.score(items[i]["wav"], "eres2netv2")
             if scorers.args.sv_ref_camp:
                 results[i]["sim_camp"] = scorers.sv.score(items[i]["wav"], "campplus")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error containment
             results[i]["error"] = f"sv: {e}"
     t_sv = time.time() - t0
 
     # ASR (batched)
     t0 = time.time()
     try:
-        idx = [i for i in ok_idx]
+        idx = ok_idx
         got = scorers.asr.score(
             [items[i]["wav"] for i in idx], [items[i].get("text") for i in idx]
         )
         for i, g in zip(idx, got):
             results[i]["transcript"] = g["transcript"]
             results[i]["cer"] = g["cer"]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — keep worker alive per scorer
         for i in ok_idx:
             results[i]["error"] = (results[i]["error"] or "") + f"asr: {e}"
     t_asr = time.time() - t0
@@ -149,7 +149,7 @@ def handle_score(scorers: Scorers, items: list[dict]) -> dict:
         scores = scorers.mos.score([items[i]["wav"] for i in ok_idx])
         for i, m in zip(ok_idx, scores):
             results[i]["mos"] = m
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — keep worker alive per scorer
         for i in ok_idx:
             results[i]["error"] = (results[i]["error"] or "") + f"mos: {e}"
     t_mos = time.time() - t0
@@ -211,7 +211,7 @@ def main() -> None:
                 send({"id": rid, "ok": True, **out})
             else:
                 send({"id": rid, "ok": False, "error": f"unknown op {op!r}"})
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — per-item error containment
             log(f"[scorer] req {rid} FATAL: {e!r}")
             send({"id": rid, "ok": False, "error": repr(e)})
     log("[scorer] stdin closed, exiting")

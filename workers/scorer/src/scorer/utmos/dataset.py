@@ -19,7 +19,7 @@ def load_audio(sr_target: int, file) -> np.ndarray:
     try:
         y, sr = librosa.load(file, sr=None)
         y = librosa.resample(y, orig_sr=sr, target_sr=sr_target)
-    except Exception:
+    except Exception:  # noqa: BLE001 — audio loader fallback (npy / odd files)
         y = np.load(file)
     return y
 

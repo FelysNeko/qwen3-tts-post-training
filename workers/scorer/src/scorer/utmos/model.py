@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, cast
 
 import timm
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from transformers import AutoFeatureExtractor, AutoModel
 
 from scorer.utmos.config import DATASET_MAP

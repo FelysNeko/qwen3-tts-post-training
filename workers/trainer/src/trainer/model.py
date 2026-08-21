@@ -110,6 +110,3 @@ class TrainerModel:
     @property
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         return [p for p in self.model.parameters() if p.requires_grad]
-
-    def trainable_count(self) -> int:
-        return sum(p.numel() for p in self.trainable_parameters)

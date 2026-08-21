@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-import torchaudio.functional as AF
 import torchaudio.compliance.kaldi as Kaldi
+import torchaudio.functional as AF
 
 TARGET_SR = 16000
 

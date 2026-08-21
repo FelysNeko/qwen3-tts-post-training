@@ -22,13 +22,7 @@ import torch
 
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 from qwen3_tts_post_training.scorers.client import ScoreItem, ScorerClient
-from qwen3_tts_post_training.train.grpo import (
-    GRPOConfig as GRPOAlgoConfig,
-)
-from qwen3_tts_post_training.train.grpo import (
-    grpo_loss,
-    needs_resample,
-)
+from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
 from trainer.decoder import Decoder
 from trainer.logprob import LogProbComputer
 from trainer.model import TrainerModel
@@ -77,9 +71,6 @@ class TrainConfig:
     out_dir: str = "runs/grpo_v1"
     ckpt_every: int = 1
     resume: bool = False
-
-    # logging knobs
-    log_every: int = 1
     monitor: bool = True
 
 
@@ -188,9 +179,9 @@ def _train_loop(
 
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    monitor_f = (out / "monitor.jsonl").open("a")
+    monitor_f = (out / "monitor.jsonl").open("a") if cfg.monitor else None
 
-    algo = GRPOAlgoConfig(variant=cfg.variant, kl_beta=cfg.kl_beta)
+    algo = GRPOConfig(variant=cfg.variant, kl_beta=cfg.kl_beta)
     reward_cfg = RewardConfig()
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
 
@@ -269,11 +260,12 @@ def _train_loop(
         }
         line = json.dumps(monitor, ensure_ascii=False)
         print(line)
-        if cfg.monitor:
+        if monitor_f is not None:
             monitor_f.write(line + "\n")
             monitor_f.flush()
 
         if (step + 1) % cfg.ckpt_every == 0:
             _save_ckpt(cfg, ttm, optimizer, step)
 
-    monitor_f.close()
+    if monitor_f is not None:
+        monitor_f.close()
