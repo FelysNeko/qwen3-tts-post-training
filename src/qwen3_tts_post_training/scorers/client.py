@@ -47,6 +47,11 @@ class ScorerClient:
         device: str = "cuda:0",
         timeout_s: float = 600.0,
     ):
+        sv_dir = DEFAULTS["sv_dir"] if sv_dir is None else Path(sv_dir)
+        sv_ref = DEFAULTS["sv_ref"] if sv_ref is None else Path(sv_ref)
+        sv_ref_camp = (
+            DEFAULTS["sv_ref_camp"] if sv_ref_camp is None else Path(sv_ref_camp)
+        )
         self.worker_dir = repo_root() / "workers" / "scorer"
         self.worker_py = self.worker_dir / ".venv" / "bin" / "python"
         self.serve_py = self.worker_dir / "main.py"

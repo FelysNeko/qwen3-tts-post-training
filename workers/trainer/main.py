@@ -1,0 +1,71 @@
+"""Thin CLI launcher for the GRPO loop (Phase 4)."""
+
+from __future__ import annotations
+
+import argparse
+
+from trainer.loop import TrainConfig, run_grpo
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="GRPO trainer worker")
+    p.add_argument("--model-path", default=TrainConfig.model_path)
+    p.add_argument("--device", default=TrainConfig.device)
+    p.add_argument("--dtype", default=TrainConfig.dtype)
+    p.add_argument("--lora-r", type=int, default=TrainConfig.lora_r)
+    p.add_argument("--lora-alpha", type=float, default=TrainConfig.lora_alpha)
+    p.add_argument("--group-size", type=int, default=TrainConfig.group_size)
+    p.add_argument("--num-steps", type=int, default=TrainConfig.num_steps)
+    p.add_argument("--seed", type=int, default=TrainConfig.seed)
+    p.add_argument("--max-new-tokens", type=int, default=TrainConfig.max_new_tokens)
+    p.add_argument("--temperature", type=float, default=TrainConfig.temperature)
+    p.add_argument("--top-k", type=int, default=TrainConfig.top_k)
+    p.add_argument("--top-p", type=float, default=TrainConfig.top_p)
+    p.add_argument(
+        "--repetition-penalty", type=float, default=TrainConfig.repetition_penalty
+    )
+    p.add_argument(
+        "--variant", default=TrainConfig.variant, choices=["vanilla", "dr", "gspo"]
+    )
+    p.add_argument("--kl-beta", type=float, default=TrainConfig.kl_beta)
+    p.add_argument("--lr", type=float, default=TrainConfig.lr)
+    p.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay)
+    p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip)
+    p.add_argument("--scorer-device", default=TrainConfig.scorer_device)
+    p.add_argument("--out-dir", default=TrainConfig.out_dir)
+    p.add_argument("--ckpt-every", type=int, default=TrainConfig.ckpt_every)
+    p.add_argument("--resume", action="store_true")
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    cfg = TrainConfig(
+        model_path=args.model_path,
+        device=args.device,
+        dtype=args.dtype,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        group_size=args.group_size,
+        num_steps=args.num_steps,
+        seed=args.seed,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        variant=args.variant,
+        kl_beta=args.kl_beta,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        scorer_device=args.scorer_device,
+        out_dir=args.out_dir,
+        ckpt_every=args.ckpt_every,
+        resume=args.resume,
+    )
+    run_grpo(cfg)
+
+
+if __name__ == "__main__":
+    main()
