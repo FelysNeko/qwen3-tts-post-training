@@ -1028,7 +1028,7 @@ wheels = [
 [[package]]
 name = "q3tts-worker-scorer"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "librosa" },
     { name = "qwen3-tts-post-training" },
@@ -1060,6 +1060,9 @@ requires-dist = [
     { name = "torchaudio", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = "==0.23.0", index = "https://download.pytorch.org/whl/cu128" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ruff", specifier = ">=0.16.4" }]
 
 [[package]]
 name = "regex"

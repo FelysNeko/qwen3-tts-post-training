@@ -1589,7 +1589,7 @@ wheels = [
 [[package]]
 name = "q3tts-worker-trainer"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "flash-attn", marker = "python_full_version < '3.13'" },
     { name = "qwen-tts" },
@@ -1639,6 +1639,9 @@ requires-dist = [
     { name = "torchaudio", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = "==0.23.0", index = "https://download.pytorch.org/whl/cu128" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ruff", specifier = ">=0.16.4" }]
 
 [[package]]
 name = "regex"
