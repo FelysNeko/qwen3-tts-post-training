@@ -17,7 +17,7 @@ class ASRScorer:
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = (
             AutoModelForMultimodalLM.from_pretrained(
-                model_id, dtype=torch.bfloat16, attn_implementation="sdpa"
+                model_id, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
             )
             .to(device)
             .eval()

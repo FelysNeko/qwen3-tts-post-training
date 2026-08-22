@@ -1591,14 +1591,12 @@ name = "q3tts-worker-trainer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "flash-attn", marker = "python_full_version < '3.13'" },
     { name = "qwen-tts" },
     { name = "qwen3-tts-post-training" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "qwen-tts", specifier = "==0.1.1" },
     { name = "qwen3-tts-post-training", editable = "../../" },
 ]
@@ -1628,6 +1626,7 @@ name = "qwen3-tts-post-training"
 version = "0.1.0"
 source = { editable = "../../" }
 dependencies = [
+    { name = "flash-attn", marker = "python_full_version < '3.13'" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
@@ -1635,6 +1634,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "flash-attn", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "torch", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchaudio", specifier = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = "==0.23.0", index = "https://download.pytorch.org/whl/cu128" },
