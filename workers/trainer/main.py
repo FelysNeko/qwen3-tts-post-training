@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-r", type=int, default=TrainConfig.lora_r)
     p.add_argument("--lora-alpha", type=float, default=TrainConfig.lora_alpha)
     p.add_argument("--group-size", type=int, default=TrainConfig.group_size)
+    p.add_argument("--text-pool-path", default=TrainConfig.text_pool_path)
     p.add_argument("--num-steps", type=int, default=TrainConfig.num_steps)
     p.add_argument("--seed", type=int, default=TrainConfig.seed)
     p.add_argument("--max-new-tokens", type=int, default=TrainConfig.max_new_tokens)
@@ -47,6 +48,7 @@ def main() -> None:
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         group_size=args.group_size,
+        text_pool_path=args.text_pool_path,
         num_steps=args.num_steps,
         seed=args.seed,
         max_new_tokens=args.max_new_tokens,

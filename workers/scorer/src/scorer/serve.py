@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import sys
 import time
 from pathlib import Path
@@ -207,6 +208,9 @@ def main() -> None:
                 send({"id": rid, "ok": True, "loaded": scorers.loaded()})
             elif op == "score":
                 out = handle_score(scorers, req["items"])
+                out["rss_mb"] = (
+                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+                )
                 log(f"[scorer] req {rid}: n={len(req['items'])} timing={out['timing']}")
                 send({"id": rid, "ok": True, **out})
             else:

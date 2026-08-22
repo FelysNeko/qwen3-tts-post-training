@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import random
+import resource
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ class TrainConfig:
     lora_alpha: float = 64
 
     text_pool: tuple[str, ...] = TEXT_POOL
+    text_pool_path: str | None = None  # if set, overrides text_pool (one line each)
     group_size: int = 8
     num_steps: int = 1
     seed: int = 0
@@ -74,10 +76,16 @@ class TrainConfig:
     monitor: bool = True
 
 
-def _pick_prompts(cfg: TrainConfig, step: int) -> list[str]:
+def _load_text_pool(cfg: TrainConfig) -> list[str]:
+    """Text pool from file (one prompt per line) or the built-in placeholder."""
+    if cfg.text_pool_path is None:
+        return list(cfg.text_pool)
+    return [line.strip() for line in Path(cfg.text_pool_path).read_text().splitlines()]
+
+
+def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
     """Deterministically pick `group_size` prompts (rotate pool by step)."""
     rng = random.Random(cfg.seed * 1000003 + step)
-    pool = list(cfg.text_pool)
     if len(pool) > cfg.group_size:
         rng.shuffle(pool)
         pool = pool[: cfg.group_size]
@@ -183,15 +191,18 @@ def _train_loop(
 
     algo = GRPOConfig(variant=cfg.variant, kl_beta=cfg.kl_beta)
     reward_cfg = RewardConfig()
+    pool = _load_text_pool(cfg)
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
 
     for step in range(start_step, start_step + cfg.num_steps):
         t0 = time.monotonic()
-        prompts = _pick_prompts(cfg, step)
+        prompts = _pick_prompts(pool, cfg, step)
         rollout = rollout_group(
             sampler, decoder, prompts, seed=cfg.seed + step, tag=f"step{step}"
         )
+        t_rollout = time.monotonic() - t0
 
+        t_score = 0.0
         try:
             results = scorer.score(
                 [
@@ -202,6 +213,7 @@ def _train_loop(
             sim = _scores_to_tensor(results, "sim", cfg.device)
             cer = _scores_to_tensor(results, "cer", cfg.device)
             mos = _scores_to_tensor(results, "mos", cfg.device)
+            t_score = time.monotonic() - t0 - t_rollout
         except RuntimeError as e:
             print(
                 json.dumps(
@@ -226,18 +238,22 @@ def _train_loop(
             continue
 
         R, bd = reward_v3(sim, cer, mos, reward_cfg)
+        t_ref0 = time.monotonic()
         ref = lpc.compute_ref(prompts, rollout.codes, cfg.temperature, cfg.top_k)
+        t_ref = time.monotonic() - t_ref0
         pol = lpc.compute_policy(prompts, rollout.codes, cfg.temperature, cfg.top_k)
         loss, metrics = grpo_loss(
             pol.log_probs, ref.log_probs, R, pol.mask, group_ids, algo
         )
 
+        t_opt0 = time.monotonic()
         optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             ttm.trainable_parameters, cfg.grad_clip
         )
         optimizer.step()
+        t_opt = time.monotonic() - t_opt0
 
         monitor = {
             "step": step,
@@ -256,6 +272,11 @@ def _train_loop(
             "sim_mean": round(sim.mean().item(), 4),
             "cer_mean": round(cer.mean().item(), 4),
             "mos_mean": round(mos.mean().item(), 4),
+            "t_rollout": round(t_rollout, 2),
+            "t_score": round(t_score, 2),
+            "t_ref": round(t_ref, 2),
+            "t_opt": round(t_opt, 2),
+            "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
             "dur_s": round(time.monotonic() - t0, 2),
         }
         line = json.dumps(monitor, ensure_ascii=False)

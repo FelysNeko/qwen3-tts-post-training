@@ -15,13 +15,13 @@ class ASRScorer:
         self.device = device
         self.batch = batch_size
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = (
-            AutoModelForMultimodalLM.from_pretrained(
-                model_id, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
-            )
-            .to(device)
-            .eval()
+        self.model = AutoModelForMultimodalLM.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map=device,
         )
+        self.model.eval()
 
     @torch.inference_mode()
     def transcribe(self, wavs: list[str]) -> dict[str, str]:

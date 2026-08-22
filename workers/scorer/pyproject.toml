@@ -9,6 +9,7 @@ description = "Unified scoring worker: SV (ERes2NetV2/CAM++) + MOS (UTMOSv2) + W
 requires-python = ">=3.12"
 dependencies = [
     "transformers>=5.15",
+    "accelerate",
     "timm",
     "librosa",
     "qwen3-tts-post-training",
