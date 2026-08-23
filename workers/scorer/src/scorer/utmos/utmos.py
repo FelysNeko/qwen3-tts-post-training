@@ -12,7 +12,7 @@ import torch
 
 from scorer.fetch import ensure_utmos
 from scorer.utmos.config import DATASET_MAP, build_cfg
-from scorer.utmos.dataset import UTMOSSample, load_audio
+from scorer.utmos.dataset import GPUSpecBuilder, UTMOSSample, load_audio
 from scorer.utmos.model import SSLMultiSpecExtModelV2
 
 
@@ -22,6 +22,7 @@ class UTMOS:
         fold: int = 0,
         seed: int = 42,
         device: str = "cuda:0",
+        gpu_mel: bool = True,
     ):
         self.cfg = build_cfg()
         self.device = device
@@ -31,6 +32,7 @@ class UTMOS:
         self.model.eval().to(device)
         # domain one-hot index: upstream predict() default predict_dataset="sarulab"
         self.dataset_idx = DATASET_MAP["sarulab"]
+        self.gpu_builder = GPUSpecBuilder(self.cfg, device) if gpu_mel else None
 
     def _forward_batch(
         self,
@@ -51,7 +53,7 @@ class UTMOS:
         seed: int = 42,
     ) -> list[float]:
         """MOS per wav, input order preserved."""
-        sample = UTMOSSample(self.cfg, self.dataset_idx)
+        sample = UTMOSSample(self.cfg, self.dataset_idx, gpu_builder=self.gpu_builder)
         audios = [load_audio(self.cfg.sr, w) for w in wavs]
         # res = 0.0 (python float) is deliberate: numpy's weak-scalar promotion
         # keeps the accumulation in float16, matching upstream _predict_impl's

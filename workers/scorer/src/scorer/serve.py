@@ -77,6 +77,7 @@ class Scorers:
                 seed=self.args.mos_seed,
                 num_repetitions=self.args.mos_reps,
                 device=self.args.device,
+                gpu_mel=self.args.gpu_mel,
             )
             log(f"[load] mos {time.time() - t0:.1f}s")
         return self._mos
@@ -183,6 +184,13 @@ def main() -> None:
     ap.add_argument("--mos-fold", type=int, default=0)
     ap.add_argument("--mos-seed", type=int, default=42)
     ap.add_argument("--mos-reps", type=int, default=8)
+    ap.add_argument(
+        "--gpu-mel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="build UTMOS mel spectrograms on GPU (default on; ~20x faster, "
+        "MOS within ~0.03 of the librosa path)",
+    )
     args = ap.parse_args()
 
     # reserve fd 1 for the protocol; everything else prints to stderr

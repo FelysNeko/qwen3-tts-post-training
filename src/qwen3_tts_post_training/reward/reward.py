@@ -4,16 +4,20 @@
 
 - r_sv  = sigmoid((sim_e2v2 − 0.8585)/0.0966)      (E2V2 speaker sim, unit-normalized)
 - r_wer = 1 − CER_qwen3asr                          (normalize() + edit-distance CER)
-- r_mos = sigmoid((mos_utmosv2fold0 − 2.5)/0.2)     (hinge 护栏, 只挡不驱动)
+- r_mos = max(0, 2.5 − mos_utmosv2fold0)            (hinge 护栏, 线性地板: 只挡不驱动)
 - std is the *within-group* std of each component (batch-std layer; per MD the
   std≈0 in all-above-τ groups). The MOS term 熄火 (zeroed) when its group std
   drops below mos_flameout_eps (MD: 组内 std<eps 熄火). SV/WER keep the
   max(std, eps) guard so they never divide by zero.
 - λ = (1.0, 1.0, 0.2) — v3 定稿.
 
-Inputs are per-sample scores of one prompt group (shape [G]) or a batch of
-groups along `group_dim` (shape [..., G]). Pure torch — usable from the trainer
-loop and from evaluation scripts.
+r_mos floor (2026-08-23, UTMOS-replacement A/B conclusion): a sigmoid is still
+sloped inside the healthy zone (mos 2.7-3.3 → r_mos 0.73-0.98), so healthy
+groups leak a within-group std ≈ 0.09 into the advantage — pure ranking noise
+(empirically UTMOS invents ~1.3σ within-group spread on indistinguishable good
+takes). max(0, τ−mos) is exactly 0 above τ, so a healthy group has r_mos ≡ 0 →
+std = 0 *by construction* and the flameout is guaranteed, not a threshold
+gamble; the continuous linear penalty lives only where it is reliable (below τ).
 """
 
 from __future__ import annotations
@@ -57,7 +61,13 @@ def r_wer_fn(cer: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
 
 
 def r_mos_fn(mos: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
-    return torch.sigmoid((mos - cfg.mos_tau) / cfg.mos_scale)
+    """Hinge floor: 0 above τ (healthy, strictly silent), linear penalty below.
+
+    Healthy groups get r_mos ≡ 0, so their within-group std is 0 by
+    construction and the flameout fires deterministically — no threshold gamble
+    on a noisy std estimate. Penalty slope is 1 per MOS unit below τ.
+    """
+    return torch.clamp(cfg.mos_tau - mos, min=0.0)
 
 
 def reward_v3(

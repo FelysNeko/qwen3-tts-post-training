@@ -23,10 +23,11 @@ class MOSScorer:
         seed: int = 42,
         num_repetitions: int = 8,
         device: str = "cuda:0",
+        gpu_mel: bool = True,
     ):
         self.reps = num_repetitions
         self.seed = seed
-        self.model = UTMOS(fold=fold, seed=seed, device=device)
+        self.model = UTMOS(fold=fold, seed=seed, device=device, gpu_mel=gpu_mel)
 
     def score(self, wavs: list[str], chunk: int = 32) -> list[float]:
         """MOS per wav, input order preserved."""

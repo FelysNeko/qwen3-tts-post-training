@@ -68,11 +68,17 @@ def _make_melspec(cfg, spec_cfg, y: np.ndarray) -> np.ndarray:
 
 
 class UTMOSSample:
-    """Per-item feature builder: (ssl_wave, spec_stack, domain_onehot)."""
+    """Per-item feature builder: (ssl_wave, spec_stack, domain_onehot).
 
-    def __init__(self, cfg, dataset_idx: int):
+    Pass `gpu_builder` (a GPUSpecBuilder) to run the melspectrogram stack on
+    GPU. The RNG call sequence is identical either way — only the mel compute
+    moves off librosa/CPU — so the determinism contract is preserved.
+    """
+
+    def __init__(self, cfg, dataset_idx: int, gpu_builder: GPUSpecBuilder | None = None):
         self.cfg = cfg
         self.dataset_idx = dataset_idx
+        self.gpu_builder = gpu_builder
 
     def build(self, y: np.ndarray) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
@@ -91,22 +97,81 @@ class UTMOSSample:
         y = extend_audio(y, length, method=cfg.dataset.spec_frames.extend)
         for _ in range(cfg.dataset.spec_frames.num_frames):
             y1 = select_random_start(y, length)
-            for spec_cfg in cfg.dataset.specs:
-                spec = _make_melspec(cfg, spec_cfg, y1)
+            for sc_idx, spec_cfg in enumerate(cfg.dataset.specs):
+                if self.gpu_builder is not None:
+                    spec = self.gpu_builder.melspec(sc_idx, y1)
+                else:
+                    spec = _make_melspec(cfg, spec_cfg, y1)
+                    spec = torch.from_numpy(np.asarray(spec, dtype=np.float32))
                 if cfg.dataset.spec_frames.mixup_inner:
                     y2 = select_random_start(y, length)
-                    spec2 = _make_melspec(cfg, spec_cfg, y2)
-                    lmd = np.random.beta(
-                        cfg.dataset.spec_frames.mixup_alpha,
-                        cfg.dataset.spec_frames.mixup_alpha,
+                    if self.gpu_builder is not None:
+                        spec2 = self.gpu_builder.melspec(sc_idx, y2)
+                    else:
+                        spec2 = _make_melspec(cfg, spec_cfg, y2)
+                        spec2 = torch.from_numpy(np.asarray(spec2, dtype=np.float32))
+                    lmd = float(
+                        np.random.beta(
+                            cfg.dataset.spec_frames.mixup_alpha,
+                            cfg.dataset.spec_frames.mixup_alpha,
+                        )
                     )
                     spec = lmd * spec + (1 - lmd) * spec2
-                spec = np.stack([spec, spec, spec], axis=0)
-                spec_tensor = torch.tensor(spec, dtype=torch.float32)
-                spec_tensor = cfg.transform["valid"](spec_tensor)
+                spec = torch.stack([spec, spec, spec], dim=0)
+                spec_tensor = cfg.transform["valid"](spec)
                 specs.append(spec_tensor)
         x2 = torch.stack(specs).float()
 
         d = torch.zeros(len(DATASET_MAP), dtype=torch.float32)
         d[self.dataset_idx] = 1.0
         return x1, x2, d
+
+
+class GPUSpecBuilder:
+    """librosa-mel-equivalent spectrogram builder running on torch (GPU).
+
+    The mel filterbank matrix (librosa.filters.mel, default norm='slaney') and
+    the padded hann windows are precomputed once on CPU then moved to device;
+    the per-crop work is torch.stft + filterbank matmul + power_to_db + norm.
+    Crop selection stays in numpy (identical RNG order), so determinism holds
+    (torch.stft/cufft and torchvision Resize are deterministic).
+    """
+
+    def __init__(self, cfg, device: str):
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self.mel_fbanks: list[torch.Tensor] = []
+        self.windows: list[torch.Tensor] = []
+        for sc in cfg.dataset.specs:
+            fb = librosa.filters.mel(sr=cfg.sr, n_fft=sc.n_fft, n_mels=sc.n_mels)
+            self.mel_fbanks.append(
+                torch.from_numpy(np.asarray(fb, dtype=np.float32)).to(self.device)
+            )
+            # torch.stft expects a win_length-sized window and pads it to n_fft
+            # internally (same centering as librosa's pad_center).
+            self.windows.append(
+                torch.hann_window(sc.win_length, periodic=True, device=self.device)
+            )
+
+    def melspec(self, sc_idx: int, y: np.ndarray) -> torch.Tensor:
+        sc = self.cfg.dataset.specs[sc_idx]
+        t = torch.from_numpy(y).to(self.device, non_blocking=True)
+        spec = torch.stft(
+            t,
+            n_fft=sc.n_fft,
+            hop_length=sc.hop_length,
+            win_length=sc.win_length,
+            window=self.windows[sc_idx],
+            center=True,
+            pad_mode="reflect",
+            return_complex=True,
+        )
+        mag = spec.abs().pow(2)
+        mel = self.mel_fbanks[sc_idx] @ mag
+        ref = mel.max().clamp_min(1e-10)
+        db = 10.0 * (torch.log10(mel.clamp_min(1e-10)) - torch.log10(ref))
+        # librosa.power_to_db default top_db=80.0: floor at max - top_db
+        db = torch.maximum(db, db.max() - 80.0)
+        if sc.norm is not None:
+            db = (db + sc.norm) / sc.norm
+        return db
