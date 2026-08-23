@@ -27,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--repetition-penalty", type=float, default=TrainConfig.repetition_penalty
     )
     p.add_argument(
+        "--sampler-impl",
+        default=TrainConfig.sampler_impl,
+        choices=["hf", "fast", "compiled"],
+    )
+    p.add_argument(
         "--variant", default=TrainConfig.variant, choices=["vanilla", "dr", "gspo"]
     )
     p.add_argument("--kl-beta", type=float, default=TrainConfig.kl_beta)
@@ -58,6 +63,7 @@ def main() -> None:
         top_k=args.top_k,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
+        sampler_impl=args.sampler_impl,
         variant=args.variant,
         kl_beta=args.kl_beta,
         lr=args.lr,

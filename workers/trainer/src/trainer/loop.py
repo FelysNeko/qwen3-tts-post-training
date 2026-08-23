@@ -63,6 +63,7 @@ class TrainConfig:
     top_k: int = 50
     top_p: float = 1.0
     repetition_penalty: float | None = None
+    sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
 
     variant: str = "dr"
     kl_beta: float = 0.001
@@ -167,7 +168,7 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
     )
-    sampler = Sampler(ttm, speaker=cfg.speaker)
+    sampler = Sampler(ttm, speaker=cfg.speaker, impl=cfg.sampler_impl)
     decoder = Decoder(ttm)
     lpc = LogProbComputer(ttm, speaker=cfg.speaker)
     scorer = ScorerClient(device=cfg.scorer_device)

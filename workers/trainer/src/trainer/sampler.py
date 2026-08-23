@@ -39,11 +39,25 @@ class Sampler:
         speaker: str = "cyrene",
         language: str = "Auto",
         non_streaming_mode: bool = True,
+        impl: str = "hf",
     ):
         self.ttm = ttm
         self.speaker = speaker
         self.language = language
         self.non_streaming_mode = non_streaming_mode
+        self.impl = impl
+        if impl in ("fast", "compiled"):
+            from trainer.fastgen import FastSampler
+
+            self._fast = FastSampler(
+                ttm,
+                speaker=speaker,
+                language=language,
+                non_streaming_mode=non_streaming_mode,
+                compile=(impl == "compiled"),
+            )
+        elif impl != "hf":
+            raise ValueError(f"unknown sampler impl: {impl}")
 
     def _tokenize(self, text: str) -> torch.Tensor:
         return tokenize_assistant(self.ttm.processor, text).to(self.ttm.device)
@@ -63,6 +77,17 @@ class Sampler:
         """Generate one code-group sequence per text. Returns list of
         [T, num_code_groups] tensors (first column = semantic tokens; the EOS
         stop token is truncated by the generation path)."""
+        if self.impl == "fast":
+            return self._fast.sample(
+                texts,
+                seed=seed,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_new_tokens=max_new_tokens,
+            )
         if seed is not None:
             torch.manual_seed(seed)
         input_ids = [self._tokenize(t) for t in texts]
