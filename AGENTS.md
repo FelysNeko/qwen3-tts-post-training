@@ -27,7 +27,8 @@ workers/scorer/.venv/bin/python workers/scorer/main.py [args]     # run scorer s
 - Trainer spawns the scorer as a subprocess (`ScorerClient` in `src/qwen3_tts_post_training/scorers/client.py`): `workers/scorer/.venv/bin/python workers/scorer/main.py`, JSON lines over stdin/stdout, lock-step (one in-flight request). In `serve.py` stdout is dup'ed to an fd reserved for protocol and `sys.stdout` remapped to stderr — never print to stdout in scorer code.
 - Trainer defaults to `cuda:1`, scorer to `cuda:0` (one CUDA context per process).
 - Rollout wavs are written to per-run tmpfs dirs under `/dev/shm` and the scorer reads them by path; they are reclaimed by the OS.
-- Hardcoded defaults point at the author's machine and do NOT exist here: model `/mnt/e/Model/PhiLia093-TTS/` (trainer `--model-path`), SV assets under `/home/felysneko/workspace/playground` (client `DEFAULTS`). Override via CLI flags. `Q3TTS_ROOT` env var overrides repo root in `repo_root()`.
+- Scorer/SV model weights auto-fetch on first load via the upstream tools (no manual downloads): SV ckpts through the `modelscope` client, UTMOSv2 folds through `huggingface_hub` from the official `sarulab-speech/UTMOSv2`, ASR/wav2vec2 through transformers. See `workers/scorer/src/scorer/fetch.py`.
+- Defaults are overridable: model ckpt `--model-path` (default `/mnt/d/Repository/models/PhiLia093-TTS/`, not present until downloaded — trainer raises a clear FileNotFoundError). SV assets resolve to the sibling `playground/` dir without a hardcoded username — `Q3TTS_ROOT` overrides repo root, `Q3TTS_PLAYGROUND` overrides the playground dir. Scorer worker `--sv-dir` can point at a local 3D-Speaker checkout.
 - Checkpoints save LoRA deltas + codec head + optimizer state; `--resume` reads `out_dir/latest`.
 
 ## Vendored code — byte-faithful, do not modify

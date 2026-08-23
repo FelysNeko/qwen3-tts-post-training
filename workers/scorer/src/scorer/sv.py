@@ -13,6 +13,8 @@ import torch
 import torchaudio.compliance.kaldi as Kaldi
 import torchaudio.functional as AF
 
+from scorer.fetch import ensure_sv_ckpt
+
 TARGET_SR = 16000
 
 MODELS = {
@@ -25,12 +27,10 @@ MODELS = {
             "scale": 4,
             "expansion": 4,
         },
-        "ckpt": "pretrained/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common/pretrained_eres2netv2w24s4ep4.ckpt",
     },
     "campplus": {
         "obj": "scorer.speakerlab.models.campplus.DTDNN.CAMPPlus",
         "args": {"feat_dim": 80, "embedding_size": 192},
-        "ckpt": "pretrained/speech_campplus_sv_zh-cn_16k-common/campplus_cn_common.bin",
     },
 }
 
@@ -70,9 +70,8 @@ class SVScorer:
             conf = MODELS[name]
             module, cls = conf["obj"].rsplit(".", 1)
             model = getattr(importlib.import_module(module), cls)(**conf["args"])
-            model.load_state_dict(
-                torch.load(self.sv_dir / conf["ckpt"], map_location="cpu")
-            )
+            ckpt = ensure_sv_ckpt(self.sv_dir, name)
+            model.load_state_dict(torch.load(ckpt, map_location="cpu"))
             model.to(self.device).eval()
             self._models[name] = (model, self.device)
         return self._models[name]

@@ -76,6 +76,7 @@ class Scorers:
                 fold=self.args.mos_fold,
                 seed=self.args.mos_seed,
                 num_repetitions=self.args.mos_reps,
+                device=self.args.device,
             )
             log(f"[load] mos {time.time() - t0:.1f}s")
         return self._mos

@@ -12,6 +12,7 @@ dependencies = [
     "accelerate",
     "timm",
     "librosa",
+    "modelscope>=1.17",
     "qwen3-tts-post-training",
 ]
 

@@ -20,13 +20,13 @@ class MOSScorer:
     def __init__(
         self,
         fold: int = 0,
-        config: str = "fusion_stage3",
         seed: int = 42,
         num_repetitions: int = 8,
+        device: str = "cuda:0",
     ):
         self.reps = num_repetitions
         self.seed = seed
-        self.model = UTMOS(fold=fold, config=config, seed=seed)
+        self.model = UTMOS(fold=fold, seed=seed, device=device)
 
     def score(self, wavs: list[str], chunk: int = 32) -> list[float]:
         """MOS per wav, input order preserved."""

@@ -2,21 +2,18 @@
 
 Determinism contract (validated): np.random.seed(fixed) before each
 repetition loop + sequential in-order item processing (no fork workers).
-Checkpoint read directly from the upstream HF cache layout
-(~/.cache/utmosv2/models/fusion_stage3/fold{F}_s42_best_model.pth)."""
+Weights are fetched (once, via HF cache) from the official
+sarulab-speech/UTMOSv2 repo by scorer.fetch.ensure_utmos."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import numpy as np
 import torch
 
+from scorer.fetch import ensure_utmos
 from scorer.utmos.config import DATASET_MAP, build_cfg
 from scorer.utmos.dataset import UTMOSSample, load_audio
 from scorer.utmos.model import SSLMultiSpecExtModelV2
-
-CACHE = Path.home() / ".cache" / "utmosv2"
 
 
 class UTMOS:
@@ -24,18 +21,12 @@ class UTMOS:
         self,
         fold: int = 0,
         seed: int = 42,
-        config: str = "fusion_stage3",
         device: str = "cuda:0",
     ):
         self.cfg = build_cfg()
         self.device = device
         self.model = SSLMultiSpecExtModelV2(self.cfg)
-        ckpt = CACHE / "models" / config / f"fold{fold}_s{seed}_best_model.pth"
-        if not ckpt.exists():
-            raise FileNotFoundError(
-                f"{ckpt} not found — run once with the upstream package "
-                "(or download from sarulab/UTMOSv2 HF) to populate the cache"
-            )
+        ckpt = ensure_utmos(fold, seed)
         self.model.load_state_dict(torch.load(ckpt, map_location="cpu"))
         self.model.eval().to(device)
         # domain one-hot index: upstream predict() default predict_dataset="sarulab"

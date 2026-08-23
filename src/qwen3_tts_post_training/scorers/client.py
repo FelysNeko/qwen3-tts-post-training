@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -18,20 +19,30 @@ from typing import Self
 
 from .protocol import ScoreItem, ScorerError, make_ping, make_request, parse_response
 
-# Defaults point at playground assets until the assets/ migration (MD §8).
-PLAYGROUND = Path("/home/felysneko/workspace/playground")
-DEFAULTS = {
-    "sv_dir": PLAYGROUND / "3D-Speaker",
-    "sv_ref": PLAYGROUND / "audio" / "sv_ref_embedding.npy",
-    "sv_ref_camp": PLAYGROUND / "audio" / "campplus" / "sv_ref_embedding.npy",
-}
-
 
 def repo_root() -> Path:
     env = os.environ.get("Q3TTS_ROOT")
     if env:
         return Path(env).resolve()
     return Path(__file__).resolve().parents[3]
+
+
+def _playground() -> Path:
+    """Playground assets dir (SV refs, 3D-Speaker). Resolved without a
+    hardcoded username: sibling of this repo by default, override with
+    Q3TTS_PLAYGROUND."""
+    env = os.environ.get("Q3TTS_PLAYGROUND")
+    if env:
+        return Path(env).resolve()
+    return repo_root().parent / "playground"
+
+
+# Defaults point at playground assets until the assets/ migration (MD §8).
+DEFAULTS = {
+    "sv_dir": _playground() / "3D-Speaker",
+    "sv_ref": _playground() / "audio" / "sv_ref_embedding.npy",
+    "sv_ref_camp": _playground() / "audio" / "campplus" / "sv_ref_embedding.npy",
+}
 
 
 class ScorerClient:
@@ -96,6 +107,17 @@ class ScorerClient:
         self._lines = queue.Queue()
         self._reader = threading.Thread(target=self._drain, daemon=True)
         self._reader.start()
+        # stderr must be drained too: the worker's logs + model-download
+        # progress go there, and an undrained pipe buffer (64KB) would block
+        # the worker → trainer deadlock.
+        self._err_reader = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._err_reader.start()
+
+    def _drain_stderr(self) -> None:
+        assert self._proc is not None and self._proc.stderr is not None
+        for line in self._proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
 
     def _drain(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None

@@ -45,11 +45,12 @@ TEXT_POOL = (
 
 @dataclass
 class TrainConfig:
-    model_path: str = "/mnt/e/Model/PhiLia093-TTS/"
+    model_path: str = "/mnt/d/Repository/models/PhiLia093-TTS/"
     device: str = "cuda:1"
     dtype: str = "bfloat16"
     lora_r: int = 16
     lora_alpha: float = 64
+    speaker: str = "cyrene"
 
     text_pool: tuple[str, ...] = TEXT_POOL
     text_pool_path: str | None = None  # if set, overrides text_pool (one line each)
@@ -84,12 +85,11 @@ def _load_text_pool(cfg: TrainConfig) -> list[str]:
 
 
 def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
-    """Deterministically pick `group_size` prompts (rotate pool by step)."""
+    """Standard GRPO group: ONE prompt per step, rolled out `group_size` times
+    (the within-group variance is pure sampling noise of the same text; the
+    group-advantage std then measures rollout randomness, not prompt spread)."""
     rng = random.Random(cfg.seed * 1000003 + step)
-    if len(pool) > cfg.group_size:
-        rng.shuffle(pool)
-        pool = pool[: cfg.group_size]
-    return pool
+    return [rng.choice(pool)] * cfg.group_size
 
 
 def _scores_to_tensor(results: list[dict], key: str, device: str) -> torch.Tensor:
@@ -153,6 +153,13 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
     cfg = cfg or TrainConfig()
     dtype = getattr(torch, cfg.dtype)
 
+    if not Path(cfg.model_path).exists():
+        raise FileNotFoundError(
+            f"TTS model ckpt not found at {cfg.model_path!r}. "
+            "Pass --model-path (or set TrainConfig.model_path) to your "
+            "PhiLia093-TTS ckpt once it is downloaded."
+        )
+
     ttm = TrainerModel(
         cfg.model_path,
         device=cfg.device,
@@ -160,9 +167,9 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
     )
-    sampler = Sampler(ttm)
+    sampler = Sampler(ttm, speaker=cfg.speaker)
     decoder = Decoder(ttm)
-    lpc = LogProbComputer(ttm)
+    lpc = LogProbComputer(ttm, speaker=cfg.speaker)
     scorer = ScorerClient(device=cfg.scorer_device)
     scorer.start()
     try:

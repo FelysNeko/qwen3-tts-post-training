@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", default=TrainConfig.dtype)
     p.add_argument("--lora-r", type=int, default=TrainConfig.lora_r)
     p.add_argument("--lora-alpha", type=float, default=TrainConfig.lora_alpha)
+    p.add_argument("--speaker", default=TrainConfig.speaker)
     p.add_argument("--group-size", type=int, default=TrainConfig.group_size)
     p.add_argument("--text-pool-path", default=TrainConfig.text_pool_path)
     p.add_argument("--num-steps", type=int, default=TrainConfig.num_steps)
@@ -47,6 +48,7 @@ def main() -> None:
         dtype=args.dtype,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
+        speaker=args.speaker,
         group_size=args.group_size,
         text_pool_path=args.text_pool_path,
         num_steps=args.num_steps,
