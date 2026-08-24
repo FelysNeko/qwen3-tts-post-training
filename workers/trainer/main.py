@@ -15,7 +15,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-r", type=int, default=TrainConfig.lora_r)
     p.add_argument("--lora-alpha", type=float, default=TrainConfig.lora_alpha)
     p.add_argument("--speaker", default=TrainConfig.speaker)
+    p.add_argument("--num-prompts", type=int, default=TrainConfig.num_prompts)
     p.add_argument("--group-size", type=int, default=TrainConfig.group_size)
+    p.add_argument("--runaway-t-max", type=int, default=TrainConfig.runaway_t_max)
     p.add_argument("--text-pool-path", default=TrainConfig.text_pool_path)
     p.add_argument("--num-steps", type=int, default=TrainConfig.num_steps)
     p.add_argument("--seed", type=int, default=TrainConfig.seed)
@@ -35,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--variant", default=TrainConfig.variant, choices=["vanilla", "dr", "gspo"]
     )
     p.add_argument("--kl-beta", type=float, default=TrainConfig.kl_beta)
+    p.add_argument("--warmup-steps", type=int, default=TrainConfig.warmup_steps)
     p.add_argument("--lr", type=float, default=TrainConfig.lr)
     p.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay)
     p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip)
@@ -54,7 +57,9 @@ def main() -> None:
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         speaker=args.speaker,
+        num_prompts=args.num_prompts,
         group_size=args.group_size,
+        runaway_t_max=args.runaway_t_max,
         text_pool_path=args.text_pool_path,
         num_steps=args.num_steps,
         seed=args.seed,
@@ -66,6 +71,7 @@ def main() -> None:
         sampler_impl=args.sampler_impl,
         variant=args.variant,
         kl_beta=args.kl_beta,
+        warmup_steps=args.warmup_steps,
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,

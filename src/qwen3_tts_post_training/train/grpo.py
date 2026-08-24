@@ -212,6 +212,5 @@ def needs_resample(
     cer = 0.14, where a single Adam step along the leftover SV-noise
     ranking collapsed the policy into 12-79 s babbling rollouts).
     """
-    r_sv = torch.sigmoid((sim - 0.8585) / 0.0966)
     r_wer = 1.0 - cer
     return bool(r_wer.std(unbiased=False) < wer_eps)

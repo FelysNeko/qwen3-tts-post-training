@@ -153,9 +153,7 @@ def _static_attention_cp(self, hidden_states, position_embeddings, cache):
     )
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     cos, sin = position_embeddings
-    query_states, key_states = apply_rotary_pos_emb(
-        query_states, key_states, cos, sin
-    )
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     out = flash_attn_with_kvcache(
         query_states.transpose(1, 2).contiguous(),
         cache.k_pool[self.layer_idx],
@@ -353,9 +351,7 @@ class GraphFastSampler(FastSampler):
         )
 
     @staticmethod
-    def _capture_graph(
-        fn, out_buf: torch.Tensor, probe_fn
-    ) -> torch.cuda.CUDAGraph:
+    def _capture_graph(fn, out_buf: torch.Tensor, probe_fn) -> torch.cuda.CUDAGraph:
         """Warm the workload, capture it into a CUDA graph, and verify the
         replay reproduces the eager output (catches empty/corrupt captures)
         and responds to input-content changes (catches Blackwell/WSL input

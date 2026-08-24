@@ -54,23 +54,23 @@ def logprobs_from_logits(
     suppress: tuple[int, int] | None = None,
     eos_id: int | None = None,
 ) -> torch.Tensor:
-    """Per-position log-prob of `tokens` under the exact sampling distribution.
+    """Per-position log-prob of `tokens` under the temperature-scaled model
+    distribution, evaluated on the FULL softmax.
 
-    Replicates the generation logit processors (MD §7 缺口 #3): temperature
-    scaling, top_k mask, and the same `suppress_tokens` band (eos exempt).
-    """
-    logits = logits / temperature
-    if suppress is not None:
-        low, high = suppress
-        keep = torch.ones_like(logits, dtype=torch.bool)  # True = keep logit
-        keep[..., low:high] = False
-        if eos_id is not None and low <= eos_id < high:
-            keep[..., eos_id] = True
-        logits = torch.where(keep, logits, float("-inf"))
-    if top_k is not None:
-        k = min(top_k, logits.size(-1))
-        vals, _ = logits.topk(k, dim=-1)
-        logits = torch.where(logits >= vals[..., -1:], logits, float("-inf"))
+    The sampling-time top_k / suppress masks are deliberately NOT re-applied:
+    a hard truncation makes the log-prob DISCONTINUOUS — a 1e-5 weight nudge
+    (one clipped Adam step) flips borderline tokens across the k-th boundary,
+    producing ±inf log-ratios, KL = inf and exploding gradients (diagnosed
+    C1v10: post-update per-token |δ| = inf, grad_norm 2976; the same root
+    cause behind every earlier NaN / runaway-policy smoke failure). Sampled
+    tokens always live inside the sampling support, so their unmasked
+    log-probs are finite and continuous; top-50 mass at T=0.9 ≈ 1, so the
+    behavior-policy bias is negligible. Temperature is kept (continuous, no
+    boundary). Softmax runs in fp32 — bf16 log_softmax quantization
+    (~0.02/token) would otherwise dominate the small deltas the ratio and
+    KL are made of. `top_k`/`suppress`/`eos_id` are accepted and ignored
+    (call-site compatibility)."""
+    logits = logits.float() / temperature
     return F.log_softmax(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
 

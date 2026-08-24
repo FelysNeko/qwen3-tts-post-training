@@ -106,9 +106,7 @@ def reward_v3(
     # group-mean subtraction anyway; this keeps R itself interpretable)
     zeros = torch.zeros_like(r_sv)
     term_sv = torch.where(std_sv < cfg.flameout_eps, zeros, cfg.lam_sv * r_sv)
-    term_wer = torch.where(
-        std_wer < cfg.flameout_eps, zeros, cfg.lam_wer * r_wer
-    )
+    term_wer = torch.where(std_wer < cfg.flameout_eps, zeros, cfg.lam_wer * r_wer)
     if cfg.mos_flameout:
         term_mos = torch.where(
             std_mos < cfg.mos_flameout_eps, zeros, cfg.lam_mos * r_mos

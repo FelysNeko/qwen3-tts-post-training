@@ -75,7 +75,9 @@ class UTMOSSample:
     moves off librosa/CPU — so the determinism contract is preserved.
     """
 
-    def __init__(self, cfg, dataset_idx: int, gpu_builder: GPUSpecBuilder | None = None):
+    def __init__(
+        self, cfg, dataset_idx: int, gpu_builder: GPUSpecBuilder | None = None
+    ):
         self.cfg = cfg
         self.dataset_idx = dataset_idx
         self.gpu_builder = gpu_builder

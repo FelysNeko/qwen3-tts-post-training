@@ -23,6 +23,7 @@ import torch
 
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 from qwen3_tts_post_training.scorers.client import ScoreItem, ScorerClient
+from qwen3_tts_post_training.scorers.protocol import ScorerError
 from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
 from trainer.decoder import Decoder
 from trainer.logprob import LogProbComputer
@@ -54,10 +55,12 @@ class TrainConfig:
 
     text_pool: tuple[str, ...] = TEXT_POOL
     text_pool_path: str | None = None  # if set, overrides text_pool (one line each)
-    group_size: int = 8
+    num_prompts: int = 8  # distinct prompts per step (Fish Audio S2 layout)
+    group_size: int = 8  # rollouts per prompt (the GRPO group)
     num_steps: int = 1
     seed: int = 0
     max_new_tokens: int = 4096
+    runaway_t_max: int = 400  # per-group no-EOS guard (also OOM guard)
 
     temperature: float = 0.9
     top_k: int = 50
@@ -66,8 +69,10 @@ class TrainConfig:
     sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
 
     variant: str = "dr"
-    kl_beta: float = 0.001
+    kl_beta: float = 0.01
     lr: float = 1e-5
+    warmup_steps: int = 10  # linear LR ramp: tames the Adam first-step sign
+    # jolt (all params move ±lr at once; observed as KL 586 on step 1, fish3)
     weight_decay: float = 0.01
     grad_clip: float = 1.0
 
@@ -95,11 +100,13 @@ def _current_rss_mb() -> int:
 
 
 def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
-    """Standard GRPO group: ONE prompt per step, rolled out `group_size` times
-    (the within-group variance is pure sampling noise of the same text; the
-    group-advantage std then measures rollout randomness, not prompt spread)."""
+    """Fish-Audio-style batch: `num_prompts` DISTINCT prompts per step, each
+    rolled out `group_size` times (8×8 = 64 rollouts per update). Distinct
+    prompts average out per-group reward noise; within-group variance stays
+    pure sampling noise of the same text (the GRPO baseline)."""
     rng = random.Random(cfg.seed * 1000003 + step)
-    return [rng.choice(pool)] * cfg.group_size
+    k = min(cfg.num_prompts, len(pool))
+    return rng.sample(pool, k)
 
 
 def _scores_to_tensor(results: list[dict], key: str, device: str) -> torch.Tensor:
@@ -212,106 +219,186 @@ def _train_loop(
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
 
     for step in range(start_step, start_step + cfg.num_steps):
+        lr_t = cfg.lr * min(1.0, (step + 1) / max(1, cfg.warmup_steps))
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_t
         t0 = time.monotonic()
         prompts = _pick_prompts(pool, cfg, step)
-        rollout = rollout_group(
-            sampler, decoder, prompts, seed=cfg.seed + step, tag=f"step{step}"
-        )
-        t_rollout = time.monotonic() - t0
+        gs = cfg.group_size
+        skips: dict[str, int] = {}
 
-        t_max = max(c.shape[0] for c in rollout.codes)
-        if t_max > 400:
-            # runaway no-EOS group (degenerate policy state): scoring it is a
-            # waste and teacher-forcing [8, >400] with grads OOMs the 16 GB
-            # trainer GPU (graphed smoke C1v8)
-            print(json.dumps({"step": step, "skip": "runaway_rollout",
-                              "t_max": t_max}), flush=True)
-            continue
+        # ---- phase 1: rollout — one group per prompt (graphed batch = gs) ----
+        t_roll0 = time.monotonic()
+        groups: list[dict] = []
+        for gi, prompt in enumerate(prompts):
+            rollout = rollout_group(
+                sampler,
+                decoder,
+                [prompt] * gs,
+                seed=cfg.seed * 1000003 + step * 1009 + gi,
+                tag=f"step{step}g{gi}",
+            )
+            t_max = max(c.shape[0] for c in rollout.codes)
+            if t_max > cfg.runaway_t_max:
+                # runaway no-EOS group (degenerate policy state): scoring it
+                # wastes time and teacher-forcing [gs, >400] with grads OOMs
+                # the 16 GB trainer GPU
+                skips["runaway"] = skips.get("runaway", 0) + 1
+                continue
+            groups.append(
+                {
+                    "gi": gi,
+                    "prompt": prompt,
+                    "codes": rollout.codes,
+                    "wavs": rollout.wav_paths,
+                    "t_max": t_max,
+                }
+            )
+        t_rollout = time.monotonic() - t_roll0
 
+        # ---- phase 2: score — ONE request for all surviving groups ----
         t_score = 0.0
-        try:
-            results = scorer.score(
-                [
-                    ScoreItem(wav=str(w), text=p)
-                    for w, p in zip(rollout.wav_paths, prompts)
+        if groups:
+            t_s0 = time.monotonic()
+            try:
+                items = [
+                    ScoreItem(wav=str(g["wavs"][j]), text=g["prompt"])
+                    for g in groups
+                    for j in range(gs)
                 ]
-            )
-            sim = _scores_to_tensor(results, "sim", cfg.device)
-            cer = _scores_to_tensor(results, "cer", cfg.device)
-            mos = _scores_to_tensor(results, "mos", cfg.device)
-            t_score = time.monotonic() - t0 - t_rollout
-        except RuntimeError as e:
+                results = scorer.score(items)
+            except (RuntimeError, ScorerError) as e:
+                print(
+                    json.dumps(
+                        {"step": step, "skip": "scorer_failure", "reason": str(e)},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                continue
+            t_score = time.monotonic() - t_s0
+
+            scored: list[dict] = []
+            pos = 0
+            for g in groups:
+                rs = results[pos : pos + gs]
+                pos += gs
+                if any(r.get("error") is not None or r.get("cer") is None for r in rs):
+                    skips["scorer_item"] = skips.get("scorer_item", 0) + 1
+                    continue
+                for key in ("sim", "cer", "mos"):
+                    g[key] = torch.tensor(
+                        [r[key] for r in rs], dtype=torch.float32, device=cfg.device
+                    )
+                scored.append(g)
+            groups = scored
+
+        # per-group zero-signal filter (DAPO dynamic sampling): only groups
+        # whose WER actually spreads carry a learnable within-group signal
+        trainable: list[dict] = []
+        for g in groups:
+            if needs_resample(g["sim"], g["cer"]):
+                skips["flat_group"] = skips.get("flat_group", 0) + 1
+                continue
+            g["R"], g["bd"] = reward_v3(g["sim"], g["cer"], g["mos"], reward_cfg)
+            trainable.append(g)
+
+        if not trainable:
             print(
                 json.dumps(
-                    {"step": step, "skip": "scorer_failure", "reason": str(e)},
-                    ensure_ascii=False,
-                )
-            )
-            continue
-
-        if needs_resample(sim, cer):
-            print(
-                json.dumps(
-                    {
-                        "step": step,
-                        "skip": "needs_resample",
-                        "sim_std": f"{sim.float().std().item():.5f}",
-                        "cer_std": f"{cer.float().std().item():.5f}",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            continue
-
-        R, bd = reward_v3(sim, cer, mos, reward_cfg)
-        t_ref0 = time.monotonic()
-        ref = lpc.compute_ref(prompts, rollout.codes, cfg.temperature, cfg.top_k)
-        t_ref = time.monotonic() - t_ref0
-        pol = lpc.compute_policy(prompts, rollout.codes, cfg.temperature, cfg.top_k)
-        loss, metrics = grpo_loss(
-            pol.log_probs, ref.log_probs, R, pol.mask, group_ids, algo
-        )
-
-        t_opt0 = time.monotonic()
-        optimizer.zero_grad()
-        loss.backward()
-        if not torch.isfinite(loss):
-            # non-finite loss (e.g. a sampled token falling out of the
-            # teacher-forcing top-k after a bad update) backprops NaN grads;
-            # stepping on them writes NaN into the weights permanently
-            print(
-                json.dumps({"step": step, "skip": "non_finite_loss"}),
+                    {"step": step, "skip": "no_trainable_group", "skips": skips}
+                ),
                 flush=True,
             )
-            optimizer.zero_grad(set_to_none=True)
             continue
+
+        # ---- phase 3: train — gradient accumulation, one group per pass ----
+        # (peak activation memory stays at single-group level; each group
+        # contributes 1/len(trainable) to the update, equal group weighting)
+        t_train0 = time.monotonic()
+        optimizer.zero_grad(set_to_none=True)
+        trained: list[tuple[torch.Tensor, object, dict]] = []
+        for g in trainable:
+            ref = lpc.compute_ref(
+                [g["prompt"]] * gs, g["codes"], cfg.temperature, cfg.top_k
+            )
+            pol = lpc.compute_policy(
+                [g["prompt"]] * gs, g["codes"], cfg.temperature, cfg.top_k
+            )
+            loss, metrics = grpo_loss(
+                pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo
+            )
+            if not torch.isfinite(loss):
+                # non-finite loss (e.g. a sampled token falling out of the
+                # teacher-forcing top-k) backprops NaN grads — drop the group
+                skips["nonfinite_loss"] = skips.get("nonfinite_loss", 0) + 1
+                continue
+            (loss / len(trainable)).backward()
+            trained.append((loss, metrics, g))
+        t_train = time.monotonic() - t_train0
+
+        if not trained:
+            print(
+                json.dumps(
+                    {"step": step, "skip": "all_losses_nonfinite", "skips": skips}
+                ),
+                flush=True,
+            )
+            continue
+
+        # ---- phase 4: update ----
+        t_opt0 = time.monotonic()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             ttm.trainable_parameters, cfg.grad_clip
         )
         optimizer.step()
         t_opt = time.monotonic() - t_opt0
 
+        losses = torch.stack([l for l, _, _ in trained])
+        pol_losses = torch.stack([m.policy_loss for _, m, _ in trained])
+        kls = [m.kl for _, m, _ in trained if m.kl is not None]
+        advs = torch.cat([m.advantage for _, m, _ in trained])
+        R_all = torch.cat([g["R"] for _, _, g in trained])
+        bds = [g["bd"] for _, _, g in trained]
+
+        def _col(key: str, bds=bds) -> float:
+            return torch.cat([getattr(b, key) for b in bds]).float().mean().item()
+
+        def _col_g(key: str, trained=trained) -> float:
+            return torch.cat([g[key] for _, _, g in trained]).mean().item()
+
         monitor = {
             "step": step,
-            "loss": round(loss.item(), 4),
-            "policy_loss": round(metrics.policy_loss.item(), 4),
-            "kl": round(metrics.kl.item(), 5) if metrics.kl is not None else None,
+            "groups_trained": len(trained),
+            "groups_skipped": sum(skips.values()),
+            "skips": skips,
+            "loss": round(losses.mean().item(), 4),
+            "policy_loss": round(pol_losses.mean().item(), 4),
+            "kl": round(torch.stack(kls).mean().item(), 5) if kls else None,
             "grad_norm": round(grad_norm.item(), 4),
-            "mean_R": round(R.mean().item(), 4),
-            "t_max": t_max,
-            "adv_std": round(metrics.advantage.std(unbiased=False).item(), 4),
-            "r_sv_mean": round(bd.r_sv.mean().item(), 4),
-            "r_wer_mean": round(bd.r_wer.mean().item(), 4),
-            "r_mos_mean": round(bd.r_mos.mean().item(), 4),
-            "std_sv": round(bd.std_sv.item(), 5),
-            "std_wer": round(bd.std_wer.item(), 5),
-            "mos_dead": bool((bd.std_mos < reward_cfg.mos_flameout_eps).item()),
-            "sim_mean": round(sim.mean().item(), 4),
-            "cer_mean": round(cer.mean().item(), 4),
-            "mos_mean": round(mos.mean().item(), 4),
+            "lr": f"{lr_t:.2e}",
+            "mean_R": round(R_all.mean().item(), 4),
+            "t_max": max(g["t_max"] for _, _, g in trained),
+            "adv_std": round(advs.std(unbiased=False).item(), 4),
+            "r_sv_mean": round(_col("r_sv"), 4),
+            "r_wer_mean": round(_col("r_wer"), 4),
+            "r_mos_mean": round(_col("r_mos"), 4),
+            "std_sv": round(torch.cat([b.std_sv for b in bds]).mean().item(), 5),
+            "std_wer": round(torch.cat([b.std_wer for b in bds]).mean().item(), 5),
+            "mos_dead_frac": round(
+                torch.stack(
+                    [(b.std_mos < reward_cfg.mos_flameout_eps).float() for b in bds]
+                )
+                .mean()
+                .item(),
+                3,
+            ),
+            "sim_mean": round(_col_g("sim"), 4),
+            "cer_mean": round(_col_g("cer"), 4),
+            "mos_mean": round(_col_g("mos"), 4),
             "t_rollout": round(t_rollout, 2),
             "t_score": round(t_score, 2),
-            "t_ref": round(t_ref, 2),
+            "t_train": round(t_train, 2),
             "t_opt": round(t_opt, 2),
             "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
             "rss_cur_mb": _current_rss_mb(),
