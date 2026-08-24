@@ -37,10 +37,10 @@ class LoRALinear(nn.Module):
         dtype = base.weight.dtype
         device = base.weight.device
         self.lora_a = nn.Parameter(
-            torch.empty(r, base.in_features, device=device, dtype=dtype)
+            torch.empty(base.in_features, r, device=device, dtype=dtype)
         )
         self.lora_b = nn.Parameter(
-            torch.empty(base.out_features, r, device=device, dtype=dtype)
+            torch.empty(r, base.out_features, device=device, dtype=dtype)
         )
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
         nn.init.zeros_(self.lora_b)  # delta = 0 at start → identical to base
@@ -50,7 +50,12 @@ class LoRALinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
         if self.enabled:
-            out = out + self.scaling * (x @ self.lora_a.t()) @ self.lora_b.t()
+            # parameters are stored pre-transposed ([in, r] / [r, out]) so both
+            # GEMMs take contiguous weight operands: a strided `.t()` view here
+            # makes cuBLAS materialize the weight during CUDA-graph capture,
+            # baking the value into the graph (probe C1v8: in-place optimizer
+            # updates stopped reaching graphed rollouts)
+            out = out + self.scaling * (x @ self.lora_a) @ self.lora_b
         return out
 
 

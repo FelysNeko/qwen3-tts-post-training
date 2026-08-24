@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sampler-impl",
         default=TrainConfig.sampler_impl,
-        choices=["hf", "fast", "compiled"],
+        choices=["hf", "fast", "compiled", "graphed"],
     )
     p.add_argument(
         "--variant", default=TrainConfig.variant, choices=["vanilla", "dr", "gspo"]

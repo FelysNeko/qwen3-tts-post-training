@@ -6,9 +6,10 @@
 - r_wer = 1 − CER_qwen3asr                          (normalize() + edit-distance CER)
 - r_mos = max(0, 2.5 − mos_utmosv2fold0)            (hinge 护栏, 线性地板: 只挡不驱动)
 - std is the *within-group* std of each component (batch-std layer; per MD the
-  std≈0 in all-above-τ groups). The MOS term 熄火 (zeroed) when its group std
-  drops below mos_flameout_eps (MD: 组内 std<eps 熄火). SV/WER keep the
-  max(std, eps) guard so they never divide by zero.
+  std≈0 in all-above-τ groups). Every term 熄火 (zeroed) when its group std
+  drops below its flameout eps (MD: 组内 std<eps 熄火) — MOS by construction in
+  healthy groups, SV/WER in degenerate groups (e.g. all-perfect transcripts);
+  otherwise a dead group would divide by eps and inject a 1e6 sentinel.
 - λ = (1.0, 1.0, 0.2) — v3 定稿.
 
 r_mos floor (2026-08-23, UTMOS-replacement A/B conclusion): a sigmoid is still
@@ -38,6 +39,7 @@ class RewardConfig:
     lam_wer: float = 1.0
     lam_mos: float = 0.2
     std_eps: float = 1e-6
+    flameout_eps: float = 1e-3
     mos_flameout_eps: float = 1e-4
     mos_flameout: bool = True
 
@@ -77,11 +79,18 @@ def reward_v3(
     cfg: RewardConfig | None = None,
     group_dim: int = -1,
 ) -> tuple[torch.Tensor, RewardBreakdown]:
-    """v3 composite reward. Each component is normalized by its within-group
-    std; the MOS term 熄火 (zeroed) when its group std < mos_flameout_eps.
+    """v3.1 composite reward: RAW component magnitudes, no within-group std
+    division. Dr.GRPO subtracts the group mean in the advantage, so flat
+    groups already produce near-zero A on their own; the old r/std(r)
+    standardization (a) amplified pure ranking noise to full scale on flat
+    groups (one Adam step along it collapsed the policy — smoke C1v8/C1v9)
+    and (b) was philosophically at odds with Dr.GRPO's "keep magnitude
+    information" design. The std flameout survives only as a signal-health
+    indicator (breakdown + needs_resample); a degenerate component (std <
+    flameout_eps) is zeroed so it cannot leak a constant offset either.
 
-    Returns (R, breakdown) with R of the same shape as the inputs (grouped
-    along group_dim).
+    Component scales (per take): r_sv ∈ (0,1) sigmoid; r_wer ∈ [0,1];
+    r_mos = max(0, τ−mos), linear penalty in MOS units, λ_mos=0.2.
     """
     cfg = cfg or RewardConfig()
 
@@ -93,17 +102,19 @@ def reward_v3(
     std_wer = r_wer.std(dim=group_dim, unbiased=False, keepdim=True)
     std_mos = r_mos.std(dim=group_dim, unbiased=False, keepdim=True)
 
-    term_sv = cfg.lam_sv * r_sv / std_sv.clamp_min(cfg.std_eps)
-    term_wer = cfg.lam_wer * r_wer / std_wer.clamp_min(cfg.std_eps)
-
+    # dead components contribute nothing (constant offsets are erased by the
+    # group-mean subtraction anyway; this keeps R itself interpretable)
+    zeros = torch.zeros_like(r_sv)
+    term_sv = torch.where(std_sv < cfg.flameout_eps, zeros, cfg.lam_sv * r_sv)
+    term_wer = torch.where(
+        std_wer < cfg.flameout_eps, zeros, cfg.lam_wer * r_wer
+    )
     if cfg.mos_flameout:
-        dead = std_mos < cfg.mos_flameout_eps
         term_mos = torch.where(
-            dead, torch.zeros_like(r_mos), r_mos
-        ) / std_mos.clamp_min(cfg.std_eps)
+            std_mos < cfg.mos_flameout_eps, zeros, cfg.lam_mos * r_mos
+        )
     else:
-        term_mos = r_mos / std_mos.clamp_min(cfg.std_eps)
-    term_mos = cfg.lam_mos * term_mos
+        term_mos = cfg.lam_mos * r_mos
 
     R = term_sv + term_wer + term_mos
     return R, RewardBreakdown(r_sv, r_wer, r_mos, std_sv, std_wer, std_mos, R)

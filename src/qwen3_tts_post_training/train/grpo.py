@@ -201,12 +201,17 @@ def needs_resample(
     sv_eps: float = 1e-3,
     wer_eps: float = 1e-3,
 ) -> bool:
-    """Zero-signal group → resample. Criterion is SV/WER variance ONLY (MOS
-    bimodal excluded — GLM EMO lesson). True when both the SV and WER reward
-    components are degenerate within the group (all-advantage-≈0).
+    """Zero-signal group → skip the update (DAPO-style dynamic sampling).
+
+    The only reliable within-group signal is WER spread: MOS is dead by
+    design (hinge floor, std≡0 in healthy groups) and SV rank on
+    same-policy takes is measurement noise (SV_REWARD_FINDINGS §四). So a
+    group trains ONLY when r_wer actually spreads — this covers both
+    all-perfect groups (r_wer ≡ 1) and flat-CER groups (8 takes with
+    identical cer, observed on the graphed smoke C1v8: std_wer = 0 with
+    cer = 0.14, where a single Adam step along the leftover SV-noise
+    ranking collapsed the policy into 12-79 s babbling rollouts).
     """
     r_sv = torch.sigmoid((sim - 0.8585) / 0.0966)
     r_wer = 1.0 - cer
-    return bool(
-        r_sv.std(unbiased=False) < sv_eps and r_wer.std(unbiased=False) < wer_eps
-    )
+    return bool(r_wer.std(unbiased=False) < wer_eps)

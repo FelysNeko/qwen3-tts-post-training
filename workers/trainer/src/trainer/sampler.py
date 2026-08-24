@@ -46,16 +46,26 @@ class Sampler:
         self.language = language
         self.non_streaming_mode = non_streaming_mode
         self.impl = impl
-        if impl in ("fast", "compiled"):
+        if impl in ("fast", "compiled", "graphed"):
             from trainer.fastgen import FastSampler
 
-            self._fast = FastSampler(
-                ttm,
-                speaker=speaker,
-                language=language,
-                non_streaming_mode=non_streaming_mode,
-                compile=(impl == "compiled"),
-            )
+            if impl == "graphed":
+                from trainer.fastgraph import GraphFastSampler
+
+                self._fast = GraphFastSampler(
+                    ttm,
+                    speaker=speaker,
+                    language=language,
+                    non_streaming_mode=non_streaming_mode,
+                )
+            else:
+                self._fast = FastSampler(
+                    ttm,
+                    speaker=speaker,
+                    language=language,
+                    non_streaming_mode=non_streaming_mode,
+                    compile=(impl == "compiled"),
+                )
         elif impl != "hf":
             raise ValueError(f"unknown sampler impl: {impl}")
 
@@ -77,7 +87,7 @@ class Sampler:
         """Generate one code-group sequence per text. Returns list of
         [T, num_code_groups] tensors (first column = semantic tokens; the EOS
         stop token is truncated by the generation path)."""
-        if self.impl == "fast":
+        if self.impl in ("fast", "compiled", "graphed"):
             return self._fast.sample(
                 texts,
                 seed=seed,

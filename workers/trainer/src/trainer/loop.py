@@ -67,7 +67,7 @@ class TrainConfig:
 
     variant: str = "dr"
     kl_beta: float = 0.001
-    lr: float = 5e-5
+    lr: float = 1e-5
     weight_decay: float = 0.01
     grad_clip: float = 1.0
 
@@ -83,6 +83,15 @@ def _load_text_pool(cfg: TrainConfig) -> list[str]:
     if cfg.text_pool_path is None:
         return list(cfg.text_pool)
     return [line.strip() for line in Path(cfg.text_pool_path).read_text().splitlines()]
+
+
+def _current_rss_mb() -> int:
+    """Current resident set size of this process (MB), from /proc."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * 4096 // 2**20
+    except OSError:
+        return -1
 
 
 def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
@@ -210,6 +219,15 @@ def _train_loop(
         )
         t_rollout = time.monotonic() - t0
 
+        t_max = max(c.shape[0] for c in rollout.codes)
+        if t_max > 400:
+            # runaway no-EOS group (degenerate policy state): scoring it is a
+            # waste and teacher-forcing [8, >400] with grads OOMs the 16 GB
+            # trainer GPU (graphed smoke C1v8)
+            print(json.dumps({"step": step, "skip": "runaway_rollout",
+                              "t_max": t_max}), flush=True)
+            continue
+
         t_score = 0.0
         try:
             results = scorer.score(
@@ -257,6 +275,16 @@ def _train_loop(
         t_opt0 = time.monotonic()
         optimizer.zero_grad()
         loss.backward()
+        if not torch.isfinite(loss):
+            # non-finite loss (e.g. a sampled token falling out of the
+            # teacher-forcing top-k after a bad update) backprops NaN grads;
+            # stepping on them writes NaN into the weights permanently
+            print(
+                json.dumps({"step": step, "skip": "non_finite_loss"}),
+                flush=True,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
         grad_norm = torch.nn.utils.clip_grad_norm_(
             ttm.trainable_parameters, cfg.grad_clip
         )
@@ -270,6 +298,7 @@ def _train_loop(
             "kl": round(metrics.kl.item(), 5) if metrics.kl is not None else None,
             "grad_norm": round(grad_norm.item(), 4),
             "mean_R": round(R.mean().item(), 4),
+            "t_max": t_max,
             "adv_std": round(metrics.advantage.std(unbiased=False).item(), 4),
             "r_sv_mean": round(bd.r_sv.mean().item(), 4),
             "r_wer_mean": round(bd.r_wer.mean().item(), 4),
@@ -285,6 +314,9 @@ def _train_loop(
             "t_ref": round(t_ref, 2),
             "t_opt": round(t_opt, 2),
             "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
+            "rss_cur_mb": _current_rss_mb(),
+            "gpu_alloc_mb": round(torch.cuda.memory_allocated(cfg.device) / 2**20, 1),
+            "gpu_reserved_mb": round(torch.cuda.memory_reserved(cfg.device) / 2**20, 1),
             "dur_s": round(time.monotonic() - t0, 2),
         }
         line = json.dumps(monitor, ensure_ascii=False)
