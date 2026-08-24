@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 from trainer.decoder import Decoder, write_wav
-from trainer.sampler import Sampler
+from trainer.samplers import Sampler
 
 
 @dataclass
@@ -31,10 +31,14 @@ def rollout_group(
     prompts: list[str],
     seed: int,
     tag: str,
+    temperature: float = 0.9,
+    top_k: int = 50,
     work_dir: Path | None = None,
 ) -> RolloutResult:
     """Sample one group and render it to wav. Returns codes + wav paths."""
-    codes = sampler.sample(prompts, seed=seed)
+    codes = sampler.sample(
+        prompts, seed=seed, temperature=temperature, top_k=top_k
+    )
     wavs, fs = decoder.decode(codes)
     if work_dir is None:
         work_dir = Path("/dev/shm") / f"grpo_{tag}"

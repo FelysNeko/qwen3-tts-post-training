@@ -20,18 +20,8 @@ Phase-0 profile (PROJECT_STATUS §9): B=8 generation spends ~61% in code
 predictor forwards, ~24% main forwards, ~13% HF loop machinery, all
 CPU-launch bound (GPU busy < 1 ms per forward). This module strips the
 machinery layer and pins down the exact per-step op sequence as groundwork
-for the torch.compile / CUDA-graph phases.
-
-``compile=True`` (Phase-2 probe variant A) wraps the two backbone forwards
-with ``torch.compile(dynamic=None, options={"epilogue_fusion": False})``
-(2.4x; epilogue fusion off — vllm-omni's precision note). Determinism
-contract, from the Step-0 probes: the first call walks a static->dynamic
-graph promotion and drifts from later runs, so __init__ warms up with two
-short dummy generations of different lengths; after warmup same-seed runs
-are bitwise self-reproducible and no per-length recompiles occur. Compiled
-kernels legitimately drift vs eager (inductor float reassociation, greedy
-argmax flips at step 0) — bit-equality vs the HF path only holds for
-``compile=False``.
+for the torch.compile / CUDA-graph phases (see torch_compile.py /
+cuda_graph.py).
 """
 
 from __future__ import annotations
@@ -40,50 +30,20 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 from trainer.model import TrainerModel
-from trainer.sampler import tokenize_assistant
+from trainer.samplers.base import Sampler, tokenize_assistant
 
 
-def enable_compile(ttm: TrainerModel) -> bool:
-    """Wrap the two backbone forwards with torch.compile (idempotent).
-
-    Returns True if this call installed the wrappers. ``dynamic=None``:
-    first trace is static, later shapes promote to dynamic graphs (verified:
-    no per-length recompile storm). Dynamo cache limit is raised because the
-    LoRA on/off guard variants alone account for ~200 graphs.
-    """
-    talker = ttm.model.talker
-    if getattr(talker.model, "_q3tts_compiled", False):
-        return False
-    torch._dynamo.config.cache_size_limit = 256
-    talker.model.forward = torch.compile(
-        talker.model.forward, dynamic=None, options={"epilogue_fusion": False}
-    )
-    talker.code_predictor.model.forward = torch.compile(
-        talker.code_predictor.model.forward,
-        dynamic=None,
-        options={"epilogue_fusion": False},
-    )
-    talker.model._q3tts_compiled = True
-    return True
-
-
-class FastSampler:
-    """Drop-in replacement for ``Sampler`` with the HF loops stripped out."""
+class EagerSampler(Sampler):
+    """Drop-in replacement for ``HFSampler`` with the HF loops stripped out."""
 
     def __init__(
         self,
         ttm: TrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
-        non_streaming_mode: bool = True,
-        compile: bool = False,
     ):
-        if language.lower() != "auto" or not non_streaming_mode:
-            raise NotImplementedError(
-                "fastgen supports the Auto + non-streaming layout only"
-            )
-        self.ttm = ttm
-        self.speaker = speaker
+        assert language.lower() == "auto", "eager sampler supports the Auto (non-streaming) layout only"
+        super().__init__(ttm, speaker=speaker, language=language)
         model = ttm.model
         self.talker = model.talker
         tc = model.config.talker_config
@@ -105,36 +65,6 @@ class FastSampler:
         self.cp_proj = self.cp.small_to_mtp_projection
         self.cp_emb = self.cp.get_input_embeddings()
         self.cp_heads = self.cp.lm_head
-        self._compiled = False
-        self._warmed_batches: set[int] = set()
-        if compile:
-            enable_compile(ttm)
-            self._compiled = True
-            self._warmup()
-
-    def _warmup(self) -> None:
-        """Two short B=1 dummy generations of different lengths.
-
-        Absorbs dynamo's static->dynamic graph promotion for the sequence
-        dimension (Step-0 probe A). The batch dimension promotes separately:
-        ``_maybe_warm_batch`` lazily runs one short dummy per new batch size
-        before the first real call at that size, so real ``sample`` calls are
-        always on the settled (bitwise self-reproducible) path. Cold cost is
-        ~2 min at the first new batch size (compile), then seconds.
-        """
-        self.sample(["你好。"], seed=0, max_new_tokens=32)
-        self.sample(
-            ["这是一段用于预热的稍长文本，用来触发动态形状图的编译与稳定。"],
-            seed=0,
-            max_new_tokens=32,
-        )
-
-    def _maybe_warm_batch(self, b: int) -> None:
-        if not self._compiled or b in self._warmed_batches:
-            return
-        self._warmed_batches.add(b)
-        if b > 1:
-            self.sample(["你好。"] * b, seed=0, max_new_tokens=32)
 
     # ------------------------------------------------------------------
     # prefill
@@ -378,8 +308,6 @@ class FastSampler:
         do_sample: bool = True,
         temperature: float = 0.9,
         top_k: int = 50,
-        top_p: float = 1.0,
-        repetition_penalty: float | None = None,
         max_new_tokens: int = 4096,
         subtalker_do_sample: bool | None = None,
         subtalker_temperature: float = 0.9,
@@ -387,15 +315,6 @@ class FastSampler:
     ) -> list[torch.Tensor]:
         """Same contract as ``Sampler.sample``: one [T, num_code_groups]
         tensor per text, truncated at the codebook-0 EOS token."""
-        if repetition_penalty is not None:
-            raise NotImplementedError(
-                "repetition_penalty is dropped for RL sampling (MD §7)"
-            )
-        if top_p != 1.0:
-            raise NotImplementedError(
-                "top_p != 1 is not part of the RL sampling config"
-            )
-        self._maybe_warm_batch(len(texts))  # before reseeding: dummy consumes RNG
         if seed is not None:
             torch.manual_seed(seed)
         sdo = do_sample if subtalker_do_sample is None else subtalker_do_sample

@@ -24,10 +24,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=TrainConfig.max_new_tokens)
     p.add_argument("--temperature", type=float, default=TrainConfig.temperature)
     p.add_argument("--top-k", type=int, default=TrainConfig.top_k)
-    p.add_argument("--top-p", type=float, default=TrainConfig.top_p)
-    p.add_argument(
-        "--repetition-penalty", type=float, default=TrainConfig.repetition_penalty
-    )
     p.add_argument(
         "--sampler-impl",
         default=TrainConfig.sampler_impl,
@@ -66,8 +62,6 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty,
         sampler_impl=args.sampler_impl,
         variant=args.variant,
         kl_beta=args.kl_beta,

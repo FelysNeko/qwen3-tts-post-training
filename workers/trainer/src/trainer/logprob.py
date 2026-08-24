@@ -13,9 +13,13 @@ logits ≈ 0.31 bf16 noise, sampled-token ranks identical).
 The sampled codes exclude the EOS stop token (generation truncates it), so the
 log-prob sum covers exactly the returned semantic tokens.
 
-Sampling-consistency (MD §7 缺口 #3): logits are divided by the same
-temperature used for sampling and the same top_k/suppress masks are applied, so
-the policy ratio / KL are computed under the actual sampling distribution.
+Sampling-consistency (MD §7 缺口 #3, revised after C1v10): logits are divided
+by the same temperature used for sampling and evaluated on the FULL fp32
+softmax. The sampling-time top_k/suppress masks are deliberately NOT re-applied
+(a hard truncation is discontinuous in the weights — see
+`logprobs_from_logits`); repetition_penalty is not part of the RL sampling
+contract at all (sampler signatures exclude it), so the reconstruction stays
+stateless: one teacher-forcing forward, temperature scaling, done.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from trainer.model import TrainerModel
-from trainer.sampler import tokenize_assistant
+from trainer.samplers import tokenize_assistant
 
 # SFT-collate layout (official TTSDataset.collate_fn), per sample:
 #   0-2     role tokens (text channel)
@@ -50,9 +54,6 @@ def logprobs_from_logits(
     logits: torch.Tensor,
     tokens: torch.Tensor,
     temperature: float = 1.0,
-    top_k: int | None = None,
-    suppress: tuple[int, int] | None = None,
-    eos_id: int | None = None,
 ) -> torch.Tensor:
     """Per-position log-prob of `tokens` under the temperature-scaled model
     distribution, evaluated on the FULL softmax.
@@ -68,8 +69,7 @@ def logprobs_from_logits(
     behavior-policy bias is negligible. Temperature is kept (continuous, no
     boundary). Softmax runs in fp32 — bf16 log_softmax quantization
     (~0.02/token) would otherwise dominate the small deltas the ratio and
-    KL are made of. `top_k`/`suppress`/`eos_id` are accepted and ignored
-    (call-site compatibility)."""
+    KL are made of."""
     logits = logits.float() / temperature
     return F.log_softmax(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
@@ -86,8 +86,6 @@ class LogProbComputer:
 
         talker_config = self.talker.config
         self.num_code_groups = talker_config.num_code_groups
-        self.suppress = (talker_config.vocab_size - 1024, talker_config.vocab_size)
-        self.eos_id = talker_config.codec_eos_token_id
         self.speaker_vec = self.talker.model.codec_embedding.weight[
             talker_config.spk_id[speaker.lower()]
         ]
@@ -210,12 +208,11 @@ class LogProbComputer:
         texts: list[str],
         codes: list[torch.Tensor],
         temperature: float = 0.9,
-        top_k: int | None = 50,
     ) -> LogProbResult:
         """Reference (adapter OFF) log-probs — frozen base forward, no grads."""
         self.ttm.set_adapter(False)
         try:
-            return self._forward(texts, codes, temperature, top_k)
+            return self._forward(texts, codes, temperature)
         finally:
             self.ttm.set_adapter(True)
 
@@ -224,18 +221,16 @@ class LogProbComputer:
         texts: list[str],
         codes: list[torch.Tensor],
         temperature: float = 0.9,
-        top_k: int | None = 50,
     ) -> LogProbResult:
         """Policy (adapter ON) log-probs — differentiable, part of the train graph."""
         self.ttm.set_adapter(True)
-        return self._forward(texts, codes, temperature, top_k)
+        return self._forward(texts, codes, temperature)
 
     def _forward(
         self,
         texts: list[str],
         codes: list[torch.Tensor],
         temperature: float,
-        top_k: int | None,
     ) -> LogProbResult:
         input_embeddings, attention_mask, meta = self._build_input(texts, codes)
         logits = self.talker(
@@ -253,9 +248,6 @@ class LogProbComputer:
                 logits[i, pred_positions],
                 m["semantic_tokens"],
                 temperature,
-                top_k,
-                self.suppress,
-                self.eos_id,
             )
             log_prob_cols.append(F.pad(token_log_probs, (0, max_code_len - code_len)))
             lengths.append(code_len)

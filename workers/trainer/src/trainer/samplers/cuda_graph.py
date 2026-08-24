@@ -13,12 +13,12 @@ kernel. The pooling trick is valid because a GRPO group rolls out the SAME text
 - Code predictor: prefill [B,2] (eager) + 14 captured 1-token steps per main
   step, its own small pool (LMAX = num_code_groups).
 - Sampling stays eager outside the graphs (same multinomial draw order as
-  fastgen), EOS via a tiny D2H check, ``cache_seqlens`` bounds every row so
+  the eager path), EOS via a tiny D2H check, ``cache_seqlens`` bounds every row so
   stale pool bytes are never read. LoRA adapter is ON for capture+replay;
   optimizer in-place weight updates are picked up by replay (same addresses).
 
 Numerics: ``flash_attn_with_kvcache`` agrees with ``flash_attn_func`` within
-~0.004 (bf16) — a different kernel family than the eager fastgen path
+~0.004 (bf16) — a different kernel family than the eager path
 (DynamicCache + HF FA2), so this path is NOT bit-equal to `fast`/`compiled`;
 its contract is same-seed self-reproducibility + distribution-level
 equivalence, verified by the probe C1v4 (graph capture + replay + multi-step
@@ -28,24 +28,17 @@ in-place growth all match the reference).
 from __future__ import annotations
 
 import torch
-from transformers.cache_utils import Cache
-
-from trainer.fastgen import FastSampler
-from trainer.model import TrainerModel
-
-try:
-    from flash_attn import flash_attn_with_kvcache
-
-    _HAS_FLASH_ATTN = True
-except ImportError:  # pragma: no cover — only reachable in broken envs
-    _HAS_FLASH_ATTN = False
-
+from flash_attn import flash_attn_with_kvcache
 from qwen_tts.core.models.modeling_qwen3_tts import (
     Qwen3TTSAttention,
     Qwen3TTSTalkerAttention,
     apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb,
 )
+from transformers.cache_utils import Cache
+
+from trainer.model import TrainerModel
+from trainer.samplers.eager import EagerSampler
 
 
 class StaticKVCache(Cache):
@@ -236,37 +229,64 @@ def install_attention_patch() -> bool:
     return True
 
 
-class GraphFastSampler(FastSampler):
-    """CUDA-graph rollout sampler. Fixed batch size (GRPO group); other batch
-    sizes fall back to the plain eager FastSampler."""
+def capture_graph(fn, out_buf: torch.Tensor, probe_fn) -> torch.cuda.CUDAGraph:
+    """Warm the workload, capture it into a CUDA graph, and verify the replay
+    reproduces the eager output (catches corrupt captures) and responds to
+    input-content changes (catches empty captures — WSL2 secondary-GPU
+    default-stream bug, probe C1v7).
+
+    MUST capture on an explicit stream: torch.cuda.graph() with the default
+    stream records an EMPTY graph on the secondary GPU (cuda:1 / RTX 5070 Ti,
+    WSL2). vLLM sidesteps the same bug by always capturing on a dedicated
+    stream. Capture failures here are deterministic environment/code bugs,
+    not transient states — they surface immediately instead of retrying."""
+    dev = out_buf.device
+    capture_stream = torch.cuda.Stream(device=dev)
+    with torch.inference_mode(), torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize(dev)
+
+        eager = fn().clone()
+        torch.cuda.synchronize(dev)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=capture_stream):
+            out_buf.copy_(fn())
+        torch.cuda.synchronize(dev)
+
+    out_buf.zero_()
+    g.replay()
+    torch.cuda.synchronize(dev)
+    assert torch.equal(out_buf, eager), "graph replay diverged from eager output"
+
+    # Safety net: perturb an input buffer and check the replay output
+    # changes — catches empty/corrupt captures.
+    probe_baseline = out_buf.clone()
+    probe_fn()
+    torch.cuda.synchronize(dev)
+    g.replay()
+    torch.cuda.synchronize(dev)
+    assert not torch.equal(out_buf, probe_baseline), "empty graph (capture recorded nothing); use --sampler-impl compiled"
+    return g
+
+
+class CudaGraphSampler(EagerSampler):
+    """CUDA-graph rollout sampler. Fixed batch size (GRPO group); mismatched
+    batch sizes assert — switch to ``EagerSampler`` for arbitrary batches."""
 
     def __init__(
         self,
         ttm: TrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
-        non_streaming_mode: bool = True,
         batch_size: int = 8,
         lmax: int = 1024,
     ):
-        if not _HAS_FLASH_ATTN:
-            raise RuntimeError("flash-attn is required for the graphed sampler")
-        super().__init__(
-            ttm,
-            speaker=speaker,
-            language=language,
-            non_streaming_mode=non_streaming_mode,
-            compile=False,
-        )
+        super().__init__(ttm, speaker=speaker, language=language)
         install_attention_patch()
         self.batch = batch_size
         self.lmax = lmax
-        self._eager = FastSampler(
-            ttm,
-            speaker=speaker,
-            language=language,
-            non_streaming_mode=non_streaming_mode,
-        )
         dev = ttm.device
         self.main_cache = StaticKVCache(
             self.tc.num_hidden_layers,
@@ -322,7 +342,7 @@ class GraphFastSampler(FastSampler):
                 output_hidden_states=False,
             ).last_hidden_state
 
-        self.main_graph = self._capture_graph(
+        self.main_graph = capture_graph(
             run_main, self.main_out_buf, lambda: self.main_emb_buf.normal_()
         )
 
@@ -346,63 +366,9 @@ class GraphFastSampler(FastSampler):
                 output_hidden_states=False,
             ).last_hidden_state
 
-        self.cp_graph = self._capture_graph(
+        self.cp_graph = capture_graph(
             run_cp, self.cp_out_buf, lambda: self.cp_emb_buf.normal_()
         )
-
-    @staticmethod
-    def _capture_graph(fn, out_buf: torch.Tensor, probe_fn) -> torch.cuda.CUDAGraph:
-        """Warm the workload, capture it into a CUDA graph, and verify the
-        replay reproduces the eager output (catches empty/corrupt captures)
-        and responds to input-content changes (catches Blackwell/WSL input
-        baking). Retries with heavier warmup if a capture-time CUDA error
-        occurs."""
-        dev = out_buf.device
-        # MUST capture on an explicit stream: torch.cuda.graph() with the
-        # default stream records an EMPTY graph on the secondary GPU
-        # (cuda:1 / RTX 5070 Ti, WSL2) — probe C1v7. vLLM sidesteps the same
-        # bug by always capturing on a dedicated stream.
-        capture_stream = torch.cuda.Stream(device=dev)
-        last_err = None
-        for attempt in range(3):
-            try:
-                with torch.inference_mode():
-                    with torch.cuda.stream(capture_stream):
-                        for _ in range(3 + attempt):
-                            fn()
-                        torch.cuda.synchronize(dev)
-
-                        eager = fn().clone()
-                        torch.cuda.synchronize(dev)
-
-                        g = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(g, stream=capture_stream):
-                            out_buf.copy_(fn())
-                        torch.cuda.synchronize(dev)
-
-                    out_buf.zero_()
-                    g.replay()
-                    torch.cuda.synchronize(dev)
-                    if not torch.equal(out_buf, eager):
-                        raise RuntimeError("graph replay diverged from eager output")
-
-                    # Safety net: perturb an input buffer and check the
-                    # replay output changes. Catches empty/corrupt captures
-                    # (default-stream capture on cuda:1 records nothing).
-                    probe_baseline = out_buf.clone()
-                    probe_fn()
-                    torch.cuda.synchronize(dev)
-                    g.replay()
-                    torch.cuda.synchronize(dev)
-                    if torch.equal(out_buf, probe_baseline):
-                        raise RuntimeError(
-                            "CUDA graph capture records nothing on this device "
-                            "(empty graph); use --sampler-impl compiled"
-                        )
-                    return g
-            except Exception as e:  # noqa: BLE001 — retry, then surface
-                last_err = e
-        raise RuntimeError(f"CUDA graph capture failed after retries: {last_err}")
 
     # ------------------------------------------------------------------
     # decode
@@ -420,6 +386,9 @@ class GraphFastSampler(FastSampler):
         embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts)
         dev = self.ttm.device
         text_len = int(mask.sum(-1).max().item())
+        # FA2 kvcache writes past the pool unchecked — an oversized prefill is
+        # an out-of-bounds write, not a Python error.
+        assert text_len < self.lmax, f"prefill {text_len} >= lmax {self.lmax}"
         position_ids, rope_deltas = self.talker.get_rope_index(mask)
         rope_deltas = rope_deltas - (1 - mask).sum(-1, keepdim=True)
         valid = embeds_b[:, -text_len:, :]
@@ -518,37 +487,15 @@ class GraphFastSampler(FastSampler):
         do_sample: bool = True,
         temperature: float = 0.9,
         top_k: int = 50,
-        top_p: float = 1.0,
-        repetition_penalty: float | None = None,
         max_new_tokens: int = 4096,
         subtalker_do_sample: bool | None = None,
         subtalker_temperature: float = 0.9,
         subtalker_top_k: int = 50,
     ) -> list[torch.Tensor]:
-        """Same contract as ``FastSampler.sample``. Non-matching batch sizes
-        fall back to the eager fastgen path."""
-        if repetition_penalty is not None:
-            raise NotImplementedError(
-                "repetition_penalty is dropped for RL sampling (MD §7)"
-            )
-        if top_p != 1.0:
-            raise NotImplementedError(
-                "top_p != 1 is not part of the RL sampling config"
-            )
-        if len(texts) != self.batch:
-            return self._eager.sample(
-                texts,
-                seed=seed,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                max_new_tokens=max_new_tokens,
-                subtalker_do_sample=subtalker_do_sample,
-                subtalker_temperature=subtalker_temperature,
-                subtalker_top_k=subtalker_top_k,
-            )
+        """Same contract as ``EagerSampler.sample``. Batch size must equal
+        ``batch_size`` (the captured graph shape); use ``EagerSampler``
+        directly for anything else."""
+        assert len(texts) == self.batch, f"graphed sampler is fixed batch={self.batch}; use --sampler-impl fast"
         if seed is not None:
             torch.manual_seed(seed)
         sdo = do_sample if subtalker_do_sample is None else subtalker_do_sample
@@ -608,5 +555,4 @@ class GraphFastSampler(FastSampler):
         """One tiny graph-path generation + self-repro sanity check."""
         a = self.sample(["你好。"] * self.batch, seed=0, max_new_tokens=16)
         b = self.sample(["你好。"] * self.batch, seed=0, max_new_tokens=16)
-        if not all(torch.equal(x, y) for x, y in zip(a, b)):
-            raise RuntimeError("graph sampler failed self-reproducibility check")
+        assert all(torch.equal(x, y) for x, y in zip(a, b)), "graph sampler failed self-reproducibility check"

@@ -29,7 +29,7 @@ from trainer.decoder import Decoder
 from trainer.logprob import LogProbComputer
 from trainer.model import TrainerModel
 from trainer.rollout import rollout_group
-from trainer.sampler import Sampler
+from trainer.samplers import Sampler, build_sampler
 
 # v1 placeholder text pool (domain: narrative / dialogue / rhythmic narration).
 TEXT_POOL = (
@@ -64,8 +64,6 @@ class TrainConfig:
 
     temperature: float = 0.9
     top_k: int = 50
-    top_p: float = 1.0
-    repetition_penalty: float | None = None
     sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
 
     variant: str = "dr"
@@ -110,10 +108,9 @@ def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
 
 
 def _scores_to_tensor(results: list[dict], key: str, device: str) -> torch.Tensor:
-    """Extract one score column; `error`/None anywhere → raises so the step skips."""
+    """Extract one score column; `error`/None anywhere → asserts so the step skips."""
     values = [r[key] for r in results]
-    if any(v is None for v in values):
-        raise RuntimeError(f"scorer column {key!r} is None (scorer failure?)")
+    assert not any(v is None for v in values), f"scorer column {key!r} is None (scorer failure?)"
     return torch.tensor(values, dtype=torch.float32, device=device)
 
 
@@ -170,12 +167,7 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
     cfg = cfg or TrainConfig()
     dtype = getattr(torch, cfg.dtype)
 
-    if not Path(cfg.model_path).exists():
-        raise FileNotFoundError(
-            f"TTS model ckpt not found at {cfg.model_path!r}. "
-            "Pass --model-path (or set TrainConfig.model_path) to your "
-            "PhiLia093-TTS ckpt once it is downloaded."
-        )
+    assert Path(cfg.model_path).exists(), f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
 
     ttm = TrainerModel(
         cfg.model_path,
@@ -184,7 +176,7 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
     )
-    sampler = Sampler(ttm, speaker=cfg.speaker, impl=cfg.sampler_impl)
+    sampler = build_sampler(ttm, impl=cfg.sampler_impl, speaker=cfg.speaker)
     decoder = Decoder(ttm)
     lpc = LogProbComputer(ttm, speaker=cfg.speaker)
     scorer = ScorerClient(device=cfg.scorer_device)
@@ -237,6 +229,8 @@ def _train_loop(
                 [prompt] * gs,
                 seed=cfg.seed * 1000003 + step * 1009 + gi,
                 tag=f"step{step}g{gi}",
+                temperature=cfg.temperature,
+                top_k=cfg.top_k,
             )
             t_max = max(c.shape[0] for c in rollout.codes)
             if t_max > cfg.runaway_t_max:
@@ -320,10 +314,10 @@ def _train_loop(
         trained: list[tuple[torch.Tensor, object, dict]] = []
         for g in trainable:
             ref = lpc.compute_ref(
-                [g["prompt"]] * gs, g["codes"], cfg.temperature, cfg.top_k
+                [g["prompt"]] * gs, g["codes"], cfg.temperature
             )
             pol = lpc.compute_policy(
-                [g["prompt"]] * gs, g["codes"], cfg.temperature, cfg.top_k
+                [g["prompt"]] * gs, g["codes"], cfg.temperature
             )
             loss, metrics = grpo_loss(
                 pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo
