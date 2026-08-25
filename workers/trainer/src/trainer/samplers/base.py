@@ -33,6 +33,23 @@ def tokenize_assistant(processor, text: str) -> torch.Tensor:
     return ids.unsqueeze(0) if ids.dim() == 1 else ids
 
 
+def prefill_cur_len(processor, texts: list[str]) -> int:
+    """Prefill length `cur_len = mask.shape[1]` for `token_budget` accounting.
+
+    Shared by `EagerSampler` and `HFSampler` — exact `eager._build_prefill`
+    logic up to the `mask` (no forward), so `hf` no longer depends on
+    `eager.py`. `cur_len` is the padded prefill length (text + cie/role
+    overhead), and `max_new = token_budget - cur_len`.
+    """
+    # head 8 + tail n+1 + last 1 = n+10 where n = ids.shape[1]-8
+    max_n = 0
+    for text in texts:
+        ids = tokenize_assistant(processor, text)
+        n = ids.shape[1] - 8
+        max_n = max(max_n, n)
+    return max_n + 10
+
+
 class Sampler(ABC):
     """Abstract rollout sampler: text prompts → semantic code groups.
 
@@ -63,22 +80,24 @@ class Sampler(ABC):
         self.language = language
 
     def warmup_sample(
-        self, text: str, batch: int, max_new_tokens: int
+        self, text: str, batch: int, token_budget: int
     ) -> list[torch.Tensor]:
         """One dummy generation at the RL contract config (seed 0, T=0.9,
         top_k=50, subtalker trio at upstream defaults); returns its codes.
         Used by the compiled/graphed impls' warmup paths — dummy generations
-        must consume the same RNG stream shape as real rollouts."""
-        return self.sample(
+        must consume the same RNG stream shape as real rollouts.
+        ``token_budget`` is total tokens (prefill cur_len + new) budget."""
+        codes, _ = self.sample(
             [text] * batch,
             seed=0,
             do_sample=True,
             temperature=0.9,
             top_k=50,
-            max_new_tokens=max_new_tokens,
+            token_budget=token_budget,
             subtalker_temperature=0.9,
             subtalker_top_k=50,
         )
+        return codes
 
     @abstractmethod
     def sample(
@@ -89,13 +108,14 @@ class Sampler(ABC):
         do_sample: bool,
         temperature: float,
         top_k: int,
-        max_new_tokens: int,
+        token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
-    ) -> list[torch.Tensor]:
-        """Generate one code-group sequence per text. Returns list of
-        [T, num_code_groups] tensors (first column = semantic tokens; the EOS
-        stop token is truncated by the generation path).
+    ) -> tuple[list[torch.Tensor], int]:
+        """Generate one code-group sequence per text. Returns
+        ``(codes, cur_len)`` where ``codes`` is list of [T, num_code_groups]
+        tensors (first column = semantic tokens; EOS truncated) and ``cur_len``
+        is prefill length (mask.shape[1]) for token_budget accounting.
 
         All sampling params are keyword-only WITHOUT defaults: callers state
         the full config explicitly (the RL contract lives at call sites;
@@ -109,4 +129,7 @@ class Sampler(ABC):
         the outer (semantic token) loop and the code-predictor loop — the
         split variant was never used; greedy verification wants both greedy,
         sampling wants both sampling. The loops keep separate
-        temperature/top_k (a real TTS codec research dimension)."""
+        temperature/top_k (a real TTS codec research dimension).
+        ``token_budget`` is total tokens (prefill cur_len + new) budget;
+        effective ``max_new = token_budget - cur_len`` (replaces
+        max_new_tokens/lmax/runaway_t_max, ``AGENTS.md`` token_budget)."""

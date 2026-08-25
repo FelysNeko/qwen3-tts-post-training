@@ -17,11 +17,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--speaker", default=TrainConfig.speaker)
     p.add_argument("--num-prompts", type=int, default=TrainConfig.num_prompts)
     p.add_argument("--group-size", type=int, default=TrainConfig.group_size)
-    p.add_argument("--runaway-t-max", type=int, default=TrainConfig.runaway_t_max)
+    p.add_argument("--token-budget", type=int, default=TrainConfig.token_budget)
+    p.add_argument(
+        "--token-budget-infer", type=int, default=TrainConfig.token_budget_infer
+    )
     p.add_argument("--text-pool-path", default=TrainConfig.text_pool_path)
     p.add_argument("--num-steps", type=int, default=TrainConfig.num_steps)
     p.add_argument("--seed", type=int, default=TrainConfig.seed)
-    p.add_argument("--max-new-tokens", type=int, default=TrainConfig.max_new_tokens)
     p.add_argument("--temperature", type=float, default=TrainConfig.temperature)
     p.add_argument("--top-k", type=int, default=TrainConfig.top_k)
     p.add_argument(
@@ -55,11 +57,11 @@ def main() -> None:
         speaker=args.speaker,
         num_prompts=args.num_prompts,
         group_size=args.group_size,
-        runaway_t_max=args.runaway_t_max,
+        token_budget=args.token_budget,
+        token_budget_infer=args.token_budget_infer,
         text_pool_path=args.text_pool_path,
         num_steps=args.num_steps,
         seed=args.seed,
-        max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
         sampler_impl=args.sampler_impl,

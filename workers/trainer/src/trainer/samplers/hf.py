@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from trainer.samplers.base import Sampler, tokenize_assistant
+from trainer.samplers.base import Sampler, prefill_cur_len, tokenize_assistant
 
 
 class HFSampler(Sampler):
@@ -25,12 +25,14 @@ class HFSampler(Sampler):
         do_sample: bool,
         temperature: float,
         top_k: int,
-        max_new_tokens: int,
+        token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``Sampler.sample`` (see base class)."""
         torch.manual_seed(seed)
+        cur_len = prefill_cur_len(self.ttm.processor, texts)
+        max_new_tokens = max(0, token_budget - cur_len)
         input_ids = [self._tokenize(t) for t in texts]
         n = len(texts)
         codes, _ = self.ttm.model.generate(
@@ -50,4 +52,4 @@ class HFSampler(Sampler):
             subtalker_temperature=subtalker_temperature,
             subtalker_top_k=subtalker_top_k,
         )
-        return codes
+        return codes, cur_len

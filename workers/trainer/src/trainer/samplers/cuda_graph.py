@@ -474,13 +474,15 @@ class CudaGraphSampler(EagerSampler):
         do_sample: bool,
         temperature: float,
         top_k: int,
-        max_new_tokens: int,
+        token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``EagerSampler.sample``. Batch size must equal
         ``batch_size`` (the captured graph shape); use ``EagerSampler``
-        directly for anything else."""
+        directly for anything else.
+        ``token_budget`` is total tokens (prefill cur_len + new) budget;
+        effective ``max_new = token_budget - cur_len`` clamped by ``lmax``."""
         assert len(texts) == self.batch, f"graphed sampler is fixed batch={self.batch}; use --sampler-impl fast"
         torch.manual_seed(seed)
 
@@ -494,6 +496,8 @@ class CudaGraphSampler(EagerSampler):
             text_len,
         ) = self._graph_prefill(texts)
         cur_len = text_len
+        init_cur_len = cur_len
+        max_new_tokens = max(0, token_budget - cur_len)
         max_new_tokens = min(max_new_tokens, self.lmax - cur_len)
         tok = self._choose(
             self._process_outer(logits, 0, do_sample, temperature, top_k), do_sample
@@ -533,10 +537,10 @@ class CudaGraphSampler(EagerSampler):
             hit = (col == self.eos).nonzero()
             length = int(hit[0]) if hit.numel() else all_rows.shape[0]
             results.append(all_rows[:length, i, :])
-        return results
+        return results, init_cur_len
 
     def _warmup_graph(self) -> None:
         """One tiny graph-path generation + self-repro sanity check."""
-        a = self.warmup_sample("你好。", self.batch, max_new_tokens=16)
-        b = self.warmup_sample("你好。", self.batch, max_new_tokens=16)
+        a = self.warmup_sample("你好。", self.batch, token_budget=64)
+        b = self.warmup_sample("你好。", self.batch, token_budget=64)
         assert all(torch.equal(x, y) for x, y in zip(a, b)), "graph sampler failed self-reproducibility check"

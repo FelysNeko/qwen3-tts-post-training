@@ -30,8 +30,11 @@ def build_sampler(
     impl: str = "hf",
     speaker: str = "cyrene",
     language: str = "Auto",
+    lmax: int = 1024,
 ) -> Sampler:
-    """Instantiate the sampler named by ``impl`` (see module docstring)."""
+    """Instantiate the sampler named by ``impl`` (see module docstring).
+    ``lmax`` is total tokens budget for inference (static KV pool) — graphed
+    only; for training the per-call ``token_budget`` caps ``max_new``."""
     if impl == "hf":
         from trainer.samplers.hf import HFSampler
 
@@ -47,7 +50,7 @@ def build_sampler(
     if impl == "graphed":
         from trainer.samplers.cuda_graph import CudaGraphSampler
 
-        return CudaGraphSampler(ttm, speaker=speaker, language=language)
+        return CudaGraphSampler(ttm, speaker=speaker, language=language, lmax=lmax)
     raise ValueError(f"unknown sampler impl: {impl}")
 
 

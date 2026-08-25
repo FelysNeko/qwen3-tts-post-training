@@ -59,8 +59,8 @@ class TrainConfig:
     group_size: int = 8  # rollouts per prompt (the GRPO group)
     num_steps: int = 1
     seed: int = 0
-    max_new_tokens: int = 4096
-    runaway_t_max: int = 400  # per-group no-EOS guard (also OOM guard)
+    token_budget: int = 512  # total tokens budget (prompt + new + 8 overhead) for training: OOM guard (B8 T500 14.4G) and runaway guard; rollout max_new = budget - cur_len
+    token_budget_infer: int = 1024  # total tokens budget for inference (graphed lmax); if None defaults to token_budget; 1024 ≈60s audio
 
     temperature: float = 0.9
     top_k: int = 50
@@ -176,7 +176,12 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
     )
-    sampler = build_sampler(ttm, impl=cfg.sampler_impl, speaker=cfg.speaker)
+    sampler = build_sampler(
+        ttm,
+        impl=cfg.sampler_impl,
+        speaker=cfg.speaker,
+        lmax=cfg.token_budget_infer,
+    )
     decoder = Decoder(ttm)
     lpc = LogProbComputer(ttm, speaker=cfg.speaker)
     scorer = ScorerClient(device=cfg.scorer_device)
@@ -231,13 +236,16 @@ def _train_loop(
                 tag=f"step{step}g{gi}",
                 temperature=cfg.temperature,
                 top_k=cfg.top_k,
-                max_new_tokens=cfg.max_new_tokens,
+                token_budget=cfg.token_budget,
             )
             t_max = max(c.shape[0] for c in rollout.codes)
-            if t_max > cfg.runaway_t_max:
-                # runaway no-EOS group (degenerate policy state): scoring it
-                # wastes time and teacher-forcing [gs, >400] with grads OOMs
-                # the 16 GB trainer GPU
+            # token_budget = cur_len + T (total tokens); T hits budget when
+            # cur_len + T >= token_budget i.e. T >= budget - cur_len
+            cur_len = rollout.cur_len
+            if t_max + cur_len >= cfg.token_budget:
+                # runaway no-EOS group (hit budget without EOS): scoring it
+                # wastes time and teacher-forcing [gs, >budget] with grads OOMs
+                # the 16 GB trainer GPU (B8 T500 14.4G, T550 OOM)
                 skips["runaway"] = skips.get("runaway", 0) + 1
                 continue
             groups.append(

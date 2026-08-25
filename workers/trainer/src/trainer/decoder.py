@@ -26,6 +26,7 @@ class Decoder:
     def __init__(self, ttm: TrainerModel):
         self.ttm = ttm
 
+    @torch.inference_mode()
     def decode(self, codes: list[torch.Tensor]) -> tuple[list[np.ndarray], int]:
         """codes: list of [T, num_code_groups]. Returns (wavs, sample_rate)."""
         wavs, fs = self.ttm.model.speech_tokenizer.decode(

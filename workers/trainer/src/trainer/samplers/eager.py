@@ -313,18 +313,19 @@ class EagerSampler(Sampler):
         do_sample: bool,
         temperature: float,
         top_k: int,
-        max_new_tokens: int,
+        token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
-    ) -> list[torch.Tensor]:
-        """Same contract as ``Sampler.sample``: one [T, num_code_groups]
-        tensor per text, truncated at the codebook-0 EOS token."""
+    ) -> tuple[list[torch.Tensor], int]:
+        """Same contract as ``Sampler.sample``: returns (codes, cur_len)."""
         torch.manual_seed(seed)
 
         cache, mask, trailing, pad_e, rope_deltas, past_hidden, logits = self._prefill(
             texts
         )
         cur_len = mask.shape[1]
+        init_cur_len = cur_len
+        max_new_tokens = max(0, token_budget - cur_len)
         tok = self._choose(
             self._process_outer(logits, 0, do_sample, temperature, top_k), do_sample
         )
@@ -364,4 +365,4 @@ class EagerSampler(Sampler):
             hit = (col == self.eos).nonzero()
             length = int(hit[0]) if hit.numel() else all_rows.shape[0]
             results.append(all_rows[:length, i, :])
-        return results
+        return results, init_cur_len
