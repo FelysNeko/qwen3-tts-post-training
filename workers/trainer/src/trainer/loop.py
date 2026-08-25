@@ -231,6 +231,7 @@ def _train_loop(
                 tag=f"step{step}g{gi}",
                 temperature=cfg.temperature,
                 top_k=cfg.top_k,
+                max_new_tokens=cfg.max_new_tokens,
             )
             t_max = max(c.shape[0] for c in rollout.codes)
             if t_max > cfg.runaway_t_max:

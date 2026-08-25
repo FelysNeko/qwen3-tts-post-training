@@ -161,72 +161,51 @@ def _static_attention_cp(self, hidden_states, position_embeddings, cache):
     return self.o_proj(attn_output), None
 
 
-_ORIG_ATTN_FWD = None
-_ORIG_CP_ATTN_FWD = None
-
-
-def _patched_attention_forward(
-    self,
-    hidden_states,
-    position_embeddings,
-    attention_mask,
-    past_key_values=None,
-    cache_position=None,
-    **kwargs,
-):
-    if isinstance(past_key_values, StaticKVCache):
-        return _static_attention(
-            self, hidden_states, position_embeddings, past_key_values
-        )
-    return _ORIG_ATTN_FWD(
-        self,
-        hidden_states,
-        position_embeddings,
-        attention_mask,
-        past_key_values,
-        cache_position,
-        **kwargs,
-    )
-
-
-def _patched_cp_attention_forward(
-    self,
-    hidden_states,
-    position_embeddings,
-    attention_mask,
-    past_key_values=None,
-    cache_position=None,
-    **kwargs,
-):
-    if isinstance(past_key_values, StaticKVCache):
-        return _static_attention_cp(
-            self, hidden_states, position_embeddings, past_key_values
-        )
-    return _ORIG_CP_ATTN_FWD(
-        self,
-        hidden_states,
-        position_embeddings,
-        attention_mask,
-        past_key_values,
-        cache_position,
-        **kwargs,
-    )
-
-
-def install_attention_patch() -> bool:
+def install_attention_patch() -> None:
     """Install the graph-mode attention dispatch once per process (idempotent).
 
     Both attention classes must be patched: the talker backbone uses
     ``Qwen3TTSTalkerAttention`` while the code predictor uses
-    ``Qwen3TTSAttention``."""
-    global _ORIG_ATTN_FWD, _ORIG_CP_ATTN_FWD
-    if _ORIG_ATTN_FWD is None:
-        _ORIG_ATTN_FWD = Qwen3TTSTalkerAttention.forward
-        Qwen3TTSTalkerAttention.forward = _patched_attention_forward
-    if _ORIG_CP_ATTN_FWD is None:
-        _ORIG_CP_ATTN_FWD = Qwen3TTSAttention.forward
-        Qwen3TTSAttention.forward = _patched_cp_attention_forward
-    return True
+    ``Qwen3TTSAttention`` — a patch on only one leaves the other
+    context-free (no cache reads/writes, probe C1v8).
+
+    Idempotence via a class sentinel (same pattern as ``enable_compile``):
+    re-install would capture the patched function as "original" and the
+    fallback path would recurse into itself. The original forward is bound
+    as a default arg of the closure, not a module global."""
+    for cls, graph_impl in (
+        (Qwen3TTSTalkerAttention, _static_attention),
+        (Qwen3TTSAttention, _static_attention_cp),
+    ):
+        if getattr(cls, "_q3tts_graph_attn", False):
+            continue
+        orig = cls.forward
+
+        def patched_forward(
+            self,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values=None,
+            cache_position=None,
+            _orig=orig,
+            _graph=graph_impl,
+            **kwargs,
+        ):
+            if isinstance(past_key_values, StaticKVCache):
+                return _graph(self, hidden_states, position_embeddings, past_key_values)
+            return _orig(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                cache_position,
+                **kwargs,
+            )
+
+        cls.forward = patched_forward
+        cls._q3tts_graph_attn = True
 
 
 def capture_graph(fn, out_buf: torch.Tensor, probe_fn) -> torch.cuda.CUDAGraph:
@@ -374,7 +353,7 @@ class CudaGraphSampler(EagerSampler):
     # decode
     # ------------------------------------------------------------------
 
-    def _graph_prefill(self, texts):
+    def _graph_prefill(self, texts: list[str]) -> tuple:
         """Prefill the main StaticKVCache with ONLY the valid text tokens.
 
         ``_build_prefill`` left-pads to a fixed length; padding must never
@@ -407,7 +386,14 @@ class CudaGraphSampler(EagerSampler):
         logits = self.codec_head(out.last_hidden_state).float()[:, -1]
         return mask, trailing_b, pad_e, rope_deltas, past_hidden, logits, text_len
 
-    def _predictor_pass_graph(self, past_hidden, last_id_hidden, sdo, st, sk):
+    def _predictor_pass_graph(
+        self,
+        past_hidden: torch.Tensor,
+        last_id_hidden: torch.Tensor,
+        do_sample: bool,
+        st: float,
+        sk: int,
+    ) -> torch.Tensor:
         dev = past_hidden.device
         self.cp_cache.seqlens.zero_()
         pe = self.cp_proj(torch.cat([past_hidden, last_id_hidden], dim=1))
@@ -419,7 +405,7 @@ class CudaGraphSampler(EagerSampler):
             output_hidden_states=False,
         )
         logits = self.cp_heads[0](out.last_hidden_state).float()[:, -1]
-        code = self._choose(self._process_inner(logits, sdo, st, sk), sdo)
+        code = self._choose(self._process_inner(logits, do_sample, st, sk), do_sample)
         codes = [code]
         self.cp_cache.seqlens.fill_(2)
         for gs in range(1, self.q - 1):
@@ -428,24 +414,24 @@ class CudaGraphSampler(EagerSampler):
             self.cp_cache.seqlens.fill_(gs + 1)
             self.cp_graph.replay()
             logits = self.cp_heads[gs](self.cp_out_buf).float()[:, -1]
-            code = self._choose(self._process_inner(logits, sdo, st, sk), sdo)
+            code = self._choose(self._process_inner(logits, do_sample, st, sk), do_sample)
             codes.append(code)
         return torch.cat(codes, dim=1)
 
     def _main_step_graph(
         self,
-        tok,
-        step,
-        cur_len,
-        past_hidden,
-        mask,
-        trailing,
-        pad_e,
-        rope_deltas,
-        do_sample,
-        temperature,
-        top_k,
-    ):
+        tok: torch.Tensor,
+        step: int,
+        cur_len: int,
+        past_hidden: torch.Tensor,
+        mask: torch.Tensor,
+        trailing: torch.Tensor,
+        pad_e: torch.Tensor,
+        rope_deltas: torch.Tensor,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dev = tok.device
         b = tok.shape[0]
         last_id_hidden = self.codec_emb(tok)
@@ -483,22 +469,20 @@ class CudaGraphSampler(EagerSampler):
     def sample(
         self,
         texts: list[str],
-        seed: int | None = None,
-        do_sample: bool = True,
-        temperature: float = 0.9,
-        top_k: int = 50,
-        max_new_tokens: int = 4096,
-        subtalker_do_sample: bool | None = None,
-        subtalker_temperature: float = 0.9,
-        subtalker_top_k: int = 50,
+        *,
+        seed: int,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        max_new_tokens: int,
+        subtalker_temperature: float,
+        subtalker_top_k: int,
     ) -> list[torch.Tensor]:
         """Same contract as ``EagerSampler.sample``. Batch size must equal
         ``batch_size`` (the captured graph shape); use ``EagerSampler``
         directly for anything else."""
         assert len(texts) == self.batch, f"graphed sampler is fixed batch={self.batch}; use --sampler-impl fast"
-        if seed is not None:
-            torch.manual_seed(seed)
-        sdo = do_sample if subtalker_do_sample is None else subtalker_do_sample
+        torch.manual_seed(seed)
 
         (
             mask,
@@ -525,7 +509,7 @@ class CudaGraphSampler(EagerSampler):
                 trailing,
                 pad_e,
                 rope_deltas,
-                sdo,
+                do_sample,
                 subtalker_temperature,
                 subtalker_top_k,
             )
@@ -553,6 +537,6 @@ class CudaGraphSampler(EagerSampler):
 
     def _warmup_graph(self) -> None:
         """One tiny graph-path generation + self-repro sanity check."""
-        a = self.sample(["你好。"] * self.batch, seed=0, max_new_tokens=16)
-        b = self.sample(["你好。"] * self.batch, seed=0, max_new_tokens=16)
+        a = self.warmup_sample("你好。", self.batch, max_new_tokens=16)
+        b = self.warmup_sample("你好。", self.batch, max_new_tokens=16)
         assert all(torch.equal(x, y) for x, y in zip(a, b)), "graph sampler failed self-reproducibility check"

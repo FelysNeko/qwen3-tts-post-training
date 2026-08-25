@@ -31,13 +31,26 @@ def rollout_group(
     prompts: list[str],
     seed: int,
     tag: str,
-    temperature: float = 0.9,
-    top_k: int = 50,
+    *,
+    temperature: float,
+    top_k: int,
+    max_new_tokens: int,
     work_dir: Path | None = None,
 ) -> RolloutResult:
-    """Sample one group and render it to wav. Returns codes + wav paths."""
+    """Sample one group and render it to wav. Returns codes + wav paths.
+
+    The non-varying part of the RL sampling contract is pinned here
+    (do_sample=True governs both loops, subtalker trio at 0.9/50); probes
+    that need other values call the sampler directly."""
     codes = sampler.sample(
-        prompts, seed=seed, temperature=temperature, top_k=top_k
+        prompts,
+        seed=seed,
+        do_sample=True,
+        temperature=temperature,
+        top_k=top_k,
+        max_new_tokens=max_new_tokens,
+        subtalker_temperature=0.9,
+        subtalker_top_k=50,
     )
     wavs, fs = decoder.decode(codes)
     if work_dir is None:

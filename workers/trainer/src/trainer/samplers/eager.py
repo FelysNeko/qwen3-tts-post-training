@@ -70,7 +70,7 @@ class EagerSampler(Sampler):
     # prefill
     # ------------------------------------------------------------------
 
-    def _build_prefill(self, texts: list[str]):
+    def _build_prefill(self, texts: list[str]) -> tuple:
         """Port of ``Qwen3TTSForConditionalGeneration.generate`` lines that
         assemble talker input embeds for the Auto + speaker + non-streaming
         case (no instruct, no voice clone)."""
@@ -152,7 +152,7 @@ class EagerSampler(Sampler):
         trailing_b = padded_t
         return embeds_b, mask, trailing_b, pad_e
 
-    def _prefill(self, texts: list[str]):
+    def _prefill(self, texts: list[str]) -> tuple:
         embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts)
         dev = self.ttm.device
         cache = DynamicCache()
@@ -219,7 +219,7 @@ class EagerSampler(Sampler):
         self,
         past_hidden: torch.Tensor,
         last_id_hidden: torch.Tensor,
-        sdo: bool,
+        do_sample: bool,
         st: float,
         sk: int,
     ) -> torch.Tensor:
@@ -234,7 +234,9 @@ class EagerSampler(Sampler):
             cache_position=torch.arange(2, device=dev),
         )
         logits = self.cp_heads[0](out.last_hidden_state).float()[:, -1]
-        code = self._choose(self._process_inner(logits, sdo, st, sk), sdo)
+        code = self._choose(
+            self._process_inner(logits, do_sample, st, sk), do_sample
+        )
         codes = [code]
         for gs in range(1, self.q - 1):
             emb = self.cp_proj(self.cp_emb[gs - 1](code))
@@ -245,7 +247,9 @@ class EagerSampler(Sampler):
                 cache_position=torch.arange(gs + 1, gs + 2, device=dev),
             )
             logits = self.cp_heads[gs](out.last_hidden_state).float()[:, -1]
-            code = self._choose(self._process_inner(logits, sdo, st, sk), sdo)
+            code = self._choose(
+                self._process_inner(logits, do_sample, st, sk), do_sample
+            )
             codes.append(code)
         return torch.cat(codes, dim=1)
 
@@ -260,14 +264,14 @@ class EagerSampler(Sampler):
         trailing: torch.Tensor,
         pad_e: torch.Tensor,
         rope_deltas: torch.Tensor,
-        sdo: bool,
+        do_sample: bool,
         st: float,
         sk: int,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dev = tok.device
         b = tok.shape[0]
         last_id_hidden = self.codec_emb(tok)
-        seqs = self._predictor_pass(past_hidden, last_id_hidden, sdo, st, sk)
+        seqs = self._predictor_pass(past_hidden, last_id_hidden, do_sample, st, sk)
 
         hiddens = [last_id_hidden] + [
             self.cp_emb[i](seqs[:, i : i + 1]) for i in range(self.q - 1)
@@ -304,20 +308,18 @@ class EagerSampler(Sampler):
     def sample(
         self,
         texts: list[str],
-        seed: int | None = None,
-        do_sample: bool = True,
-        temperature: float = 0.9,
-        top_k: int = 50,
-        max_new_tokens: int = 4096,
-        subtalker_do_sample: bool | None = None,
-        subtalker_temperature: float = 0.9,
-        subtalker_top_k: int = 50,
+        *,
+        seed: int,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        max_new_tokens: int,
+        subtalker_temperature: float,
+        subtalker_top_k: int,
     ) -> list[torch.Tensor]:
         """Same contract as ``Sampler.sample``: one [T, num_code_groups]
         tensor per text, truncated at the codebook-0 EOS token."""
-        if seed is not None:
-            torch.manual_seed(seed)
-        sdo = do_sample if subtalker_do_sample is None else subtalker_do_sample
+        torch.manual_seed(seed)
 
         cache, mask, trailing, pad_e, rope_deltas, past_hidden, logits = self._prefill(
             texts
@@ -338,7 +340,7 @@ class EagerSampler(Sampler):
                 trailing,
                 pad_e,
                 rope_deltas,
-                sdo,
+                do_sample,
                 subtalker_temperature,
                 subtalker_top_k,
             )

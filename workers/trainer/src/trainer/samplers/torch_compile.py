@@ -74,24 +74,24 @@ class TorchCompileSampler(EagerSampler):
         always run on the settled (bitwise self-reproducible) path. Cold
         cost is ~2 min (compile), then seconds.
         """
-        self.sample(["你好。"] * self.batch, seed=0, max_new_tokens=32)
-        self.sample(
-            ["这是一段用于预热的稍长文本，用来触发动态形状图的编译与稳定。"] * self.batch,
-            seed=0,
+        self.warmup_sample("你好。", self.batch, max_new_tokens=32)
+        self.warmup_sample(
+            "这是一段用于预热的稍长文本，用来触发动态形状图的编译与稳定。",
+            self.batch,
             max_new_tokens=32,
         )
 
     def sample(
         self,
         texts: list[str],
-        seed: int | None = None,
-        do_sample: bool = True,
-        temperature: float = 0.9,
-        top_k: int = 50,
-        max_new_tokens: int = 4096,
-        subtalker_do_sample: bool | None = None,
-        subtalker_temperature: float = 0.9,
-        subtalker_top_k: int = 50,
+        *,
+        seed: int,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        max_new_tokens: int,
+        subtalker_temperature: float,
+        subtalker_top_k: int,
     ) -> list[torch.Tensor]:
         """Same contract as ``EagerSampler.sample``. Batch size must equal
         ``batch_size`` (the warmed compile shape); use ``EagerSampler``
@@ -104,7 +104,6 @@ class TorchCompileSampler(EagerSampler):
             temperature=temperature,
             top_k=top_k,
             max_new_tokens=max_new_tokens,
-            subtalker_do_sample=subtalker_do_sample,
             subtalker_temperature=subtalker_temperature,
             subtalker_top_k=subtalker_top_k,
         )

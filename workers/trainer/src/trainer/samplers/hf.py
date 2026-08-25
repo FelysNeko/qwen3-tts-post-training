@@ -20,18 +20,17 @@ class HFSampler(Sampler):
     def sample(
         self,
         texts: list[str],
-        seed: int | None = None,
-        do_sample: bool = True,
-        temperature: float = 0.9,
-        top_k: int = 50,
-        max_new_tokens: int = 4096,
-        subtalker_do_sample: bool | None = None,
-        subtalker_temperature: float = 0.9,
-        subtalker_top_k: int = 50,
+        *,
+        seed: int,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        max_new_tokens: int,
+        subtalker_temperature: float,
+        subtalker_top_k: int,
     ) -> list[torch.Tensor]:
         """Same contract as ``Sampler.sample`` (see base class)."""
-        if seed is not None:
-            torch.manual_seed(seed)
+        torch.manual_seed(seed)
         input_ids = [self._tokenize(t) for t in texts]
         n = len(texts)
         codes, _ = self.ttm.model.generate(
@@ -47,9 +46,7 @@ class HFSampler(Sampler):
             # must sample from a stateless distribution (logprob parity).
             repetition_penalty=None,
             max_new_tokens=max_new_tokens,
-            subtalker_dosample=do_sample
-            if subtalker_do_sample is None
-            else subtalker_do_sample,
+            subtalker_dosample=do_sample,
             subtalker_temperature=subtalker_temperature,
             subtalker_top_k=subtalker_top_k,
         )
