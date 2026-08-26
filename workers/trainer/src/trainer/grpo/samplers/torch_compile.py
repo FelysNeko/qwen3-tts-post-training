@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import torch
 
+from trainer.grpo.samplers.eager import EagerSampler
 from trainer.model import TrainerModel
-from trainer.samplers.eager import EagerSampler
 
 
 def enable_compile(ttm: TrainerModel) -> bool:

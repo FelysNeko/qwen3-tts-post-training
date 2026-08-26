@@ -37,9 +37,9 @@ from qwen_tts.core.models.modeling_qwen3_tts import (
 )
 from transformers.cache_utils import Cache
 
+from trainer.grpo.samplers.base import prefill_cur_len
+from trainer.grpo.samplers.eager import EagerSampler
 from trainer.model import TrainerModel
-from trainer.samplers.base import prefill_cur_len
-from trainer.samplers.eager import EagerSampler
 
 
 class StaticKVCache(Cache):

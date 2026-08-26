@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from trainer.loop import TrainConfig, run_grpo
+from trainer.grpo.loop import TrainConfig, run_grpo
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -25,11 +25,11 @@ from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
-from trainer.decoder import Decoder
-from trainer.logprob import LogProbComputer
+from trainer.grpo.decoder import Decoder
+from trainer.grpo.logprob import LogProbComputer
+from trainer.grpo.rollout import rollout_group
+from trainer.grpo.samplers.base import Sampler
 from trainer.model import TrainerModel
-from trainer.rollout import rollout_group
-from trainer.samplers.base import Sampler
 
 # mirrors rollout_group's pinned subtalker sampling trio (do_sample@T=0.9/top_k=50)
 SUBTALKER_TEMPERATURE = 0.9

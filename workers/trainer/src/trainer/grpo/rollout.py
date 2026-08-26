@@ -13,8 +13,8 @@ from pathlib import Path
 
 import torch
 
-from trainer.decoder import Decoder, write_wav
-from trainer.samplers.base import Sampler
+from trainer.grpo.decoder import Decoder, write_wav
+from trainer.grpo.samplers.base import Sampler
 
 
 @dataclass

@@ -24,6 +24,19 @@ import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 
 
+def tokenize_assistant(processor, text: str) -> torch.Tensor:
+    """Official `_build_assistant_text` + `_tokenize_texts` — tokenize the full
+    assistant-formatted prompt. Returns [1, len] input ids (callers drop the
+    trailing 5 special tokens, mirroring the official `[:, :-5]`)."""
+    prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+    ids = processor(
+        text=prompt,
+        return_tensors="pt",
+        padding=True,
+    )["input_ids"]
+    return ids.unsqueeze(0) if ids.dim() == 1 else ids
+
+
 @dataclass
 class CollateBatch:
     """Dense teacher-forcing batch (official collate_fn field names/shapes).

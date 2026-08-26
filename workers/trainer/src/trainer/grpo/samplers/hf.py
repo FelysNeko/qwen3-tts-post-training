@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from trainer.samplers.base import Sampler, prefill_cur_len, tokenize_assistant
+from trainer.batch import tokenize_assistant
+from trainer.grpo.samplers.base import Sampler, prefill_cur_len
 
 
 class HFSampler(Sampler):

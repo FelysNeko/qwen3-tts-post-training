@@ -3,7 +3,7 @@
 The talker's generation does not expose per-step logits, so we rebuild the
 exact sampling-time input from the prompt text + sampled code groups through
 the SHARED teacher-forcing kernel `TrainerModel.teacher_forcing` (collate via
-`trainer.data`, embeddings, one talker forward, one sub-talker forward) — a
+`trainer.batch`, embeddings, one talker forward, one sub-talker forward) — a
 port of the official SFT input pipeline verified byte-equal against the
 upstream reference, with ONE correction at the embedding stage: the text
 channel goes through `text_projection`, exactly as generation does. This file
@@ -65,9 +65,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from trainer.data import CollateBatch, collate
+from trainer.batch import CollateBatch, collate, tokenize_assistant
 from trainer.model import TrainerModel
-from trainer.samplers.base import tokenize_assistant
 
 
 @dataclass

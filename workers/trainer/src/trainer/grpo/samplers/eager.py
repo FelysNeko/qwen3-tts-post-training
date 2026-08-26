@@ -29,8 +29,9 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import DynamicCache
 
+from trainer.batch import tokenize_assistant
+from trainer.grpo.samplers.base import Sampler, prefill_cur_len
 from trainer.model import TrainerModel
-from trainer.samplers.base import Sampler, prefill_cur_len, tokenize_assistant
 
 
 class EagerSampler(Sampler):

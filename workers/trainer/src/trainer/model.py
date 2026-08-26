@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from trainer.data import CollateBatch
+from trainer.batch import CollateBatch
 
 
 @dataclass

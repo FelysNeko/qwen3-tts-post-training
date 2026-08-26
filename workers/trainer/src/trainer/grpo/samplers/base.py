@@ -1,9 +1,9 @@
-"""Rollout sampler ABC + shared tokenization (Auto language path).
+"""Rollout sampler ABC + prefill budget accounting (Auto language path).
 
 `language="Auto"` uses the nothink generation prefill, which matches the SFT
-training layout — so the teacher-forcing logprob reconstruction (logprob.py)
-can be rebuilt purely from (text, codes) without intercepting generation
-internals (verified bit-consistent vs captured generation logits).
+training layout — so the teacher-forcing logprob reconstruction can be rebuilt
+purely from (text, codes) without intercepting generation internals (verified
+bit-consistent vs captured generation logits).
 
 Sampling uses torch's global RNG — seed via torch.manual_seed(seed) before
 each group for reproducible rollout. repetition_penalty is not part of the
@@ -18,19 +18,8 @@ from abc import ABC, abstractmethod
 
 import torch
 
+from trainer.batch import tokenize_assistant
 from trainer.model import TrainerModel
-
-
-def tokenize_assistant(processor, text: str) -> torch.Tensor:
-    """Official `_build_assistant_text` + `_tokenize_texts` — tokenize the full
-    assistant-formatted prompt. Returns [1, len] input ids (no `[:-5]` drop)."""
-    prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-    ids = processor(
-        text=prompt,
-        return_tensors="pt",
-        padding=True,
-    )["input_ids"]
-    return ids.unsqueeze(0) if ids.dim() == 1 else ids
 
 
 def prefill_cur_len(processor, text: str) -> int:
@@ -111,25 +100,25 @@ class Sampler(ABC):
         """Factory — `impl` selects the sampler (lazy imports, no eager deps)."""
         match impl:
             case "hf":
-                from trainer.samplers.hf import HFSampler
+                from trainer.grpo.samplers.hf import HFSampler
 
                 return HFSampler(
                     ttm, speaker=speaker, language=language, batch_size=batch_size
                 )
             case "fast":
-                from trainer.samplers.eager import EagerSampler
+                from trainer.grpo.samplers.eager import EagerSampler
 
                 return EagerSampler(
                     ttm, speaker=speaker, language=language, batch_size=batch_size
                 )
             case "compiled":
-                from trainer.samplers.torch_compile import TorchCompileSampler
+                from trainer.grpo.samplers.torch_compile import TorchCompileSampler
 
                 return TorchCompileSampler(
                     ttm, speaker=speaker, language=language, batch_size=batch_size
                 )
             case "graphed":
-                from trainer.samplers.cuda_graph import CudaGraphSampler
+                from trainer.grpo.samplers.cuda_graph import CudaGraphSampler
 
                 return CudaGraphSampler(
                     ttm,
