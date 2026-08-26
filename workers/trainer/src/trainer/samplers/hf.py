@@ -19,7 +19,7 @@ class HFSampler(Sampler):
     @torch.inference_mode()
     def sample(
         self,
-        texts: list[str],
+        text: str,
         *,
         seed: int,
         do_sample: bool,
@@ -31,15 +31,14 @@ class HFSampler(Sampler):
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``Sampler.sample`` (see base class)."""
         torch.manual_seed(seed)
-        cur_len = prefill_cur_len(self.ttm.processor, texts)
+        cur_len = prefill_cur_len(self.ttm.processor, text)
         max_new_tokens = max(0, token_budget - cur_len)
-        input_ids = [self._tokenize(t) for t in texts]
-        n = len(texts)
+        input_ids = [self._tokenize(text) for _ in range(self.batch_size)]
         codes, _ = self.ttm.model.generate(
             input_ids=input_ids,
-            instruct_ids=[None] * n,
-            languages=[self.language] * n,
-            speakers=[self.speaker] * n,
+            instruct_ids=[None] * self.batch_size,
+            languages=[self.language] * self.batch_size,
+            speakers=[self.speaker] * self.batch_size,
             non_streaming_mode=True,
             do_sample=do_sample,
             temperature=temperature,

@@ -29,7 +29,7 @@ from trainer.decoder import Decoder
 from trainer.logprob import LogProbComputer
 from trainer.model import TrainerModel
 from trainer.rollout import rollout_group
-from trainer.samplers import Sampler, build_sampler
+from trainer.samplers.base import Sampler
 
 # v1 placeholder text pool (domain: narrative / dialogue / rhythmic narration).
 TEXT_POOL = (
@@ -60,14 +60,14 @@ class TrainConfig:
     num_steps: int = 1
     seed: int = 0
     token_budget: int = 512  # total tokens budget (prompt + new + 8 overhead) for training: OOM guard (B8 T500 14.4G) and runaway guard; rollout max_new = budget - cur_len
-    token_budget_infer: int = 1024  # total tokens budget for inference (graphed lmax); if None defaults to token_budget; 1024 ≈60s audio
+    token_budget_infer: int = 1024  # total tokens budget for inference (graphed lmax); 1024 ≈60s audio
 
     temperature: float = 0.9
     top_k: int = 50
     sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
 
     variant: str = "dr"
-    kl_beta: float = 0.01
+    kl_beta: float = 0.001
     lr: float = 1e-5
     warmup_steps: int = 10  # linear LR ramp: tames the Adam first-step sign
     # jolt (all params move ±lr at once; observed as KL 586 on step 1, fish3)
@@ -77,8 +77,6 @@ class TrainConfig:
     scorer_push_endpoint: str = "tcp://127.0.0.1:5555"
     scorer_pull_endpoint: str = "tcp://127.0.0.1:5556"
     scorer_timeout: float = 600.0
-    # deprecated: scorer_device retained for compat, scorer now manual ZMQ service
-    scorer_device: str = "cuda:0"
     out_dir: str = "runs/grpo_v1"
     ckpt_every: int = 1
     resume: bool = False
@@ -123,13 +121,6 @@ def _cleanup_wavs(wav_paths: list[Path]) -> None:
             wav_paths[0].parent.rmdir()
         except OSError:
             pass
-
-
-def _scores_to_tensor(results: list[dict], key: str, device: str) -> torch.Tensor:
-    """Extract one score column; `error`/None anywhere → asserts so the step skips."""
-    values = [r[key] for r in results]
-    assert not any(v is None for v in values), f"scorer column {key!r} is None (scorer failure?)"
-    return torch.tensor(values, dtype=torch.float32, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +185,11 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
     )
-    sampler = build_sampler(
+    sampler = Sampler.build(
         ttm,
         impl=cfg.sampler_impl,
         speaker=cfg.speaker,
+        batch_size=cfg.group_size,
         lmax=cfg.token_budget_infer,
     )
     decoder = Decoder(ttm)
@@ -255,7 +247,7 @@ def _train_loop(
             rollout = rollout_group(
                 sampler,
                 decoder,
-                [prompt] * gs,
+                prompt,
                 seed=cfg.seed * 1000003 + step * 1009 + gi,
                 tag=f"step{step}g{gi}",
                 temperature=cfg.temperature,

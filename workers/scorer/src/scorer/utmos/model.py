@@ -5,7 +5,8 @@ train-only weight cascades skipped (phase != train)."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from types import SimpleNamespace
+from typing import cast
 
 import timm
 import torch
@@ -14,9 +15,6 @@ from torch import nn
 from transformers import AutoFeatureExtractor, AutoModel
 
 from scorer.utmos.config import DATASET_MAP
-
-if TYPE_CHECKING:
-    from types import SimpleNamespace
 
 
 class _SSLEncoder(nn.Module):

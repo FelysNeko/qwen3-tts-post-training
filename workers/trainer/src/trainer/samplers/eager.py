@@ -30,7 +30,7 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 from trainer.model import TrainerModel
-from trainer.samplers.base import Sampler, tokenize_assistant
+from trainer.samplers.base import Sampler, prefill_cur_len, tokenize_assistant
 
 
 class EagerSampler(Sampler):
@@ -41,9 +41,10 @@ class EagerSampler(Sampler):
         ttm: TrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
+        batch_size: int = 8,
     ):
         assert language.lower() == "auto", "eager sampler supports the Auto (non-streaming) layout only"
-        super().__init__(ttm, speaker=speaker, language=language)
+        super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
         model = ttm.model
         self.talker = model.talker
         tc = model.config.talker_config
@@ -115,6 +116,11 @@ class EagerSampler(Sampler):
                 torch.cat([pad_e.expand(-1, cie.shape[1] - 2, -1), bos_e], dim=1)
                 + cie[:, :-1]
             )
+            # `first` (text[0] + codec_bos) is computed then truncated by the
+            # [:, :-1] below — faithful to upstream qwen-tts modeling_qwen3_tts.py
+            # (generate, tts_text_first_token): streaming mode consumes it as real
+            # input, non_streaming_mode slices it off (the full text re-enters via
+            # `tail`). Dead in our Auto+non-streaming path only; kept for parity.
             first = self.text_proj(self.text_emb(ids[:, 3:4])) + cie[:, -1:]
             head = torch.cat([role, base, first], dim=1)[:, :-1]
             n = ids.shape[1] - 8  # text tokens = ids[:, 3:-5]
@@ -307,7 +313,7 @@ class EagerSampler(Sampler):
     @torch.inference_mode()
     def sample(
         self,
-        texts: list[str],
+        text: str,
         *,
         seed: int,
         do_sample: bool,
@@ -319,11 +325,11 @@ class EagerSampler(Sampler):
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``Sampler.sample``: returns (codes, cur_len)."""
         torch.manual_seed(seed)
-
+        texts = [text] * self.batch_size
         cache, mask, trailing, pad_e, rope_deltas, past_hidden, logits = self._prefill(
             texts
         )
-        cur_len = mask.shape[1]
+        cur_len = prefill_cur_len(self.ttm.processor, text)
         init_cur_len = cur_len
         max_new_tokens = max(0, token_budget - cur_len)
         tok = self._choose(

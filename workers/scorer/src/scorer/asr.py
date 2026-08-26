@@ -39,7 +39,7 @@ class ASRScorer:
                 texts[w] = t
         return texts
 
-    def score(self, wavs: list[str], texts_ref: list[str | None]) -> list[dict]:
+    def score(self, wavs: list[str], texts_ref: list[str]) -> list[dict]:
         transcripts = self.transcribe(wavs)
         results = []
         for wav, ref in zip(wavs, texts_ref):
@@ -47,7 +47,7 @@ class ASRScorer:
             results.append(
                 {
                     "transcript": hyp,
-                    "cer": cer(normalize(ref), normalize(hyp)) if ref else None,
+                    "cer": cer(normalize(ref), normalize(hyp)),
                 }
             )
         return results

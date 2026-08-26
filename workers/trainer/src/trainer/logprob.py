@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from trainer.model import TrainerModel
-from trainer.samplers import tokenize_assistant
+from trainer.samplers.base import tokenize_assistant
 
 # SFT-collate layout (official TTSDataset.collate_fn), per sample:
 #   0-2     role tokens (text channel)

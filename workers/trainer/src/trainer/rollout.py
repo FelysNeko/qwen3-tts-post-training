@@ -14,12 +14,12 @@ from pathlib import Path
 import torch
 
 from trainer.decoder import Decoder, write_wav
-from trainer.samplers import Sampler
+from trainer.samplers.base import Sampler
 
 
 @dataclass
 class RolloutResult:
-    prompts: list[str]
+    prompt: str
     codes: list[torch.Tensor]
     wav_paths: list[Path]
     fs: int
@@ -29,7 +29,7 @@ class RolloutResult:
 def rollout_group(
     sampler: Sampler,
     decoder: Decoder,
-    prompts: list[str],
+    prompt: str,
     seed: int,
     tag: str,
     *,
@@ -40,13 +40,15 @@ def rollout_group(
 ) -> RolloutResult:
     """Sample one group and render it to wav. Returns codes + wav paths.
 
+    ``prompt`` is a single text, internally repeated `sampler.batch_size`
+    times to form the GRPO group (homogeneous, no assert needed).
     ``token_budget`` is total tokens (prefill cur_len + new) budget;
     ``max_new = token_budget - cur_len`` is derived inside the sampler.
     The non-varying part of the RL sampling contract is pinned here
     (do_sample=True governs both loops, subtalker trio at 0.9/50); probes
     that need other values call the sampler directly."""
     codes, cur_len = sampler.sample(
-        prompts,
+        prompt,
         seed=seed,
         do_sample=True,
         temperature=temperature,
@@ -62,4 +64,4 @@ def rollout_group(
     wav_paths = [
         write_wav(work_dir / f"{tag}_{i}.wav", wav, fs) for i, wav in enumerate(wavs)
     ]
-    return RolloutResult(prompts, codes, wav_paths, fs, cur_len=cur_len)
+    return RolloutResult(prompt, codes, wav_paths, fs, cur_len=cur_len)

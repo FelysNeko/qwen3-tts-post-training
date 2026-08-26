@@ -46,7 +46,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--scorer-pull-endpoint", default=TrainConfig.scorer_pull_endpoint
     )
     p.add_argument("--scorer-timeout", type=float, default=TrainConfig.scorer_timeout)
-    p.add_argument("--scorer-device", default=TrainConfig.scorer_device)
     p.add_argument("--out-dir", default=TrainConfig.out_dir)
     p.add_argument("--ckpt-every", type=int, default=TrainConfig.ckpt_every)
     p.add_argument("--resume", action="store_true")
@@ -81,7 +80,6 @@ def main() -> None:
         scorer_push_endpoint=args.scorer_push_endpoint,
         scorer_pull_endpoint=args.scorer_pull_endpoint,
         scorer_timeout=args.scorer_timeout,
-        scorer_device=args.scorer_device,
         out_dir=args.out_dir,
         ckpt_every=args.ckpt_every,
         resume=args.resume,

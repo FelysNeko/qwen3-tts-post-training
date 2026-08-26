@@ -56,7 +56,6 @@ class Client:
         if self._pull.poll(timeout_ms) == 0:
             return None
         raw = self._pull.recv_json()
-        self.last_raw = raw  # for error reporting
         return ScoreRequest.model_validate(raw)
 
     def send_response(self, resp: ScoreResponse) -> None:

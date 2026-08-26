@@ -38,6 +38,7 @@ from qwen_tts.core.models.modeling_qwen3_tts import (
 from transformers.cache_utils import Cache
 
 from trainer.model import TrainerModel
+from trainer.samplers.base import prefill_cur_len
 from trainer.samplers.eager import EagerSampler
 
 
@@ -262,9 +263,8 @@ class CudaGraphSampler(EagerSampler):
         batch_size: int = 8,
         lmax: int = 1024,
     ):
-        super().__init__(ttm, speaker=speaker, language=language)
+        super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
         install_attention_patch()
-        self.batch = batch_size
         self.lmax = lmax
         dev = ttm.device
         self.main_cache = StaticKVCache(
@@ -302,12 +302,14 @@ class CudaGraphSampler(EagerSampler):
         dev = self.ttm.device
         h = self.tc.hidden_size
         self.main_emb_buf = torch.zeros(
-            self.batch, 1, h, dtype=self.ttm.dtype, device=dev
+            self.batch_size, 1, h, dtype=self.ttm.dtype, device=dev
         )
-        self.main_pos_buf = torch.zeros(3, self.batch, 1, dtype=torch.long, device=dev)
+        self.main_pos_buf = torch.zeros(
+            3, self.batch_size, 1, dtype=torch.long, device=dev
+        )
         self.main_cp_buf = torch.zeros(1, dtype=torch.long, device=dev)
         self.main_out_buf = torch.zeros(
-            self.batch, 1, h, dtype=self.ttm.dtype, device=dev
+            self.batch_size, 1, h, dtype=self.ttm.dtype, device=dev
         )
 
         def run_main():
@@ -329,11 +331,11 @@ class CudaGraphSampler(EagerSampler):
         dev = self.ttm.device
         cp_h = self.cp_model.config.hidden_size
         self.cp_emb_buf = torch.zeros(
-            self.batch, 1, cp_h, dtype=self.ttm.dtype, device=dev
+            self.batch_size, 1, cp_h, dtype=self.ttm.dtype, device=dev
         )
         self.cp_cp_buf = torch.zeros(1, dtype=torch.long, device=dev)
         self.cp_out_buf = torch.zeros(
-            self.batch, 1, cp_h, dtype=self.ttm.dtype, device=dev
+            self.batch_size, 1, cp_h, dtype=self.ttm.dtype, device=dev
         )
 
         def run_cp():
@@ -353,7 +355,7 @@ class CudaGraphSampler(EagerSampler):
     # decode
     # ------------------------------------------------------------------
 
-    def _graph_prefill(self, texts: list[str]) -> tuple:
+    def _graph_prefill(self, text: str) -> tuple:
         """Prefill the main StaticKVCache with ONLY the valid text tokens.
 
         ``_build_prefill`` left-pads to a fixed length; padding must never
@@ -362,9 +364,10 @@ class CudaGraphSampler(EagerSampler):
         the same text out group_size times, text_len is uniform, so we drop
         the left pad and prefill [B, text_len] directly into pool positions
         0..text_len-1."""
+        texts = [text] * self.batch_size
         embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts)
         dev = self.ttm.device
-        text_len = int(mask.sum(-1).max().item())
+        text_len = prefill_cur_len(self.ttm.processor, text)
         # FA2 kvcache writes past the pool unchecked — an oversized prefill is
         # an out-of-bounds write, not a Python error.
         assert text_len < self.lmax, f"prefill {text_len} >= lmax {self.lmax}"
@@ -468,7 +471,7 @@ class CudaGraphSampler(EagerSampler):
     @torch.inference_mode()
     def sample(
         self,
-        texts: list[str],
+        text: str,
         *,
         seed: int,
         do_sample: bool,
@@ -478,12 +481,7 @@ class CudaGraphSampler(EagerSampler):
         subtalker_temperature: float,
         subtalker_top_k: int,
     ) -> tuple[list[torch.Tensor], int]:
-        """Same contract as ``EagerSampler.sample``. Batch size must equal
-        ``batch_size`` (the captured graph shape); use ``EagerSampler``
-        directly for anything else.
-        ``token_budget`` is total tokens (prefill cur_len + new) budget;
-        effective ``max_new = token_budget - cur_len`` clamped by ``lmax``."""
-        assert len(texts) == self.batch, f"graphed sampler is fixed batch={self.batch}; use --sampler-impl fast"
+        """Same contract as ``EagerSampler.sample``."""
         torch.manual_seed(seed)
 
         (
@@ -494,7 +492,7 @@ class CudaGraphSampler(EagerSampler):
             past_hidden,
             logits,
             text_len,
-        ) = self._graph_prefill(texts)
+        ) = self._graph_prefill(text)
         cur_len = text_len
         init_cur_len = cur_len
         max_new_tokens = max(0, token_budget - cur_len)
@@ -541,6 +539,6 @@ class CudaGraphSampler(EagerSampler):
 
     def _warmup_graph(self) -> None:
         """One tiny graph-path generation + self-repro sanity check."""
-        a = self.warmup_sample("你好。", self.batch, token_budget=64)
-        b = self.warmup_sample("你好。", self.batch, token_budget=64)
+        a = self.warmup_sample("你好。", token_budget=64)
+        b = self.warmup_sample("你好。", token_budget=64)
         assert all(torch.equal(x, y) for x, y in zip(a, b)), "graph sampler failed self-reproducibility check"

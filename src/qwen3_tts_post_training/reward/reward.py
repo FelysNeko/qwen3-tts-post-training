@@ -1,15 +1,17 @@
-"""Reward v3 (design truth source: playground/SV_REWARD_FINDINGS.md §四/§七).
+"""Reward v3.1 (design truth source: playground/SV_REWARD_FINDINGS.md §四/§七).
 
-    R = λ_sv·r_sv/std(r_sv) + λ_wer·r_wer/std(r_wer) + λ_mos·r_mos/max(std(r_mos), eps)
+    R = λ_sv·r_sv + λ_wer·r_wer + λ_mos·r_mos   (RAW magnitudes, no std division)
 
 - r_sv  = sigmoid((sim_e2v2 − 0.8585)/0.0966)      (E2V2 speaker sim, unit-normalized)
 - r_wer = 1 − CER_qwen3asr                          (normalize() + edit-distance CER)
 - r_mos = max(0, 2.5 − mos_utmosv2fold0)            (hinge 护栏, 线性地板: 只挡不驱动)
-- std is the *within-group* std of each component (batch-std layer; per MD the
-  std≈0 in all-above-τ groups). Every term 熄火 (zeroed) when its group std
-  drops below its flameout eps (MD: 组内 std<eps 熄火) — MOS by construction in
-  healthy groups, SV/WER in degenerate groups (e.g. all-perfect transcripts);
-  otherwise a dead group would divide by eps and inject a 1e6 sentinel.
+- Every term 熄火 (zeroed) when its within-group std drops below its
+  flameout eps (MD: 组内 std<eps 熄火) — MOS by construction in healthy
+  groups (r_mos ≡ 0 → std = 0), SV/WER in degenerate groups (e.g.
+  all-perfect transcripts); otherwise a flat group would amplify pure
+  ranking noise to full scale (one Adam step along it collapsed the policy
+  — smoke C1v8/C1v9). Dr.GRPO subtracts the group mean downstream, so
+  magnitudes are kept.
 - λ = (1.0, 1.0, 0.2) — v3 定稿.
 
 r_mos floor (2026-08-23, UTMOS-replacement A/B conclusion): a sigmoid is still
@@ -34,11 +36,9 @@ class RewardConfig:
     sv_center: float = 0.8585
     sv_scale: float = 0.0966
     mos_tau: float = 2.5
-    mos_scale: float = 0.2
     lam_sv: float = 1.0
     lam_wer: float = 1.0
     lam_mos: float = 0.2
-    std_eps: float = 1e-6
     flameout_eps: float = 1e-3
     mos_flameout_eps: float = 1e-4
     mos_flameout: bool = True

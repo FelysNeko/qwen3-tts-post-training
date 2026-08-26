@@ -60,9 +60,10 @@ class TorchCompileSampler(EagerSampler):
         language: str = "Auto",
         batch_size: int = 8,
     ):
-        super().__init__(ttm, speaker=speaker, language=language)
+        super().__init__(
+            ttm, speaker=speaker, language=language, batch_size=batch_size
+        )
         enable_compile(ttm)
-        self.batch = batch_size
         self._warmup()
 
     def _warmup(self) -> None:
@@ -74,16 +75,15 @@ class TorchCompileSampler(EagerSampler):
         always run on the settled (bitwise self-reproducible) path. Cold
         cost is ~2 min (compile), then seconds.
         """
-        self.warmup_sample("你好。", self.batch, token_budget=64)
+        self.warmup_sample("你好。", token_budget=64)
         self.warmup_sample(
             "这是一段用于预热的稍长文本，用来触发动态形状图的编译与稳定。",
-            self.batch,
             token_budget=96,
         )
 
     def sample(
         self,
-        texts: list[str],
+        text: str,
         *,
         seed: int,
         do_sample: bool,
@@ -93,12 +93,9 @@ class TorchCompileSampler(EagerSampler):
         subtalker_temperature: float,
         subtalker_top_k: int,
     ) -> tuple[list[torch.Tensor], int]:
-        """Same contract as ``EagerSampler.sample``. Batch size must equal
-        ``batch_size`` (the warmed compile shape); use ``EagerSampler``
-        directly for anything else."""
-        assert len(texts) == self.batch, f"compiled sampler is fixed batch={self.batch}; use --sampler-impl fast"
+        """Same contract as ``EagerSampler.sample``."""
         return super().sample(
-            texts,
+            text,
             seed=seed,
             do_sample=do_sample,
             temperature=temperature,

@@ -33,21 +33,18 @@ def tokenize_assistant(processor, text: str) -> torch.Tensor:
     return ids.unsqueeze(0) if ids.dim() == 1 else ids
 
 
-def prefill_cur_len(processor, texts: list[str]) -> int:
-    """Prefill length `cur_len = mask.shape[1]` for `token_budget` accounting.
+def prefill_cur_len(processor, text: str) -> int:
+    """Prefill length `cur_len` for `token_budget` accounting.
 
-    Shared by `EagerSampler` and `HFSampler` — exact `eager._build_prefill`
-    logic up to the `mask` (no forward), so `hf` no longer depends on
-    `eager.py`. `cur_len` is the padded prefill length (text + cie/role
-    overhead), and `max_new = token_budget - cur_len`.
+    Single-text — `batch_size` copies are homogeneous, so no `max` needed
+    (old `list[str]` variant with `max` is removed). Exact
+    `eager._build_prefill` logic up to the `mask` (no forward), so `hf`
+    no longer depends on `eager.py`. `cur_len` is the padded prefill length
+    (text + cie/role overhead), and `max_new = token_budget - cur_len`.
     """
     # head 8 + tail n+1 + last 1 = n+10 where n = ids.shape[1]-8
-    max_n = 0
-    for text in texts:
-        ids = tokenize_assistant(processor, text)
-        n = ids.shape[1] - 8
-        max_n = max(max_n, n)
-    return max_n + 10
+    ids = tokenize_assistant(processor, text)
+    return (ids.shape[1] - 8) + 10
 
 
 class Sampler(ABC):
@@ -63,8 +60,10 @@ class Sampler(ABC):
       generation path);
     - Auto + non-streaming prefill layout (SFT parity — the validity
       precondition for logprob.py, see module docstring);
-    - torch global RNG: identical (texts, seed) reproduce identical codes
+    - torch global RNG: identical (text, seed) reproduce identical codes
       within an impl; cross-impl bit-equality holds only for `fast` vs `hf`.
+    - Batching is internal: the single `text` is repeated `batch_size` times
+      to form the GRPO group (no heterogeneous prompts, no assert needed).
     """
 
     def __init__(
@@ -72,23 +71,24 @@ class Sampler(ABC):
         ttm: TrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
+        batch_size: int = 8,
     ):
         # Generation layout is pinned: language="Auto" + non-streaming (SFT
         # collate parity — the validity precondition for logprob.py).
         self.ttm = ttm
         self.speaker = speaker
         self.language = language
+        self.batch_size = batch_size
 
     def warmup_sample(
-        self, text: str, batch: int, token_budget: int
+        self, text: str, token_budget: int
     ) -> list[torch.Tensor]:
         """One dummy generation at the RL contract config (seed 0, T=0.9,
         top_k=50, subtalker trio at upstream defaults); returns its codes.
-        Used by the compiled/graphed impls' warmup paths — dummy generations
-        must consume the same RNG stream shape as real rollouts.
+        Uses the sampler's fixed `batch_size` (the GRPO group size).
         ``token_budget`` is total tokens (prefill cur_len + new) budget."""
         codes, _ = self.sample(
-            [text] * batch,
+            text,
             seed=0,
             do_sample=True,
             temperature=0.9,
@@ -99,10 +99,52 @@ class Sampler(ABC):
         )
         return codes
 
+    @staticmethod
+    def build(
+        ttm: TrainerModel,
+        impl: str = "hf",
+        speaker: str = "cyrene",
+        language: str = "Auto",
+        batch_size: int = 8,
+        lmax: int = 1024,
+    ) -> Sampler:
+        """Factory — `impl` selects the sampler (lazy imports, no eager deps)."""
+        match impl:
+            case "hf":
+                from trainer.samplers.hf import HFSampler
+
+                return HFSampler(
+                    ttm, speaker=speaker, language=language, batch_size=batch_size
+                )
+            case "fast":
+                from trainer.samplers.eager import EagerSampler
+
+                return EagerSampler(
+                    ttm, speaker=speaker, language=language, batch_size=batch_size
+                )
+            case "compiled":
+                from trainer.samplers.torch_compile import TorchCompileSampler
+
+                return TorchCompileSampler(
+                    ttm, speaker=speaker, language=language, batch_size=batch_size
+                )
+            case "graphed":
+                from trainer.samplers.cuda_graph import CudaGraphSampler
+
+                return CudaGraphSampler(
+                    ttm,
+                    speaker=speaker,
+                    language=language,
+                    batch_size=batch_size,
+                    lmax=lmax,
+                )
+            case _:
+                raise ValueError(f"unknown sampler impl: {impl}")
+
     @abstractmethod
     def sample(
         self,
-        texts: list[str],
+        text: str,
         *,
         seed: int,
         do_sample: bool,
@@ -112,16 +154,19 @@ class Sampler(ABC):
         subtalker_temperature: float,
         subtalker_top_k: int,
     ) -> tuple[list[torch.Tensor], int]:
-        """Generate one code-group sequence per text. Returns
+        """Generate one code-group sequence per group item. Returns
         ``(codes, cur_len)`` where ``codes`` is list of [T, num_code_groups]
         tensors (first column = semantic tokens; EOS truncated) and ``cur_len``
         is prefill length (mask.shape[1]) for token_budget accounting.
+
+        `text` is a single prompt, internally repeated `batch_size` times to
+        form the GRPO group — no heterogeneous list, no assert needed.
 
         All sampling params are keyword-only WITHOUT defaults: callers state
         the full config explicitly (the RL contract lives at call sites;
         probes vary one knob at a time). ``seed`` is REQUIRED — RL rollouts
         are always seeded (reproducibility is part of the contract; unseeded
-        sampling would poison the same-(texts, seed) replay guarantee).
+        sampling would poison the same-(text, seed) replay guarantee).
         Params mirror upstream ``generate`` with top_p pinned to the official
         1.0, repetition_penalty pinned to None (the official 1.05 default is
         serving-only; RL rollout must stay stateless so the teacher-forcing
