@@ -17,7 +17,6 @@ otherwise the ModelScope snapshot is fetched through the modelscope client.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 UTMOS_HF_REPO = "sarulab-speech/UTMOSv2"
@@ -42,10 +41,6 @@ SV_SOURCES = {
 }
 
 
-def _log(msg: str) -> None:
-    print(f"[fetch] {msg}", file=sys.stderr, flush=True)
-
-
 def ensure_sv_ckpt(sv_dir: str | Path | None, name: str) -> Path:
     """Resolve (downloading once via ModelScope if needed) the SV ckpt for
     `name`. A file already present under sv_dir/pretrained/... wins."""
@@ -55,11 +50,11 @@ def ensure_sv_ckpt(sv_dir: str | Path | None, name: str) -> Path:
         return manual
     from modelscope.hub.file_download import model_file_download
 
-    _log(f"fetching SV ckpt {name} via ModelScope ({conf['model_id']})")
+    print(f"[fetch] fetching SV ckpt {name} via ModelScope ({conf['model_id']})")
     local = model_file_download(
         model_id=conf["model_id"], file_path=conf["file"], revision="master"
     )
-    _log(f"SV ckpt {name} ready: {local}")
+    print(f"[fetch] SV ckpt {name} ready: {local}")
     return Path(local)
 
 
@@ -68,10 +63,10 @@ def ensure_utmos(fold: int, seed: int) -> Path:
     weights. Returns the HF-managed cache path."""
     from huggingface_hub import hf_hub_download
 
-    _log(f"fetching UTMOSv2 fold{fold} via HF ({UTMOS_HF_REPO})")
+    print(f"[fetch] fetching UTMOSv2 fold{fold} via HF ({UTMOS_HF_REPO})")
     local = hf_hub_download(
         repo_id=UTMOS_HF_REPO,
         filename=f"fold{fold}_s{seed}_best_model.pth",
     )
-    _log(f"UTMOSv2 fold{fold} ready: {local}")
+    print(f"[fetch] UTMOSv2 fold{fold} ready: {local}")
     return Path(local)

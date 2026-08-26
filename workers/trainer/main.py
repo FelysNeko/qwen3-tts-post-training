@@ -39,6 +39,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=TrainConfig.lr)
     p.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay)
     p.add_argument("--grad-clip", type=float, default=TrainConfig.grad_clip)
+    p.add_argument(
+        "--scorer-push-endpoint", default=TrainConfig.scorer_push_endpoint
+    )
+    p.add_argument(
+        "--scorer-pull-endpoint", default=TrainConfig.scorer_pull_endpoint
+    )
+    p.add_argument("--scorer-timeout", type=float, default=TrainConfig.scorer_timeout)
     p.add_argument("--scorer-device", default=TrainConfig.scorer_device)
     p.add_argument("--out-dir", default=TrainConfig.out_dir)
     p.add_argument("--ckpt-every", type=int, default=TrainConfig.ckpt_every)
@@ -71,6 +78,9 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
+        scorer_push_endpoint=args.scorer_push_endpoint,
+        scorer_pull_endpoint=args.scorer_pull_endpoint,
+        scorer_timeout=args.scorer_timeout,
         scorer_device=args.scorer_device,
         out_dir=args.out_dir,
         ckpt_every=args.ckpt_every,

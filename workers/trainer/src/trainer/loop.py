@@ -21,9 +21,9 @@ from pathlib import Path
 
 import torch
 
+from qwen3_tts_post_training.client.protocol import ScoreItem
+from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
-from qwen3_tts_post_training.scorers.client import ScoreItem, ScorerClient
-from qwen3_tts_post_training.scorers.protocol import ScorerError
 from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
 from trainer.decoder import Decoder
 from trainer.logprob import LogProbComputer
@@ -74,6 +74,10 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
 
+    scorer_push_endpoint: str = "tcp://127.0.0.1:5555"
+    scorer_pull_endpoint: str = "tcp://127.0.0.1:5556"
+    scorer_timeout: float = 600.0
+    # deprecated: scorer_device retained for compat, scorer now manual ZMQ service
     scorer_device: str = "cuda:0"
     out_dir: str = "runs/grpo_v1"
     ckpt_every: int = 1
@@ -105,6 +109,20 @@ def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
     rng = random.Random(cfg.seed * 1000003 + step)
     k = min(cfg.num_prompts, len(pool))
     return rng.sample(pool, k)
+
+
+def _cleanup_wavs(wav_paths: list[Path]) -> None:
+    for p in wav_paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    # try remove parent dir if empty
+    if wav_paths:
+        try:
+            wav_paths[0].parent.rmdir()
+        except OSError:
+            pass
 
 
 def _scores_to_tensor(results: list[dict], key: str, device: str) -> torch.Tensor:
@@ -184,13 +202,15 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
     )
     decoder = Decoder(ttm)
     lpc = LogProbComputer(ttm, speaker=cfg.speaker)
-    scorer = ScorerClient(device=cfg.scorer_device)
-    scorer.start()
+    scorer = Client(
+        push_endpoint=cfg.scorer_push_endpoint,
+        pull_endpoint=cfg.scorer_pull_endpoint,
+        timeout_s=cfg.scorer_timeout,
+    )
     try:
-        scorer.ping()
         _train_loop(cfg, ttm, sampler, decoder, lpc, scorer)
     finally:
-        scorer.stop()
+        scorer.close()
 
 
 def _train_loop(
@@ -199,7 +219,7 @@ def _train_loop(
     sampler: Sampler,
     decoder: Decoder,
     lpc: LogProbComputer,
-    scorer: ScorerClient,
+    scorer: Client,
 ) -> None:
     optimizer = torch.optim.AdamW(
         ttm.trainable_parameters, lr=cfg.lr, weight_decay=cfg.weight_decay
@@ -224,9 +244,13 @@ def _train_loop(
         gs = cfg.group_size
         skips: dict[str, int] = {}
 
-        # ---- phase 1: rollout — one group per prompt (graphed batch = gs) ----
+        # ---- phase 1: rollout + async push (PUSH/PULL batch pipeline) ----
+        # Zero-thread pipeline: rollout in trainer, scoring in scorer process.
+        # Trainer pushes each group's 8 wavs via ZMQ PUSH (40B path, HWM 1000, non-blocking);
+        # scorer PULLs and scores in parallel while trainer continues rollout.
+        # Stage 1: for gi push; Stage 2: for gi pull. Wall = max(rollouts, scores)+tail.
         t_roll0 = time.monotonic()
-        groups: list[dict] = []
+        pending: list[tuple[dict, int]] = []  # (group, req_id)
         for gi, prompt in enumerate(prompts):
             rollout = rollout_group(
                 sampler,
@@ -239,62 +263,63 @@ def _train_loop(
                 token_budget=cfg.token_budget,
             )
             t_max = max(c.shape[0] for c in rollout.codes)
-            # token_budget = cur_len + T (total tokens); T hits budget when
-            # cur_len + T >= token_budget i.e. T >= budget - cur_len
             cur_len = rollout.cur_len
             if t_max + cur_len >= cfg.token_budget:
-                # runaway no-EOS group (hit budget without EOS): scoring it
-                # wastes time and teacher-forcing [gs, >budget] with grads OOMs
-                # the 16 GB trainer GPU (B8 T500 14.4G, T550 OOM)
                 skips["runaway"] = skips.get("runaway", 0) + 1
+                _cleanup_wavs(rollout.wav_paths)
                 continue
-            groups.append(
-                {
-                    "gi": gi,
-                    "prompt": prompt,
-                    "codes": rollout.codes,
-                    "wavs": rollout.wav_paths,
-                    "t_max": t_max,
-                }
-            )
-        t_rollout = time.monotonic() - t_roll0
-
-        # ---- phase 2: score — ONE request for all surviving groups ----
-        t_score = 0.0
-        if groups:
-            t_s0 = time.monotonic()
+            g = {
+                "gi": gi,
+                "prompt": prompt,
+                "codes": rollout.codes,
+                "wavs": rollout.wav_paths,
+                "t_max": t_max,
+            }
             try:
-                items = [
-                    ScoreItem(wav=str(g["wavs"][j]), text=g["prompt"])
-                    for g in groups
-                    for j in range(gs)
-                ]
-                results = scorer.score(items)
-            except (RuntimeError, ScorerError) as e:
+                rid = scorer.send_score(
+                    [ScoreItem(wav_path=str(p), text=prompt) for p in g["wavs"]]
+                )
+            except Exception as e:  # noqa: BLE001
                 print(
                     json.dumps(
-                        {"step": step, "skip": "scorer_failure", "reason": str(e)},
+                        {"step": step, "skip": "scorer_send_failure", "reason": str(e)},
                         ensure_ascii=False,
                     ),
                     flush=True,
                 )
+                _cleanup_wavs(g["wavs"])
+                skips["scorer_item"] = skips.get("scorer_item", 0) + 1
                 continue
-            t_score = time.monotonic() - t_s0
+            pending.append((g, rid))
+        t_rollout = time.monotonic() - t_roll0
 
-            scored: list[dict] = []
-            pos = 0
-            for g in groups:
-                rs = results[pos : pos + gs]
-                pos += gs
-                if any(r.get("error") is not None or r.get("cer") is None for r in rs):
+        # ---- phase 2: score — drain PULL responses, trainer owns unlink ----
+        t_score = 0.0
+        groups: list[dict] = []
+        if pending:
+            t_s0 = time.monotonic()
+            for g, rid in pending:
+                try:
+                    results = scorer.recv_score(rid, timeout=scorer.timeout_s)
+                except (TimeoutError, RuntimeError) as e:
+                    print(
+                        json.dumps(
+                            {"step": step, "skip": "scorer_failure", "reason": str(e)},
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    _cleanup_wavs(g["wavs"])
                     skips["scorer_item"] = skips.get("scorer_item", 0) + 1
                     continue
+                # trainer owns lifecycle: delete tmpfs wavs after scoring
+                _cleanup_wavs(g["wavs"])
                 for key in ("sim", "cer", "mos"):
                     g[key] = torch.tensor(
-                        [r[key] for r in rs], dtype=torch.float32, device=cfg.device
+                        [r[key] for r in results], dtype=torch.float32, device=cfg.device
                     )
-                scored.append(g)
-            groups = scored
+                groups.append(g)
+            t_score = time.monotonic() - t_s0
 
         # per-group zero-signal filter (DAPO dynamic sampling): only groups
         # whose WER actually spreads carry a learnable within-group signal

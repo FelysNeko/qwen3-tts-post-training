@@ -4,7 +4,7 @@ GRPO post-training pipeline for Qwen3-TTS CustomVoice. Python 3.12, uv-managed. 
 
 ## Layout
 
-- `src/qwen3_tts_post_training/` — core lib (pure torch, no model runtime): `reward/reward.py` (reward_v3), `scorers/` (JSON-lines protocol + subprocess client), `train/grpo.py` (losses). Installed editable into both workers.
+- `src/qwen3_tts_post_training/` — core lib (pure torch, no model runtime): `reward/reward.py` (reward_v3), `client/` (protocol + trainer/scorer ZMQ clients), `train/grpo.py` (losses). Installed editable into both workers.
 - `workers/trainer/` — GRPO trainer worker (default `cuda:1`). Entry: `workers/trainer/main.py`.
 - `workers/scorer/` — resident scoring worker (default `cuda:0`): SV + ASR/CER + MOS. Entry: `workers/scorer/main.py`.
 - Each worker has its own `pyproject.toml` and `.venv`; deps are not unified at the root. Root `.venv` has only torch + ruff.
@@ -15,8 +15,8 @@ GRPO post-training pipeline for Qwen3-TTS CustomVoice. Python 3.12, uv-managed. 
 uv sync                     # root: installs ruff into .venv
 .venv/bin/ruff check .      # lint (all checks currently pass)
 uv sync                     # inside workers/trainer or workers/scorer: worker deps
-workers/trainer/.venv/bin/python workers/trainer/main.py [args]   # run trainer
-workers/scorer/.venv/bin/python workers/scorer/main.py [args]     # run scorer standalone (rare; normally spawned)
+workers/scorer/.venv/bin/python workers/scorer/main.py --sv-dir ... --sv-ref ...  # run scorer (manual, bind-less ZMQ connect to trainer)
+workers/trainer/.venv/bin/python workers/trainer/main.py [args]   # run trainer (binds ZMQ PUSH 5555 / PULL 5556; must be started before or with scorer)
 ```
 
 - Ruff is the only check. `[tool.ruff.lint.per-file-ignores]` exempts vendored `workers/scorer/src/scorer/speakerlab/**` with `ALL` — do not "fix" style there.
@@ -24,9 +24,9 @@ workers/scorer/.venv/bin/python workers/scorer/main.py [args]     # run scorer s
 
 ## Runtime wiring (not obvious from filenames)
 
-- Trainer spawns the scorer as a subprocess (`ScorerClient` in `src/qwen3_tts_post_training/scorers/client.py`): `workers/scorer/.venv/bin/python workers/scorer/main.py`, JSON lines over stdin/stdout, lock-step (one in-flight request). In `serve.py` stdout is dup'ed to an fd reserved for protocol and `sys.stdout` remapped to stderr — never print to stdout in scorer code.
+- Trainer and scorer are **manually started, fully decoupled** via ZMQ (`Client` in `src/qwen3_tts_post_training/client/trainer.py` / `scorer.py`): trainer `Client` **binds** `PUSH tcp://127.0.0.1:5555` + `PULL tcp://127.0.0.1:5556` (JSON over ZMQ, `pyzmq` in both venvs), scorer `Client` **connects** to both; no `Popen`, no stdio dup. Pipeline is **zero-thread batch**: trainer `for gi 8 push (8 wav/path JSON)` (non-blocking, HWM 1000, `scorer` starts scoring `T=1` while trainer `T=2..4` continues rollouts) → `for gi 8 pull` drain; `ZMQ` buffering gives `rollout ∥ score` (`wall = 8*rollout + last_score`), `64 wav ~46MB` safe, `score` stateless, `trainer` owns `unlink` after `recv` (scorer `read-only`, never `unlink`).
 - Trainer defaults to `cuda:1`, scorer to `cuda:0` (one CUDA context per process).
-- Rollout wavs are written to per-run tmpfs dirs under `/dev/shm` and the scorer reads them by path; they are reclaimed by the OS.
+- Rollout wavs are written to per-run tmpfs dirs under `/dev/shm` and the scorer reads them by path; **trainer deletes each group's 8 wavs after `recv`**, `atexit` sweeps stale `/dev/shm/grpo_*`.
 - Scorer/SV model weights auto-fetch on first load via the upstream tools (no manual downloads): SV ckpts through the `modelscope` client, UTMOSv2 folds through `huggingface_hub` from the official `sarulab-speech/UTMOSv2`, ASR/wav2vec2 through transformers. See `workers/scorer/src/scorer/fetch.py`.
 - Defaults are overridable: model ckpt `--model-path` (default `/mnt/d/Repository/models/PhiLia093-TTS/`, not present until downloaded — trainer asserts a clear message). SV assets resolve to the sibling `playground/` dir without a hardcoded username — `Q3TTS_ROOT` overrides repo root, `Q3TTS_PLAYGROUND` overrides the playground dir. Scorer worker `--sv-dir` can point at a local 3D-Speaker checkout.
 - Checkpoints save LoRA deltas + codec head + optimizer state; `--resume` reads `out_dir/latest`.
