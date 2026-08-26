@@ -31,6 +31,9 @@ from trainer.model import TrainerModel
 from trainer.rollout import rollout_group
 from trainer.samplers.base import Sampler
 
+# mirrors rollout_group's pinned subtalker sampling trio (do_sample@T=0.9/top_k=50)
+SUBTALKER_TEMPERATURE = 0.9
+
 # v1 placeholder text pool (domain: narrative / dialogue / rhythmic narration).
 TEXT_POOL = (
     "风从山谷那边吹来，把整片麦田都推成了金色的波浪。",
@@ -340,10 +343,16 @@ def _train_loop(
         trained: list[tuple[torch.Tensor, object, dict]] = []
         for g in trainable:
             ref = lpc.compute_ref(
-                [g["prompt"]] * gs, g["codes"], cfg.temperature
+                [g["prompt"]] * gs,
+                g["codes"],
+                cfg.temperature,
+                subtalker_temperature=SUBTALKER_TEMPERATURE,
             )
             pol = lpc.compute_policy(
-                [g["prompt"]] * gs, g["codes"], cfg.temperature
+                [g["prompt"]] * gs,
+                g["codes"],
+                cfg.temperature,
+                subtalker_temperature=SUBTALKER_TEMPERATURE,
             )
             loss, metrics = grpo_loss(
                 pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo

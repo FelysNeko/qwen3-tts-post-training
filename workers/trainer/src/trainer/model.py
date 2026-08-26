@@ -13,9 +13,32 @@ speech tokenizer is the environment renderer (always frozen).
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+from trainer.data import CollateBatch
+
+
+@dataclass
+class TeacherForcing:
+    """Selected outputs of `TrainerModel.teacher_forcing` (shared SFT/GRPO).
+
+    sem_logits [b, L-1, V]: semantic-head logits at position p-1 — the dense
+    view `logits[:, :-1]`, so the shifted target `batch.codec_0_labels[:, 1:]`
+    (SFT, includes EOS) or `sem_targets[:, 1:]` (GRPO) gathers directly.
+    predict_mask [b, L-1]: True where a code group sits at p.
+    codes_flat [N, Q]: flattened code groups (`codec_ids[codec_mask]`,
+    row-major = sample order).
+    sub_logits [N, Q-1, V]: predictor-head logits; head j at embedded slot
+    j+1 predicts c_{j+1}, conditioned on slots up to j (+ talker hidden).
+    """
+
+    sem_logits: torch.Tensor
+    predict_mask: torch.Tensor
+    codes_flat: torch.Tensor
+    sub_logits: torch.Tensor
 
 
 class LoRALinear(nn.Module):
@@ -111,6 +134,72 @@ class TrainerModel:
         """Switch LoRA on/off for policy (on) vs reference (off) forwards."""
         for lora in self.lora_modules:
             lora.enabled = bool(enabled)
+
+    def teacher_forcing(
+        self, batch: CollateBatch, speaker_vec: torch.Tensor
+    ) -> TeacherForcing:
+        """Shared teacher-forcing kernel: embeddings → ONE talker forward →
+        the sub-talker pass. Identical for SFT and GRPO (official
+        `teacher_forcing` / `sft_12hz.py` structure, with the upstream
+        target-leak bug fixed via the p-1 hidden selection). Consumers diverge
+        only downstream:
+
+        - SFT: CE on `sem_logits` vs `batch.codec_0_labels[:, 1:]`
+          (ignore_index=-100; INCLUDES the EOS label slot — it sits outside
+          `codec_mask`, hence dense logits rather than a masked select) plus
+          CE on `sub_logits` vs `codes_flat[:, 1:]` at weight 0.3;
+        - GRPO: temperature-scaled full-softmax log-probs (logprob.py).
+
+        Embedding construction (inlined): official SFT input assembly with ONE
+        deliberate correction vs the upstream script — the text channel goes
+        through `text_projection`, exactly as generation does (upstream omits
+        it; verified against captured generation inputs). `speaker_vec` is
+        [hidden] (speaker-id lookup, broadcast) or [b, hidden]
+        (`speaker_encoder(ref_mels)` output) — both assign into slot 6.
+
+        No labels are passed to the talker: the internal loss would hardcode
+        temperature 1.0 and duplicate what consumers do explicitly. Adapter
+        state, grad mode and inference_mode stay caller-owned.
+        """
+        text_embedding = (
+            self.talker.text_projection(
+                self.talker.model.text_embedding(batch.input_text_ids)
+            )
+            * batch.text_embedding_mask
+        )
+        codec_embedding = (
+            self.talker.model.codec_embedding(batch.input_codec_ids)
+            * batch.codec_embedding_mask
+        )
+        codec_embedding[:, 6, :] = speaker_vec
+
+        input_embeddings = text_embedding + codec_embedding
+
+        for k in range(1, self.talker.config.num_code_groups):
+            codec_k_embedding = self.talker.code_predictor.get_input_embeddings()[
+                k - 1
+            ](batch.codec_ids[:, :, k])
+            codec_k_embedding = codec_k_embedding * batch.codec_mask.unsqueeze(-1)
+            input_embeddings = input_embeddings + codec_k_embedding
+
+        outputs = self.talker(
+            inputs_embeds=input_embeddings,
+            attention_mask=batch.attention_mask,
+            output_hidden_states=True,
+        )
+
+        predict_mask = batch.codec_mask[:, 1:]  # [b, L-1]: code at p ↔ hidden p-1
+        codes_flat = batch.codec_ids[batch.codec_mask]  # [N, Q] row-major
+        talker_hidden = outputs.hidden_states[0][-1][:, :-1][predict_mask]
+        sub_logits, _ = self.talker.forward_sub_talker_finetune(
+            codes_flat, talker_hidden
+        )
+        return TeacherForcing(
+            sem_logits=outputs.logits[:, :-1],
+            predict_mask=predict_mask,
+            codes_flat=codes_flat,
+            sub_logits=sub_logits,
+        )
 
     @property
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
