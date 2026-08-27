@@ -23,6 +23,7 @@ import torch
 
 from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
+from qwen3_tts_post_training.reward.metrics import reward_config_from_metrics
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
 from trainer.grpo.logprob import LogProbComputer
@@ -69,6 +70,10 @@ class TrainConfig:
     temperature: float = 0.9
     top_k: int = 50
     sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
+
+    # preprocess cache (PROJECT_STATUS §16): injects sv_center/sv_scale into
+    # RewardConfig; None keeps the playground-calibrated defaults
+    metrics_path: str | None = None
 
     variant: str = "dr"
     kl_beta: float = 0.001
@@ -231,7 +236,11 @@ def _train_loop(
         kl_beta=cfg.kl_beta,
         num_code_groups=ttm.talker.config.num_code_groups,
     )
-    reward_cfg = RewardConfig()
+    reward_cfg = (
+        reward_config_from_metrics(cfg.metrics_path)
+        if cfg.metrics_path
+        else RewardConfig()
+    )
     pool = _load_text_pool(cfg)
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
 

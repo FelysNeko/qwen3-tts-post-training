@@ -35,7 +35,13 @@ dev = [
     "ruff>=0.16.4",
 ]
 
-[tool.ruff.lint.per-file-ignores]
-# vendored 3D-Speaker model defs (verbatim upstream — kept byte-faithful so the
-# SV ckpts load bit-identically; do not "fix" style here)
-"workers/scorer/src/scorer/speakerlab/**" = ["ALL"]
+[tool.ruff]
+# vendored trees stay byte-faithful to upstream (ckpts must keep loading with
+# matching state-dict keys / bit-identical kernels) — excluded from BOTH lint
+# and format (`lint.per-file-ignores` alone does NOT protect against
+# `ruff format`)
+extend-exclude = [
+    "workers/scorer/src/scorer/speakerlab",
+    "workers/scorer/src/scorer/utmos",
+    "workers/preprocess/src/preprocess/clearvoice",
+]

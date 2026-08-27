@@ -16,9 +16,15 @@ class ScoreItem(BaseModel):
 
 
 class ScoreResult(BaseModel):
+    """`sim`/`sim_camp` are None when the scorer runs without a reference
+    (preprocess mode: the centroid only exists after every clip is embedded);
+    `vector` carries the raw unit-norm ERes2NetV2 embedding (reward source of
+    truth). Trainer mode always has refs set, so sim fields are floats there."""
+
     wav_path: str
-    sim: float
-    sim_camp: float
+    sim: float | None
+    sim_camp: float | None
+    vector: list[float] | None = None
     transcript: str
     cer: float
     mos: float

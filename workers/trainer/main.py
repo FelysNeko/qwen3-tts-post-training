@@ -32,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["hf", "fast", "compiled", "graphed"],
     )
     p.add_argument(
+        "--metrics-path",
+        default=TrainConfig.metrics_path,
+        help="preprocess metrics.json — injects sv_center/sv_scale into RewardConfig",
+    )
+    p.add_argument(
         "--variant", default=TrainConfig.variant, choices=["vanilla", "dr", "gspo"]
     )
     p.add_argument("--kl-beta", type=float, default=TrainConfig.kl_beta)
@@ -67,6 +72,7 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         sampler_impl=args.sampler_impl,
+        metrics_path=args.metrics_path,
         variant=args.variant,
         kl_beta=args.kl_beta,
         warmup_steps=args.warmup_steps,

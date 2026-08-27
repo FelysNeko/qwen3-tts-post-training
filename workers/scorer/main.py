@@ -26,6 +26,11 @@ def main() -> None:
     )
     ap.add_argument("--sv-ref", default=None, help="ERes2NetV2 centroid npy")
     ap.add_argument(
+        "--metrics",
+        default=None,
+        help="metrics.json — its centroid doubles as the SV ref (exclusive with --sv-ref)",
+    )
+    ap.add_argument(
         "--sv-ref-camp", default=None, help="CAM++ centroid npy (cross-monitor)"
     )
     ap.add_argument("--asr-model", default="Qwen/Qwen3-ASR-1.7B-hf")
@@ -50,6 +55,8 @@ def main() -> None:
         help="ZMQ PUSH connect endpoint (trainer PULL binds here)",
     )
     args = ap.parse_args()
+    if args.metrics and args.sv_ref:
+        ap.error("--metrics and --sv-ref are mutually exclusive")
 
     print(f"[scorer] pid={os.getpid()} device={args.device}")
     print(f"[scorer] push {args.push_endpoint} pull {args.pull_endpoint}")

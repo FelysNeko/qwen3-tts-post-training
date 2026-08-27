@@ -4,9 +4,10 @@ GRPO post-training pipeline for Qwen3-TTS CustomVoice. Python 3.12, uv-managed. 
 
 ## Layout
 
-- `src/qwen3_tts_post_training/` — core lib (pure torch, no model runtime): `reward/reward.py` (reward_v3), `client/` (protocol + trainer/scorer ZMQ clients), `train/grpo.py` (losses). Installed editable into both workers.
+- `src/qwen3_tts_post_training/` — core lib (pure torch, no model runtime): `reward/reward.py` (reward_v3) + `reward/metrics.py` (preprocess metrics.json → RewardConfig/centroid), `client/` (protocol + trainer/scorer ZMQ clients), `train/grpo.py` (losses). Installed editable into all workers.
 - `workers/trainer/` — GRPO trainer worker (default `cuda:1`). Entry: `workers/trainer/main.py`. Package layout: shared kernels at `src/trainer/` top level (`model.py` = `ModelWrapper` [collate/tokenize_assistant/teacher_forcing/decode 共享核] + `lora.py`)
 - `workers/scorer/` — resident scoring worker (default `cuda:0`): SV + ASR/CER + MOS. Entry: `workers/scorer/main.py`.
+- `workers/preprocess/` — corpus → cache worker (default `cuda:1`, needs the scorer up): filter → clearvoice(48k) → codes → score; writes `.cache/{lang}/` (`clearvoice`/\*.wav [the ONLY derived audio — all consumers resample from it on the fly] + `asset.jsonl` + `metrics.json`). Entry: `workers/preprocess/main.py`, stages in `src/preprocess/pipeline.py`. Enhancement = VENDORED MossFormer2_SE_48K (`src/preprocess/clearvoice/`), no `clearvoice` pip dep.
 - Each worker has its own `pyproject.toml` and `.venv`; deps are not unified at the root. Root `.venv` has only torch + ruff.
 
 ## Commands
@@ -14,12 +15,13 @@ GRPO post-training pipeline for Qwen3-TTS CustomVoice. Python 3.12, uv-managed. 
 ```sh
 uv sync                     # root: installs ruff into .venv
 .venv/bin/ruff check .      # lint (all checks currently pass)
-uv sync                     # inside workers/trainer or workers/scorer: worker deps
-workers/scorer/.venv/bin/python workers/scorer/main.py --sv-dir ... --sv-ref ...  # run scorer (manual, bind-less ZMQ connect to trainer)
+uv sync                     # inside workers/trainer, workers/scorer or workers/preprocess: worker deps
+workers/scorer/.venv/bin/python workers/scorer/main.py --sv-dir ... --sv-ref ...  # run scorer (manual, bind-less ZMQ connect to trainer; preprocess mode: drop --sv-ref, or pass --metrics)
 workers/trainer/.venv/bin/python workers/trainer/main.py [args]   # run trainer (binds ZMQ PUSH 5555 / PULL 5556; must be started before or with scorer)
+workers/preprocess/.venv/bin/python workers/preprocess/main.py --dataset /path/to/{lang} [--limit N]  # corpus -> .cache/{lang} (scorer must be up WITHOUT --sv-ref)
 ```
 
-- Ruff is the only check. `[tool.ruff.lint.per-file-ignores]` exempts vendored `workers/scorer/src/scorer/speakerlab/**` with `ALL` — do not "fix" style there.
+- Ruff is the only check. `[tool.ruff] extend-exclude` skips vendored trees (`workers/scorer/src/scorer/speakerlab`, `workers/scorer/src/scorer/utmos`, `workers/preprocess/src/preprocess/clearvoice`) from BOTH lint and format — do not "fix" style there. (An earlier `[tool.ruff.lint.per-file-ignores]` setup only guarded lint; `ruff format` ignored it and reformatted the vendored files once — restored from git.)
 - torch comes from the `pytorch-cu128` uv index; flash-attn is a pinned cu12 wheel in the root pyproject. Python must be 3.12 (`.python-version`).
 
 ## Runtime wiring (not obvious from filenames)
@@ -27,14 +29,18 @@ workers/trainer/.venv/bin/python workers/trainer/main.py [args]   # run trainer 
 - Trainer and scorer are **manually started, fully decoupled** via ZMQ (`Client` in `src/qwen3_tts_post_training/client/trainer.py` / `scorer.py`): trainer `Client` **binds** `PUSH tcp://127.0.0.1:5555` + `PULL tcp://127.0.0.1:5556` (JSON over ZMQ, `pyzmq` in both venvs), scorer `Client` **connects** to both; no `Popen`, no stdio dup. Pipeline is **zero-thread batch**: trainer `for gi 8 push (8 wav/path JSON)` (non-blocking, HWM 1000, `scorer` starts scoring `T=1` while trainer `T=2..4` continues rollouts) → `for gi 8 pull` drain; `ZMQ` buffering gives `rollout ∥ score` (`wall = 8*rollout + last_score`), `64 wav ~46MB` safe, `score` stateless, `trainer` owns `unlink` after `recv` (scorer `read-only`, never `unlink`).
 - Trainer defaults to `cuda:1`, scorer to `cuda:0` (one CUDA context per process).
 - Rollout wavs are written to per-run tmpfs dirs under `/dev/shm` and the scorer reads them by path; **trainer deletes each group's 8 wavs after `recv`**, `atexit` sweeps stale `/dev/shm/grpo_*`.
-- Scorer/SV model weights auto-fetch on first load via the upstream tools (no manual downloads): SV ckpts through the `modelscope` client, UTMOSv2 folds through `huggingface_hub` from the official `sarulab-speech/UTMOSv2`, ASR/wav2vec2 through transformers. See `workers/scorer/src/scorer/fetch.py`.
-- Defaults are overridable: model ckpt `--model-path` (default `/mnt/d/Repository/models/PhiLia093-TTS/`, not present until downloaded — trainer asserts a clear message). SV assets resolve to the sibling `playground/` dir without a hardcoded username — `Q3TTS_ROOT` overrides repo root, `Q3TTS_PLAYGROUND` overrides the playground dir. Scorer worker `--sv-dir` can point at a local 3D-Speaker checkout.
+- Scorer/SV model weights auto-fetch on first load via the upstream tools (no manual downloads): SV ckpts through the `modelscope` client, UTMOSv2 folds through `huggingface_hub` from the official `sarulab-speech/UTMOSv2`, ASR/wav2vec2 through transformers, ClearVoice MossFormer2_SE_48K through `snapshot_download` from `alibabasglab/MossFormer2_SE_48K` into the canonical HF cache (see `workers/scorer/src/scorer/fetch.py` + `workers/preprocess/src/preprocess/clearvoice/load.py`).
+- **Vendored ClearVoice** (`workers/preprocess/src/preprocess/clearvoice/`): the pip `clearvoice` package was dropped — 0.1.2 hardcodes a CWD-relative `checkpoint_dir` with no override API, auto-picks the GPU via nvidia-smi as a global side effect, and pins `numpy<2` + `librosa==0.10.2.post1`. Vendor = `mossformer2_se/` model defs BYTE-FAITHFUL (state-dict keys must match the published ckpt; ruff-exempted like speakerlab) + a hand-ported decode loop (`decode.py`) + ckpt loader (`load.py`). The pip package's decode is BIT-IDENTICAL (max_abs=0.0, 4 clips incl. 26s — `probes/probe_clearvoice_ab.py`, archival now that pip is uninstalled). Upstream quirk worth knowing: their `one_time_decode_length` guard compares the BATCH dim against 20s, so every tensor-mode input takes the one-pass batched decode — the vendored loop reproduces exactly that; kaldi fbank `dither=1.0` consumes the global torch RNG (pipeline seeds it per clip).
+- Defaults are overridable: model ckpt `--model-path` (default `/mnt/d/Repository/models/PhiLia093-TTS/`, not present until downloaded — trainer/preprocess assert a clear message). Scorer worker `--sv-dir` can point at a local 3D-Speaker checkout. No `Q3TTS_*` env vars exist (AGENTS/PROJECT_STATUS claims of `Q3TTS_ROOT`/`Q3TTS_PLAYGROUND` were stale and removed 2026-08-27).
+- **metrics.json contract** (preprocess output → training input): `.cache/{lang}/metrics.json` holds `centroid` (unit-norm E2V2, scorer `--metrics` installs it as the SV ref — exclusive with `--sv-ref`), `sim.mean/std` (→ `RewardConfig.sv_center/sv_scale` via `reward.metrics.reward_config_from_metrics`; trainer `--metrics-path`, defaults fall back to the playground-calibrated constants), `wer` (domain mean CER), `utmosv2` distribution stats (mos_tau stays 2.5 until a gate rule is decided). `asset.jsonl` rows: `{name, text, transcript, cer, codes [T,16], vector (unit-norm E2V2), utmosv2, checksum}`; stages are idempotent (existing wavs / checksum-matching rows skip).
+- Score protocol: `ScoreResult.sim/sim_camp` are None when the scorer runs without a ref (preprocess mode — centroid only exists after all clips are embedded); `vector` is always populated. Trainer mode always has refs set.
 - Checkpoints save LoRA deltas + codec head + optimizer state; `--resume` reads `out_dir/latest`.
 
 ## Vendored code — byte-faithful, do not modify
 
 - `workers/scorer/src/scorer/speakerlab/**` — 3D-Speaker model defs; kept verbatim so SV ckpts load bit-identically.
 - `workers/scorer/src/scorer/utmos/**` — bit-exact vs upstream UTMOSv2 @ cc2700db.
+- `workers/preprocess/src/preprocess/clearvoice/mossformer2_se/**` — ClearVoice MossFormer2 model defs; verbatim so the published ckpt loads with matching state-dict keys (decode loop is our port, bit-identical — see above).
 - MOS scoring is deterministic only with fixed seed + 8 averaged reps + `num_workers=0` (sequential); do not parallelize or "improve" this.
 
 ## Algorithm invariants

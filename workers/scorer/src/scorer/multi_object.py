@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import numpy as np
+
 from qwen3_tts_post_training.client.protocol import ScoreItem, ScoreResult, Timing
 
 
@@ -24,6 +26,14 @@ class Scorers:
             s = SVScorer(Path(self.args.sv_dir), self.args.device)
             if self.args.sv_ref:
                 s.set_ref("eres2netv2", Path(self.args.sv_ref))
+            elif self.args.metrics:
+                # preprocess-produced calibration: centroid doubles as the SV ref
+                from qwen3_tts_post_training.reward.metrics import load_centroid
+
+                s.set_ref(
+                    "eres2netv2",
+                    np.asarray(load_centroid(self.args.metrics), dtype=np.float32),
+                )
             if self.args.sv_ref_camp:
                 s.set_ref("campplus", Path(self.args.sv_ref_camp))
             self._sv = s
@@ -60,15 +70,21 @@ class Scorers:
 
     def score(self, items: list[ScoreItem]) -> tuple[list[ScoreResult], Timing]:
         t0 = time.time()
-        sims: list[float] = []
-        sim_camps: list[float] = []
+        sims: list[float | None] = []
+        sim_camps: list[float | None] = []
+        vectors: list[list[float]] = []
         for it in items:
-            sim = self.sv.score(it.wav_path, "eres2netv2")
-            sims.append(sim)
+            emb = self.sv.embed_wav(it.wav_path, "eres2netv2")
+            vectors.append(emb.tolist())
+            sims.append(self.sv.sim_to_ref(emb, "eres2netv2"))
             if self.args.sv_ref_camp:
-                sim_camps.append(self.sv.score(it.wav_path, "campplus"))
+                sim_camps.append(
+                    self.sv.sim_to_ref(
+                        self.sv.embed_wav(it.wav_path, "campplus"), "campplus"
+                    )
+                )
             else:
-                sim_camps.append(sim)
+                sim_camps.append(sims[-1])
         t_sv = time.time() - t0
 
         t0 = time.time()
@@ -84,6 +100,7 @@ class Scorers:
                 wav_path=it.wav_path,
                 sim=sims[i],
                 sim_camp=sim_camps[i],
+                vector=vectors[i],
                 transcript=got[i]["transcript"],
                 cer=got[i]["cer"],
                 mos=mos_scores[i],

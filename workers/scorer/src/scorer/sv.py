@@ -76,10 +76,11 @@ class SVScorer:
             self._models[name] = (model, self.device)
         return self._models[name]
 
-    def set_ref(self, name: str, ref_npy: Path) -> None:
-        ref = np.load(ref_npy).astype(np.float32)
-        ref = ref / np.linalg.norm(ref)
-        self._refs[name] = ref
+    def set_ref(self, name: str, ref: Path | np.ndarray) -> None:
+        arr = np.load(ref) if isinstance(ref, (str, Path)) else np.asarray(ref)
+        arr = arr.astype(np.float32)
+        arr = arr / np.linalg.norm(arr)
+        self._refs[name] = arr
 
     @torch.no_grad()
     def embed(self, audio: np.ndarray, sr: int, name: str = "eres2netv2") -> np.ndarray:
@@ -91,12 +92,15 @@ class SVScorer:
         emb = model(feat.unsqueeze(0)).squeeze(0).cpu().numpy().astype(np.float32)
         return emb / np.linalg.norm(emb)
 
-    def score(self, wav_path: str, name: str = "eres2netv2") -> float:
+    def embed_wav(self, wav_path: str, name: str = "eres2netv2") -> np.ndarray:
         audio, sr = sf.read(wav_path, dtype="float32", always_2d=True)
-        emb = self.embed(audio.mean(axis=1), sr, name)
+        return self.embed(audio.mean(axis=1), sr, name)
+
+    def sim_to_ref(self, emb: np.ndarray, name: str) -> float | None:
+        """Cosine of `emb` (unit-norm, from embed/embed_wav) to the stored
+        reference; None when no reference was set (preprocess mode — the
+        centroid is only computable after every clip has been embedded)."""
         ref = self._refs.get(name)
         if ref is None:
-            raise RuntimeError(
-                f"reference embedding for '{name}' not set (set_ref first)"
-            )
+            return None
         return float(emb @ ref)
