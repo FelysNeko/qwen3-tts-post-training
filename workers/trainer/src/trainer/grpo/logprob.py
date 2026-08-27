@@ -2,8 +2,8 @@
 
 The talker's generation does not expose per-step logits, so we rebuild the
 exact sampling-time input from the prompt text + sampled code groups through
-the SHARED teacher-forcing kernel `TrainerModel.teacher_forcing` (collate via
-`trainer.batch`, embeddings, one talker forward, one sub-talker forward) — a
+the SHARED teacher-forcing kernel `ModelWrapper.teacher_forcing` (via
+`collate`, one talker forward, one sub-talker forward) — a
 port of the official SFT input pipeline verified byte-equal against the
 upstream reference, with ONE correction at the embedding stage: the text
 channel goes through `text_projection`, exactly as generation does. This file
@@ -65,13 +65,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from trainer.batch import CollateBatch, collate, tokenize_assistant
-from trainer.model import TrainerModel
+from trainer.lora import LoraTrainerModel
 
 
 @dataclass
 class LogProbResult:
-    log_probs: torch.Tensor  # [B, (L-1)*Q] per-code log-probs, packed (module docstring)
+    log_probs: (
+        torch.Tensor
+    )  # [B, (L-1)*Q] per-code log-probs, packed (module docstring)
     mask: torch.Tensor  # [B, (L-1)*Q] 1 on valid code slots
     lengths: torch.Tensor  # [B] valid code-group counts (pre-packing)
 
@@ -105,7 +106,7 @@ class LogProbComputer:
     `forward_sub_talker_finetune` for the predictor heads (codebooks 1..15).
     """
 
-    def __init__(self, ttm: TrainerModel, speaker: str = "cyrene"):
+    def __init__(self, ttm: LoraTrainerModel, speaker: str = "cyrene"):
         self.ttm = ttm
         self.model = ttm.model
         self.talker = ttm.model.talker
@@ -115,23 +116,6 @@ class LogProbComputer:
         self.speaker_vec = self.talker.model.codec_embedding.weight[
             talker_config.spk_id[speaker.lower()]
         ]
-
-    def _collate_batch(
-        self,
-        texts: list[str],
-        codes: list[torch.Tensor],
-    ) -> CollateBatch:
-        """(texts, codes) → official-layout batch on the model device."""
-        codes = [
-            cc.clone() for cc in codes
-        ]  # drop inference-mode so policy backward works
-        items = [
-            (tokenize_assistant(self.ttm.processor, t)[0][:-5], cc)
-            for t, cc in zip(texts, codes)
-        ]  # [:-5]: drop trailing specials (official __getitem__ convention)
-        return collate(
-            items, self.model.config, self.num_code_groups
-        ).to(self.model.device)
 
     @torch.inference_mode()
     def compute_ref(
@@ -166,7 +150,7 @@ class LogProbComputer:
         temperature: float,
         subtalker_temperature: float,
     ) -> LogProbResult:
-        batch = self._collate_batch(texts, codes)
+        batch = self.ttm.collate(texts, codes)
         tf = self.ttm.teacher_forcing(batch, self.speaker_vec)
 
         b = len(codes)
@@ -178,14 +162,14 @@ class LogProbComputer:
 
         # --- codebook 0 (semantic head): logits at j predict the code at j+1 ---
         sem_targets = torch.zeros_like(batch.codec_ids[:, :, 0])
-        sem_targets[batch.codec_mask] = tf.codes_flat[:, 0]
+        sem_targets[batch.codec_mask] = tf.talker_codec_ids[:, 0]
         sem_log_probs = token_log_probs(
-            tf.sem_logits, sem_targets[:, 1:], temperature
+            tf.talker_logits, sem_targets[:, 1:], temperature
         )  # [B, L-1], garbage-but-finite off the code span
 
         # --- codebooks 1..15 (predictor heads), conditioned on hidden at p-1 ---
         sub_log_probs = token_log_probs(
-            tf.sub_logits, tf.codes_flat[:, 1:], subtalker_temperature
+            tf.sub_talker_logits, tf.talker_codec_ids[:, 1:], subtalker_temperature
         )  # [N, Q-1]
 
         # --- pack [B, L-1, Q] -> [B, (L-1)*Q]; zeros off the code span ---

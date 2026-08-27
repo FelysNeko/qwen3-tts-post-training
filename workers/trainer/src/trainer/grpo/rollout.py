@@ -8,13 +8,25 @@ by path, and the OS reclaims them when the process exits.
 
 from __future__ import annotations
 
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 
-from trainer.grpo.decoder import Decoder, write_wav
 from trainer.grpo.samplers.base import Sampler
+from trainer.model import ModelWrapper
+
+
+def write_wav(path: str | Path, audio: np.ndarray, sr: int) -> Path:
+    path = Path(path)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+    return path
 
 
 @dataclass
@@ -23,12 +35,14 @@ class RolloutResult:
     codes: list[torch.Tensor]
     wav_paths: list[Path]
     fs: int
-    cur_len: int  # prefill length for token_budget accounting (no default: must be explicit)
+    cur_len: (
+        int  # prefill length for token_budget accounting (no default: must be explicit)
+    )
 
 
 def rollout_group(
     sampler: Sampler,
-    decoder: Decoder,
+    ttm: ModelWrapper,
     prompt: str,
     seed: int,
     tag: str,
@@ -57,7 +71,7 @@ def rollout_group(
         subtalker_temperature=0.9,
         subtalker_top_k=50,
     )
-    wavs, fs = decoder.decode(codes)
+    wavs, fs = ttm.decode(codes)
     if work_dir is None:
         work_dir = Path("/dev/shm") / f"grpo_{tag}"
     work_dir.mkdir(parents=True, exist_ok=True)

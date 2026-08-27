@@ -21,9 +21,13 @@ from qwen3_tts_post_training.client.scorer import Client
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--sv-dir", required=True, help="3D-Speaker root (pretrained/ inside)")
+    ap.add_argument(
+        "--sv-dir", required=True, help="3D-Speaker root (pretrained/ inside)"
+    )
     ap.add_argument("--sv-ref", default=None, help="ERes2NetV2 centroid npy")
-    ap.add_argument("--sv-ref-camp", default=None, help="CAM++ centroid npy (cross-monitor)")
+    ap.add_argument(
+        "--sv-ref-camp", default=None, help="CAM++ centroid npy (cross-monitor)"
+    )
     ap.add_argument("--asr-model", default="Qwen/Qwen3-ASR-1.7B-hf")
     ap.add_argument("--asr-batch", type=int, default=8)
     ap.add_argument("--mos-fold", type=int, default=0)

@@ -39,7 +39,7 @@ from transformers.cache_utils import Cache
 
 from trainer.grpo.samplers.base import prefill_cur_len
 from trainer.grpo.samplers.eager import EagerSampler
-from trainer.model import TrainerModel
+from trainer.lora import LoraTrainerModel
 
 
 class StaticKVCache(Cache):
@@ -247,7 +247,9 @@ def capture_graph(fn, out_buf: torch.Tensor, probe_fn) -> torch.cuda.CUDAGraph:
     torch.cuda.synchronize(dev)
     g.replay()
     torch.cuda.synchronize(dev)
-    assert not torch.equal(out_buf, probe_baseline), "empty graph (capture recorded nothing); use --sampler-impl compiled"
+    assert not torch.equal(out_buf, probe_baseline), (
+        "empty graph (capture recorded nothing); use --sampler-impl compiled"
+    )
     return g
 
 
@@ -257,7 +259,7 @@ class CudaGraphSampler(EagerSampler):
 
     def __init__(
         self,
-        ttm: TrainerModel,
+        ttm: LoraTrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
@@ -367,7 +369,7 @@ class CudaGraphSampler(EagerSampler):
         texts = [text] * self.batch_size
         embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts)
         dev = self.ttm.device
-        text_len = prefill_cur_len(self.ttm.processor, text)
+        text_len = prefill_cur_len(self.ttm, text)
         # FA2 kvcache writes past the pool unchecked — an oversized prefill is
         # an out-of-bounds write, not a Python error.
         assert text_len < self.lmax, f"prefill {text_len} >= lmax {self.lmax}"
@@ -417,7 +419,9 @@ class CudaGraphSampler(EagerSampler):
             self.cp_cache.seqlens.fill_(gs + 1)
             self.cp_graph.replay()
             logits = self.cp_heads[gs](self.cp_out_buf).float()[:, -1]
-            code = self._choose(self._process_inner(logits, do_sample, st, sk), do_sample)
+            code = self._choose(
+                self._process_inner(logits, do_sample, st, sk), do_sample
+            )
             codes.append(code)
         return torch.cat(codes, dim=1)
 
@@ -541,4 +545,6 @@ class CudaGraphSampler(EagerSampler):
         """One tiny graph-path generation + self-repro sanity check."""
         a = self.warmup_sample("你好。", token_budget=64)
         b = self.warmup_sample("你好。", token_budget=64)
-        assert all(torch.equal(x, y) for x, y in zip(a, b)), "graph sampler failed self-reproducibility check"
+        assert all(torch.equal(x, y) for x, y in zip(a, b)), (
+            "graph sampler failed self-reproducibility check"
+        )

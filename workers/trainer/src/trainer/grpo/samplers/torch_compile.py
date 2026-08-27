@@ -20,10 +20,10 @@ from __future__ import annotations
 import torch
 
 from trainer.grpo.samplers.eager import EagerSampler
-from trainer.model import TrainerModel
+from trainer.lora import LoraTrainerModel
 
 
-def enable_compile(ttm: TrainerModel) -> bool:
+def enable_compile(ttm: LoraTrainerModel) -> bool:
     """Wrap the two backbone forwards with torch.compile (idempotent).
 
     Returns True if this call installed the wrappers. ``dynamic=None``:
@@ -55,14 +55,12 @@ class TorchCompileSampler(EagerSampler):
 
     def __init__(
         self,
-        ttm: TrainerModel,
+        ttm: LoraTrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
     ):
-        super().__init__(
-            ttm, speaker=speaker, language=language, batch_size=batch_size
-        )
+        super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
         enable_compile(ttm)
         self._warmup()
 

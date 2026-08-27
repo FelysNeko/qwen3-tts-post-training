@@ -6,7 +6,7 @@ Pipeline per step (B=1, update after each group):
     backward → grad clip → optimizer step → monitor line → ckpt.
 
 The reference policy is the same weights with LoRA adapters disabled
-(TrainerModel.set_adapter), so only one model lives in VRAM. Ckpts carry the
+(LoraTrainerModel.set_adapter), so only one model lives in VRAM. Ckpts carry the
 LoRA deltas + semantic head + optimizer state so `--resume` continues cleanly.
 """
 
@@ -25,11 +25,10 @@ from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
-from trainer.grpo.decoder import Decoder
 from trainer.grpo.logprob import LogProbComputer
 from trainer.grpo.rollout import rollout_group
 from trainer.grpo.samplers.base import Sampler
-from trainer.model import TrainerModel
+from trainer.lora import LoraTrainerModel
 
 # mirrors rollout_group's pinned subtalker sampling trio (do_sample@T=0.9/top_k=50)
 SUBTALKER_TEMPERATURE = 0.9
@@ -63,7 +62,9 @@ class TrainConfig:
     num_steps: int = 1
     seed: int = 0
     token_budget: int = 512  # total tokens budget (prompt + new + 8 overhead) for training: OOM guard (B8 T500 14.4G) and runaway guard; rollout max_new = budget - cur_len
-    token_budget_infer: int = 1024  # total tokens budget for inference (graphed lmax); 1024 ≈60s audio
+    token_budget_infer: int = (
+        1024  # total tokens budget for inference (graphed lmax); 1024 ≈60s audio
+    )
 
     temperature: float = 0.9
     top_k: int = 50
@@ -135,7 +136,7 @@ def _ckpt_path(out_dir: Path, step: int) -> Path:
     return out_dir / f"step_{step:05d}.pt"
 
 
-def _save_ckpt(cfg: TrainConfig, ttm: TrainerModel, optimizer, step: int) -> None:
+def _save_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer, step: int) -> None:
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     state = {
@@ -151,7 +152,7 @@ def _save_ckpt(cfg: TrainConfig, ttm: TrainerModel, optimizer, step: int) -> Non
     (out / "latest").write_text(str(step))
 
 
-def _load_ckpt(cfg: TrainConfig, ttm: TrainerModel, optimizer) -> int:
+def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
     """Restore last ckpt in out_dir. Returns the next step to run."""
     out = Path(cfg.out_dir)
     marker = out / "latest"
@@ -179,9 +180,11 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
     cfg = cfg or TrainConfig()
     dtype = getattr(torch, cfg.dtype)
 
-    assert Path(cfg.model_path).exists(), f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
+    assert Path(cfg.model_path).exists(), (
+        f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
+    )
 
-    ttm = TrainerModel(
+    ttm = LoraTrainerModel(
         cfg.model_path,
         device=cfg.device,
         dtype=dtype,
@@ -195,7 +198,6 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         batch_size=cfg.group_size,
         lmax=cfg.token_budget_infer,
     )
-    decoder = Decoder(ttm)
     lpc = LogProbComputer(ttm, speaker=cfg.speaker)
     scorer = Client(
         push_endpoint=cfg.scorer_push_endpoint,
@@ -203,16 +205,15 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
         timeout_s=cfg.scorer_timeout,
     )
     try:
-        _train_loop(cfg, ttm, sampler, decoder, lpc, scorer)
+        _train_loop(cfg, ttm, sampler, lpc, scorer)
     finally:
         scorer.close()
 
 
 def _train_loop(
     cfg: TrainConfig,
-    ttm: TrainerModel,
+    ttm: LoraTrainerModel,
     sampler: Sampler,
-    decoder: Decoder,
     lpc: LogProbComputer,
     scorer: Client,
 ) -> None:
@@ -225,7 +226,11 @@ def _train_loop(
     out.mkdir(parents=True, exist_ok=True)
     monitor_f = (out / "monitor.jsonl").open("a") if cfg.monitor else None
 
-    algo = GRPOConfig(variant=cfg.variant, kl_beta=cfg.kl_beta)
+    algo = GRPOConfig(
+        variant=cfg.variant,
+        kl_beta=cfg.kl_beta,
+        num_code_groups=ttm.talker.config.num_code_groups,
+    )
     reward_cfg = RewardConfig()
     pool = _load_text_pool(cfg)
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
@@ -249,7 +254,7 @@ def _train_loop(
         for gi, prompt in enumerate(prompts):
             rollout = rollout_group(
                 sampler,
-                decoder,
+                ttm,
                 prompt,
                 seed=cfg.seed * 1000003 + step * 1009 + gi,
                 tag=f"step{step}g{gi}",
@@ -311,7 +316,9 @@ def _train_loop(
                 _cleanup_wavs(g["wavs"])
                 for key in ("sim", "cer", "mos"):
                     g[key] = torch.tensor(
-                        [r[key] for r in results], dtype=torch.float32, device=cfg.device
+                        [r[key] for r in results],
+                        dtype=torch.float32,
+                        device=cfg.device,
                     )
                 groups.append(g)
             t_score = time.monotonic() - t_s0

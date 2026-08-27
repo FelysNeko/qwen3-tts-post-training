@@ -29,9 +29,8 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import DynamicCache
 
-from trainer.batch import tokenize_assistant
 from trainer.grpo.samplers.base import Sampler, prefill_cur_len
-from trainer.model import TrainerModel
+from trainer.lora import LoraTrainerModel
 
 
 class EagerSampler(Sampler):
@@ -39,12 +38,14 @@ class EagerSampler(Sampler):
 
     def __init__(
         self,
-        ttm: TrainerModel,
+        ttm: LoraTrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
     ):
-        assert language.lower() == "auto", "eager sampler supports the Auto (non-streaming) layout only"
+        assert language.lower() == "auto", (
+            "eager sampler supports the Auto (non-streaming) layout only"
+        )
         super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
         model = ttm.model
         self.talker = model.talker
@@ -111,7 +112,7 @@ class EagerSampler(Sampler):
 
         embeds, trailing = [], []
         for text in texts:
-            ids = tokenize_assistant(self.ttm.processor, text).to(dev)
+            ids = self.ttm.tokenize_assistant(text).to(dev)
             role = self.text_proj(self.text_emb(ids[:, :3]))
             base = (
                 torch.cat([pad_e.expand(-1, cie.shape[1] - 2, -1), bos_e], dim=1)
@@ -241,9 +242,7 @@ class EagerSampler(Sampler):
             cache_position=torch.arange(2, device=dev),
         )
         logits = self.cp_heads[0](out.last_hidden_state).float()[:, -1]
-        code = self._choose(
-            self._process_inner(logits, do_sample, st, sk), do_sample
-        )
+        code = self._choose(self._process_inner(logits, do_sample, st, sk), do_sample)
         codes = [code]
         for gs in range(1, self.q - 1):
             emb = self.cp_proj(self.cp_emb[gs - 1](code))
@@ -330,7 +329,7 @@ class EagerSampler(Sampler):
         cache, mask, trailing, pad_e, rope_deltas, past_hidden, logits = self._prefill(
             texts
         )
-        cur_len = prefill_cur_len(self.ttm.processor, text)
+        cur_len = prefill_cur_len(self.ttm, text)
         init_cur_len = cur_len
         max_new_tokens = max(0, token_budget - cur_len)
         tok = self._choose(

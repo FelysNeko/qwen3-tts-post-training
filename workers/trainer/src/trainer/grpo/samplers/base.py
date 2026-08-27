@@ -18,11 +18,11 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from trainer.batch import tokenize_assistant
-from trainer.model import TrainerModel
+from trainer.lora import LoraTrainerModel
+from trainer.model import ModelWrapper
 
 
-def prefill_cur_len(processor, text: str) -> int:
+def prefill_cur_len(ttm: ModelWrapper, text: str) -> int:
     """Prefill length `cur_len` for `token_budget` accounting.
 
     Single-text — `batch_size` copies are homogeneous, so no `max` needed
@@ -32,7 +32,7 @@ def prefill_cur_len(processor, text: str) -> int:
     (text + cie/role overhead), and `max_new = token_budget - cur_len`.
     """
     # head 8 + tail n+1 + last 1 = n+10 where n = ids.shape[1]-8
-    ids = tokenize_assistant(processor, text)
+    ids = ttm.tokenize_assistant(text)
     return (ids.shape[1] - 8) + 10
 
 
@@ -57,7 +57,7 @@ class Sampler(ABC):
 
     def __init__(
         self,
-        ttm: TrainerModel,
+        ttm: LoraTrainerModel,
         speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
@@ -69,9 +69,7 @@ class Sampler(ABC):
         self.language = language
         self.batch_size = batch_size
 
-    def warmup_sample(
-        self, text: str, token_budget: int
-    ) -> list[torch.Tensor]:
+    def warmup_sample(self, text: str, token_budget: int) -> list[torch.Tensor]:
         """One dummy generation at the RL contract config (seed 0, T=0.9,
         top_k=50, subtalker trio at upstream defaults); returns its codes.
         Uses the sampler's fixed `batch_size` (the GRPO group size).
@@ -90,7 +88,7 @@ class Sampler(ABC):
 
     @staticmethod
     def build(
-        ttm: TrainerModel,
+        ttm: LoraTrainerModel,
         impl: str = "hf",
         speaker: str = "cyrene",
         language: str = "Auto",

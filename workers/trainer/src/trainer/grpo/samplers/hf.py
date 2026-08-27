@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from trainer.batch import tokenize_assistant
 from trainer.grpo.samplers.base import Sampler, prefill_cur_len
 
 
@@ -15,7 +14,7 @@ class HFSampler(Sampler):
     distribution-level equivalence for ``compiled``/``graphed``."""
 
     def _tokenize(self, text: str) -> torch.Tensor:
-        return tokenize_assistant(self.ttm.processor, text).to(self.ttm.device)
+        return self.ttm.tokenize_assistant(text).to(self.ttm.device)
 
     @torch.inference_mode()
     def sample(
@@ -32,7 +31,7 @@ class HFSampler(Sampler):
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``Sampler.sample`` (see base class)."""
         torch.manual_seed(seed)
-        cur_len = prefill_cur_len(self.ttm.processor, text)
+        cur_len = prefill_cur_len(self.ttm, text)
         max_new_tokens = max(0, token_budget - cur_len)
         input_ids = [self._tokenize(text) for _ in range(self.batch_size)]
         codes, _ = self.ttm.model.generate(

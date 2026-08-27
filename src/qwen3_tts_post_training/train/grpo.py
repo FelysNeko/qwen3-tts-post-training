@@ -43,6 +43,38 @@ class GRPOConfig:
     kl_beta: float = 0.001
     kl_estimator: str = "schulman_k3"  # "schulman_k3" | "k2"
     use_kl: bool = True
+    subtalker_weight: float = 1.0  # MTP γ: loss/KL weight on codebooks 1..15
+    subtalker_time_norm: bool = True  # divide packed columns by codebook count
+    num_code_groups: int = 16  # packing stride (set from model config)
+
+    def __post_init__(self) -> None:
+        if self.subtalker_weight < 0:
+            raise ValueError(
+                f"subtalker_weight must be >= 0, got {self.subtalker_weight}"
+            )
+
+
+def _column_weights(
+    mask: torch.Tensor,
+    cfg: GRPOConfig,
+) -> torch.Tensor:
+    """Per-column loss/KL weights [B, T] for the packed layout.
+
+    Packing contract (logprob.py): column `t*Q + j` = codebook j of time step
+    t; block 0 of each step is the semantic codebook. γ weights codebooks
+    1..Q-1; time normalization divides all columns by Q so a full 16-codebook
+    step contributes the same total weight as a semantic-only (Q=1) step.
+    Returns ones when Q==1 (no packing) — legacy shape-agnostic behavior."""
+    if cfg.num_code_groups <= 1:
+        return torch.ones_like(mask)
+    w = torch.full_like(mask, cfg.subtalker_weight)
+    is_sem = (
+        torch.arange(mask.shape[1], device=mask.device) % cfg.num_code_groups == 0
+    ).unsqueeze(0)
+    w = torch.where(is_sem, torch.ones_like(w), w)
+    if cfg.subtalker_time_norm:
+        w = w / cfg.num_code_groups
+    return w
 
 
 class GRPOMetrics(NamedTuple):
@@ -100,8 +132,13 @@ def kl_divergence(
     ref_log_probs: torch.Tensor,
     mask: torch.Tensor,
     estimator: str = "schulman_k3",
+    col_w: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Mean per-token KL over masked positions."""
+    """Mean per-token KL over masked positions (optionally column-weighted).
+
+    Column-weighted reduction: both the numerator and the effective weight
+    mass divide by Σ(mask·col_w), so a γ-weighted column set stays a proper
+    mean over what it actually includes."""
     log_ratio = log_probs - ref_log_probs
     if estimator == "schulman_k3":
         kl = torch.exp(log_ratio) - 1.0 - log_ratio
@@ -109,7 +146,13 @@ def kl_divergence(
         kl = 0.5 * log_ratio * log_ratio
     else:
         raise ValueError(f"unknown kl_estimator {estimator!r}")
-    return (kl * mask).sum() / mask.sum().clamp_min(1)
+    if col_w is None:
+        return (kl * mask).sum() / mask.sum().clamp_min(1)
+    # guard inf*0=NaN: exp overflow in a zero-weighted column (e.g. a bogus
+    # probe value) must not leak NaN into the sum — drop it before the mul
+    w = mask * col_w
+    kl = torch.where(w > 0, kl, torch.zeros_like(kl))
+    return (kl * w).sum() / w.sum().clamp_min(1e-12)
 
 
 def _clipped_loss(
@@ -119,16 +162,21 @@ def _clipped_loss(
     mask: torch.Tensor,
     cfg: GRPOConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    col_w = _column_weights(mask, cfg)
+    w = mask * col_w
     log_ratio = log_probs - ref_log_probs
-    rho = torch.exp(log_ratio)
+    # guard inf*0=NaN (see kl_divergence): zero-weighted columns whose exp
+    # overflowed must not leak NaN into the sum
+    safe_ratio = torch.where(w > 0, log_ratio, torch.zeros_like(log_ratio))
+    rho = torch.exp(safe_ratio)
     low, high = 1.0 - cfg.eps_low, 1.0 + cfg.eps_high
     if not cfg.dapo_clip:
         high = 1.0 + cfg.eps_low
     clamped = rho.clamp(low, high)
     adv = advantage.unsqueeze(-1)
     loss_t = -(torch.minimum(rho * adv, clamped * adv))  # [B, T]
-    loss = (loss_t * mask).sum() / mask.sum().clamp_min(1)
-    return loss, {"rho": rho, "clamped": clamped}
+    loss = (loss_t * w).sum() / w.sum().clamp_min(1e-12)
+    return loss, {"rho": torch.exp(log_ratio), "clamped": clamped}
 
 
 def _gspo_loss(
@@ -157,16 +205,26 @@ def grpo_loss(
     Args:
         log_probs: [B, T] per-token log-probs of the sampled sequence under the
             policy (adapter on), already aligned to the sampling distribution.
+            Packed layout (logprob.py): column `t*Q + j` = codebook j of time
+            step t — the semantic head lives in columns where t*Q % Q == 0.
         ref_log_probs: [B, T] same, under the reference (adapter off).
         rewards: [B] composed reward R (see reward.reward_v3), one per sample.
-        mask: [B, T] 1 on valid (semantic) token positions, 0 on pad/prompt.
+        mask: [B, T] 1 on valid code slots, 0 on pad/prompt.
         group_ids: optional [B] group index per sample (default: one group).
+
+    MTP γ (`cfg.subtalker_weight`): weight on packed columns of codebooks
+    1..Q-1. History: MD §四 pinned γ=0 ("v1 不提取 15 码本 logprob") when only
+    the semantic head was reconstructed; the all-codebook kernel made γ=1 the
+    effective default, and Fish S2 §4.3 validates per-component PG with a
+    shared sequence advantage (their Fast AR term). Now explicit — 0.0
+    reproduces the original semantic-only behavior.
 
     Returns (loss, metrics) where loss = policy_loss + β·KL.
     """
     cfg = cfg or GRPOConfig()
 
     A, gmean, gstd = group_advantage(rewards, cfg.variant, group_ids, cfg.std_eps)
+    col_w = _column_weights(mask, cfg)
 
     if cfg.variant == VARIANT_GSPO:
         policy_loss, info = _gspo_loss(log_probs, ref_log_probs, A, mask, cfg)
@@ -176,7 +234,7 @@ def grpo_loss(
         raise ValueError(f"unknown GRPO variant {cfg.variant!r}")
 
     kl = (
-        kl_divergence(log_probs, ref_log_probs, mask, cfg.kl_estimator)
+        kl_divergence(log_probs, ref_log_probs, mask, cfg.kl_estimator, col_w=col_w)
         if cfg.use_kl
         else None
     )

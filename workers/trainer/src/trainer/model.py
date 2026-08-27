@@ -1,10 +1,16 @@
-"""Trainer-side Qwen3TTS model wrapper: load ckpt, attach rsLoRA to the talker
-MLP, make the semantic head trainable, and switch the adapters on/off.
+"""Trainer model wrapper: the SHARED input pipeline + teacher-forcing kernel.
 
-Design (MD §7 决策 3): rsLoRA r=16, α=64, MLP-only; reference policy = same
-weights with adapters disabled (no second model in VRAM). MTP γ=0 → the code
-predictor (sub-talker) + small_to_mtp_projection stay frozen; only the semantic
-head (talker.codec_head) + LoRA are trained.
+`ModelWrapper` owns ckpt loading, the backend-agnostic forward path
+(`teacher_forcing`) and the optimizer interface (`trainable_parameters`);
+parameter assembly is left to subclasses — `LoraTrainerModel` (GRPO, adapter
+on/off on one weight set) and a future SFT full-FT variant (every param
+unfrozen). Both backends share the full (texts, codes) → loss chain:
+
+    tokenize_assistant / collate / teacher_forcing
+
+CollateBatch + collate are a port of the official SFT collate
+(finetuning/dataset.py::TTSDataset.collate_fn), verified byte-equal against
+the upstream reference.
 
 The trainable unit for GRPO is the talker (text → semantic code groups); the
 speech tokenizer is the environment renderer (always frozen).
@@ -12,85 +18,71 @@ speech tokenizer is the environment renderer (always frozen).
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
-from torch import nn
 
-from trainer.batch import CollateBatch
+
+@dataclass
+class CollateBatch:
+    """Dense teacher-forcing batch (official collate_fn field names/shapes).
+
+    input_ids [b, t, 2]: channel 0 = text stream (`input_text_ids`), channel
+    1 = codec stream (`input_codec_ids`); masks unsqueezed to [b, t, 1];
+    codec_0_labels [b, t] with -100 outside the codec span; codec_ids
+    [b, t, num_code_groups]; codec_mask [b, t] True on the T code-group
+    positions (False on the reserved EOS label slot).
+    """
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    text_embedding_mask: torch.Tensor
+    codec_embedding_mask: torch.Tensor
+    codec_0_labels: torch.Tensor
+    codec_ids: torch.Tensor
+    codec_mask: torch.Tensor
+
+    @property
+    def input_text_ids(self) -> torch.Tensor:
+        """Text channel ids, `input_ids[:, :, 0]` ([b, t])."""
+        return self.input_ids[:, :, 0]
+
+    @property
+    def input_codec_ids(self) -> torch.Tensor:
+        """Codec channel ids, `input_ids[:, :, 1]` ([b, t])."""
+        return self.input_ids[:, :, 1]
+
+    def to(self, device: str | torch.device) -> CollateBatch:
+        return CollateBatch(**{k: v.to(device) for k, v in self.__dict__.items()})
 
 
 @dataclass
 class TeacherForcing:
-    """Selected outputs of `TrainerModel.teacher_forcing` (shared SFT/GRPO).
+    """Selected outputs of `ModelWrapper.teacher_forcing` (shared SFT/GRPO).
 
-    sem_logits [b, L-1, V]: semantic-head logits at position p-1 — the dense
+    talker_logits [b, L-1, V]: semantic-head logits at position p-1 — the dense
     view `logits[:, :-1]`, so the shifted target `batch.codec_0_labels[:, 1:]`
-    (SFT, includes EOS) or `sem_targets[:, 1:]` (GRPO) gathers directly.
+    (SFT, includes EOS) or `talker_targets[:, 1:]` (GRPO) gathers directly.
     predict_mask [b, L-1]: True where a code group sits at p.
-    codes_flat [N, Q]: flattened code groups (`codec_ids[codec_mask]`,
+    talker_codec_ids [N, Q]: flattened code groups (`codec_ids[codec_mask]`,
     row-major = sample order).
-    sub_logits [N, Q-1, V]: predictor-head logits; head j at embedded slot
-    j+1 predicts c_{j+1}, conditioned on slots up to j (+ talker hidden).
+    sub_talker_logits [N, Q-1, V]: predictor-head logits; head j at embedded
+    slot j+1 predicts c_{j+1}, conditioned on slots up to j (+ talker hidden).
     """
 
-    sem_logits: torch.Tensor
+    talker_logits: torch.Tensor
     predict_mask: torch.Tensor
-    codes_flat: torch.Tensor
-    sub_logits: torch.Tensor
+    talker_codec_ids: torch.Tensor
+    sub_talker_logits: torch.Tensor
 
 
-class LoRALinear(nn.Module):
-    """Frozen base Linear + rank-stabilized LoRA delta (rsLoRA, α/√r scaling).
-
-    `enabled=False` reproduces the reference (base-only) forward for KL —
-    adapter on/off on the SAME weights, no second model.
-    """
-
-    def __init__(
-        self, base: nn.Linear, r: int = 16, alpha: float = 64, rsloRA: bool = True
-    ):
-        super().__init__()
-        self.base = base
-        self.r = r
-        self.alpha = alpha
-        self.scaling = alpha / (r**0.5 if rsloRA else r)
-        self.enabled = True
-        dtype = base.weight.dtype
-        device = base.weight.device
-        self.lora_a = nn.Parameter(
-            torch.empty(base.in_features, r, device=device, dtype=dtype)
-        )
-        self.lora_b = nn.Parameter(
-            torch.empty(r, base.out_features, device=device, dtype=dtype)
-        )
-        nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_b)  # delta = 0 at start → identical to base
-        for p in base.parameters():
-            p.requires_grad_(False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.base(x)
-        if self.enabled:
-            # parameters are stored pre-transposed ([in, r] / [r, out]) so both
-            # GEMMs take contiguous weight operands: a strided `.t()` view here
-            # makes cuBLAS materialize the weight during CUDA-graph capture,
-            # baking the value into the graph (probe C1v8: in-place optimizer
-            # updates stopped reaching graphed rollouts)
-            out = out + self.scaling * (x @ self.lora_a) @ self.lora_b
-        return out
-
-
-class TrainerModel:
+class ModelWrapper:
     def __init__(
         self,
         model_path: str,
         device: str = "cuda:1",
         dtype: torch.dtype = torch.bfloat16,
-        lora_r: int = 16,
-        lora_alpha: float = 64,
-        rsloRA: bool = True,
     ):
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
@@ -104,36 +96,109 @@ class TrainerModel:
         self.processor = wrapper.processor
         self.device = device
         self.dtype = dtype
+        self.talker = self.model.talker
 
-        # rsLoRA on the talker MLP (gate/up/down), semantic head stays trainable
-        self.lora_modules = self._attach_lora(r=lora_r, alpha=lora_alpha, rsloRA=rsloRA)
-        self.codec_head = self.model.talker.codec_head
-        self._freeze_non_trainable()
+    def tokenize_assistant(self, text: str) -> torch.Tensor:
+        """Official `_build_assistant_text` + `_tokenize_texts` — tokenize the
+        full assistant-formatted prompt. Returns [1, len] input ids on CPU;
+        callers drop the trailing 5 special tokens, mirroring the official
+        `[:, :-5]`."""
+        prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        ids = self.processor(
+            text=prompt,
+            return_tensors="pt",
+            padding=True,
+        )["input_ids"]
+        return ids.unsqueeze(0) if ids.dim() == 1 else ids
 
-    def _attach_lora(self, r: int, alpha: float, rsloRA: bool) -> list[LoRALinear]:
-        modules: list[LoRALinear] = []
-        talker = self.model.talker
-        for layer in talker.model.layers:
-            for name in ("gate_proj", "up_proj", "down_proj"):
-                lora = LoRALinear(
-                    getattr(layer.mlp, name), r=r, alpha=alpha, rsloRA=rsloRA
-                )
-                setattr(layer.mlp, name, lora)
-                modules.append(lora)
-        return modules
+    def collate(
+        self,
+        texts: list[str],
+        codes: list[torch.Tensor],
+    ) -> CollateBatch:
+        """(texts, codes) → official-layout batch on the model device.
 
-    def _freeze_non_trainable(self) -> None:
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        for lora in self.lora_modules:
-            lora.lora_a.requires_grad_(True)
-            lora.lora_b.requires_grad_(True)
-        self.codec_head.weight.requires_grad_(True)
+        Shared by BOTH backends (GRPO logprob reconstruction and the future
+        SFT on-the-fly path). Codes are cloned so an inference-mode rollout
+        tensor can enter the policy backward graph; text goes through the
+        official trailing-special drop (`[:-5]`).
 
-    def set_adapter(self, enabled: bool) -> None:
-        """Switch LoRA on/off for policy (on) vs reference (off) forwards."""
-        for lora in self.lora_modules:
-            lora.enabled = bool(enabled)
+        Layout is a port of the official SFT collate (TTSDataset.collate_fn):
+        token ids / codebook count read off `self.model.config` — the same
+        object the upstream collate reads."""
+        config = self.model.config
+        tc = config.talker_config  # Qwen3TTSTalkerConfig (num_code_groups lives here)
+
+        items = [
+            (self.tokenize_assistant(t)[0][:-5], cc.clone())
+            for t, cc in zip(texts, codes)
+        ]
+        b = len(items)
+        t = max(ti.shape[-1] + ac.shape[0] for ti, ac in items) + 8
+
+        input_ids = torch.zeros((b, t, 2), dtype=torch.long)
+        codec_ids = torch.zeros((b, t, tc.num_code_groups), dtype=torch.long)
+        text_embedding_mask = torch.zeros((b, t), dtype=torch.bool)
+        codec_embedding_mask = torch.zeros((b, t), dtype=torch.bool)
+        codec_mask = torch.zeros((b, t), dtype=torch.bool)
+        attention_mask = torch.zeros((b, t), dtype=torch.long)
+        codec_0_labels = torch.full((b, t), -100, dtype=torch.long)
+
+        codec_prefill = torch.tensor(
+            [
+                tc.codec_nothink_id,
+                tc.codec_think_bos_id,
+                tc.codec_think_eos_id,
+                0,  # speaker-embedding slot (patched by consumers)
+                tc.codec_pad_id,
+            ],
+            dtype=torch.long,
+        )
+
+        for i, (text_ids, audio_codes) in enumerate(items):
+            if text_ids.dim() == 2:  # [1, n] raw processor output
+                text_ids = text_ids[0]
+            n = text_ids.shape[0]  # 3 role + L
+            q = audio_codes.shape[0]
+            assert audio_codes.shape[1] == tc.num_code_groups
+
+            # --- text channel ---
+            input_ids[i, :3, 0] = text_ids[:3]
+            input_ids[i, 3:7, 0] = config.tts_pad_token_id
+            input_ids[i, 7, 0] = config.tts_bos_token_id
+            input_ids[i, 8 : 8 + n - 3, 0] = text_ids[3:]
+            input_ids[i, 8 + n - 3, 0] = config.tts_eos_token_id
+            input_ids[i, 8 + n - 2 : 8 + n + q, 0] = config.tts_pad_token_id
+            text_embedding_mask[i, : 8 + n + q] = True
+
+            # --- codec channel ---
+            input_ids[i, 3:8, 1] = codec_prefill
+            input_ids[i, 8 : 8 + n - 3, 1] = tc.codec_pad_id
+            input_ids[i, 8 + n - 3, 1] = tc.codec_pad_id
+            input_ids[i, 8 + n - 2, 1] = tc.codec_bos_id
+            input_ids[i, 8 + n - 1 : 8 + n - 1 + q, 1] = audio_codes[:, 0]
+            input_ids[i, 8 + n - 1 + q, 1] = tc.codec_eos_token_id
+
+            codec_0_labels[i, 8 + n - 1 : 8 + n - 1 + q] = audio_codes[:, 0]
+            codec_0_labels[i, 8 + n - 1 + q] = tc.codec_eos_token_id
+
+            codec_ids[i, 8 + n - 1 : 8 + n - 1 + q, :] = audio_codes
+
+            codec_embedding_mask[i, 3 : 8 + n + q] = True
+            codec_embedding_mask[i, 6] = False  # speaker-embedding slot
+
+            codec_mask[i, 8 + n - 1 : 8 + n - 1 + q] = True
+            attention_mask[i, : 8 + n + q] = True
+
+        return CollateBatch(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            text_embedding_mask=text_embedding_mask.unsqueeze(-1),
+            codec_embedding_mask=codec_embedding_mask.unsqueeze(-1),
+            codec_0_labels=codec_0_labels,
+            codec_ids=codec_ids,
+            codec_mask=codec_mask,
+        ).to(self.model.device)
 
     def teacher_forcing(
         self, batch: CollateBatch, speaker_vec: torch.Tensor
@@ -144,11 +209,11 @@ class TrainerModel:
         target-leak bug fixed via the p-1 hidden selection). Consumers diverge
         only downstream:
 
-        - SFT: CE on `sem_logits` vs `batch.codec_0_labels[:, 1:]`
+        - SFT: CE on `talker_logits` vs `batch.codec_0_labels[:, 1:]`
           (ignore_index=-100; INCLUDES the EOS label slot — it sits outside
           `codec_mask`, hence dense logits rather than a masked select) plus
-          CE on `sub_logits` vs `codes_flat[:, 1:]` at weight 0.3;
-        - GRPO: temperature-scaled full-softmax log-probs (logprob.py).
+          CE on `sub_talker_logits` vs `talker_codec_ids[:, 1:]` at weight 0.3;
+        - GRPO: temperature-scaled full-softmax log-probs (grpo/logprob.py).
 
         Embedding construction (inlined): official SFT input assembly with ONE
         deliberate correction vs the upstream script — the text channel goes
@@ -175,7 +240,7 @@ class TrainerModel:
 
         input_embeddings = text_embedding + codec_embedding
 
-        for k in range(1, self.talker.config.num_code_groups):
+        for k in range(1, self.model.config.talker_config.num_code_groups):
             codec_k_embedding = self.talker.code_predictor.get_input_embeddings()[
                 k - 1
             ](batch.codec_ids[:, :, k])
@@ -188,18 +253,27 @@ class TrainerModel:
             output_hidden_states=True,
         )
 
+        hidden_states = outputs.hidden_states[0][-1][:, :-1, :]
         predict_mask = batch.codec_mask[:, 1:]  # [b, L-1]: code at p ↔ hidden p-1
-        codes_flat = batch.codec_ids[batch.codec_mask]  # [N, Q] row-major
-        talker_hidden = outputs.hidden_states[0][-1][:, :-1][predict_mask]
-        sub_logits, _ = self.talker.forward_sub_talker_finetune(
-            codes_flat, talker_hidden
+        talker_hidden_states = hidden_states[predict_mask]
+        talker_codec_ids = batch.codec_ids[batch.codec_mask]  # [N, Q] row-major
+        sub_talker_logits, _ = self.talker.forward_sub_talker_finetune(
+            talker_codec_ids, talker_hidden_states
         )
         return TeacherForcing(
-            sem_logits=outputs.logits[:, :-1],
+            talker_logits=outputs.logits[:, :-1],
             predict_mask=predict_mask,
-            codes_flat=codes_flat,
-            sub_logits=sub_logits,
+            talker_codec_ids=talker_codec_ids,
+            sub_talker_logits=sub_talker_logits,
         )
+
+    @torch.inference_mode()
+    def decode(self, codes: list[torch.Tensor]) -> tuple[list[np.ndarray], int]:
+        """codes: list of [T, num_code_groups]. Returns (wavs, sample_rate)."""
+        wavs, fs = self.model.speech_tokenizer.decode(
+            [{"audio_codes": c} for c in codes]
+        )
+        return wavs, fs
 
     @property
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
