@@ -104,7 +104,7 @@ workers/trainer/.venv/bin/python workers/trainer/main.py \
 - [ ] **1-epoch ckpt 重训 + 166 对 A/B 定夺冷启动版本**（§六/§七 缺口 6 时序①）：testzip 166 对已在 playground（`audio/testzip/{test,gen}/`），新 ckpt 到位后 ~20min 可跑，定夺冷启动版本。
 
 ### 设计文档已规划、本代码未实现（非阻塞，跑通后补）
-- [ ] **CAM++ 交叉监控未接入训练循环**：scorer 已返回 `sim_camp`，但 `loop.py` 只读 `sim`。MD §四/§七 要求监控用 CAM++ 盯 SV（防 hacking）。
+- [ ] **CAM++ 交叉监控未接入训练循环**：§16.9 起协议只传 embedding（`sim_camp` 字段已删）；接入时走 caller 侧——`SVScorer.embed_wav('campplus')` + 调用方自持质心。MD §四/§七 要求监控用 CAM++ 盯 SV（防 hacking）。
 - [ ] **UTMOS 5-fold 监控未接入**：scorer 默认 fold0；§四 定稿要求"5-fold UTMOS 定期 eval"。`ScorerClient` 也未暴露 `--mos-fold`。
 - [ ] **below-τ 比例监控缺失**：§四 定稿要求"每 batch 记录 below-tau 比例（上升=退化警报）"。现 monitor 只有 `mos_dead`（组内 std<eps 熄火），不是 below-τ 占比。
 - [ ] **时长/语速投机 + 熵坍缩警报**（§七 缺口 5）：组内时长中位数漂移、熵坍缩警报未实现。
@@ -498,3 +498,15 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **centroid 独立成 `centroid.npy`（2026-08-28）**：与 codes/embedding 统一 np.save 约定（float64、单位范数）；metrics.json 不再内嵌 192-float JSON list，只留标量标定（sim/wer/utmosv2/provenance）。`reward.metrics.load_centroid(metrics_path)` 从 sibling 路径派生 npy——scorer CLI 与 wiring 零改动。选 npy 弃 .pt：消费方只当裸数组用（set_ref 吃 ndarray），且 centroid 不参与 checksum 体系（finalize 全量重建），torch 容器无加分项
 - **设计裁决**：确定性（clearvoice 固定种子 + codes/embedding 确定）使「重生成 sha 相等 ⇒ 输入未变」成立——复合 hash 方案（embedding = H(corpus, enhanced, …)）的记账可省，表+级联即其语义；模型指纹（全局 provenance）**本期不做**（裁决 2026-08-28）；metrics **永远全量重建**（~2k 行是毫秒 matmul，选择性重算无价值）；行 sim 由 finalize 对新质心统一回填（质心一漂移全体 sim 刷新，不做增量）
 - **验证**：probe 24 项（新增：表 bool 语义、corpus 级联、损坏只翻自己的位、finalize sim 回填+全量重建）；live smoke 三连——全新跑（4 clips 全落盘，codes `[95,16]` 等）→ 空闲幂等（`4 cached clips, 0 to process`）→ **salvage 实证**（人为损坏一条 enhanced → 重生成同字节 → 0 重打分 + asset.jsonl 逐字节不变）
+
+### 16.9 Embedding-only 协议 + 字段级按需打分（2026-08-28）
+
+**动因**：「需要什么就打什么分」——两个调用方字段集本就近乎不相交（trainer 用 sim/cer/mos，preprocess 用 vector/transcript/cer/mos），而 scorer 无条件跑三模型、全字段返回。
+
+- **协议**：`ScoreField(StrEnum) = {VECTOR, TRANSCRIPT, CER, MOS}`（值 = result dict key）；`ScoreRequest.fields` 默认 ALL_FIELDS；`ScoreResult` **删除 `sim/sim_camp`**，四个字段 `| None`（None = 未请求）。scorer 按字段组派发 + lazy-load（VECTOR→SV、TRANSCRIPT/CER→ASR、MOS→MOS），未请求组 timing 记 0。**双向 wire 兼容**：旧 scorer 忽略 `fields` 键全量返回（多给不缺）；新 scorer 默认全量
+- **scorer 彻底无标定**：`--sv-ref/--sv-ref-camp/--metrics` 三旗、`SVScorer.set_ref/sim_to_ref`、campplus 静默回退全部删除；`MODELS["campplus"]` 模型定义保留（embed 能力在，无协议入口）。**§16.7 的重启舞步作废**——一个常驻 scorer 永久服务 preprocess + 训练，零重配置
+- **trainer**：`--metrics-path` 变必填（assert）；启动时 `load_centroid` → float32 renormalize（复刻旧 set_ref 配方）；loop `send_score(fields={VECTOR, CER, MOS})`（每 step 省 ~12k float 的 JSON），sim = `vectors @ sv_centroid` 一次批量 matmul
+- **精度论证**：float32 ⊂ float64 → JSON 往返**逐位精确**；dot 位置从 scorer 挪到 trainer 只改求和顺序（numpy→torch），相对误差 ~1e-7，低于 sv_scale≈0.097 与一切 flameout 阈值 4-5 个量级；实证先例 = §16.7 的 0.9514841 == 0.9514841
+- **明确不做**：字段集不接入 preprocess 产物/checksum（任务表阶段粒度已够）；跨监控（CAM++/w2v2）将来走 caller 侧（请求 vector 或另加模型参数），不走协议 sim 字段
+- **验证**：probe 23 项（协议子集往返/默认全量/ScoreField==result keys/请求 mode=json 可序列化——第一版 `model_dump()` python mode 保留 frozenset 导致 zmq `send_json` 崩，已修并加探针防回归）；live 实测——损坏 embedding 重打分，transcript/cer/sim 对基线**逐位一致**（vector 传输无损 + 本地 matmul 等价旧 scorer dot）；同进程二次重打分 MOS delta=0.0
+- **MOS 跨进程非确定性（本次实测发现，与协议改动正交）**：同一 clip 跨 scorer 进程重启 MOS 漂移 ~0.17（2.619→2.447），同进程内重复位等（0.0）——GPU 核级非确定性（cudnn autotune 类），任何 scorer 重启都会触发。行 checksum 不覆盖 MOS；metrics.json 的 utmos 统计因此混有跨运行的 run 级噪声（信息性用途，不影响 τ 决策方向，如需统一需全量重打分一次）

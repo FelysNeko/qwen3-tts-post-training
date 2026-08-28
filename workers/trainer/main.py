@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--metrics-path",
         default=TrainConfig.metrics_path,
-        help="preprocess metrics.json — injects sv_center/sv_scale into RewardConfig",
+        help="preprocess metrics.json (REQUIRED) — RewardConfig calibration + the SV centroid (centroid.npy beside it)",
     )
     p.add_argument(
         "--variant", default=TrainConfig.variant, choices=["vanilla", "dr", "gspo"]

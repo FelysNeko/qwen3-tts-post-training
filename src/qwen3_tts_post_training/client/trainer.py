@@ -12,6 +12,7 @@ import time
 import zmq
 
 from qwen3_tts_post_training.client.protocol import (
+    ALL_FIELDS,
     ScoreItem,
     ScoreRequest,
     ScoreResponse,
@@ -80,13 +81,20 @@ class Client:
             except zmq.ZMQError:
                 continue
 
-    def send_score(self, items: list[ScoreItem]) -> int:
-        """Non-blocking push. Returns req_id for recv_score."""
+    def send_score(self, items: list[ScoreItem], fields=None) -> int:
+        """Non-blocking push. Returns req_id for recv_score. `fields=None`
+        requests ALL_FIELDS; pass a ScoreField subset for need-based scoring."""
         if not items:
             return -1
         self._ensure_started()
         self._req_id += 1
-        self._send_json(ScoreRequest(id=self._req_id, items=items).model_dump())
+        self._send_json(
+            ScoreRequest(
+                id=self._req_id,
+                items=items,
+                fields=ALL_FIELDS if fields is None else fields,
+            ).model_dump(mode="json")  # frozenset -> list, StrEnum -> str
+        )
         return self._req_id
 
     def recv_score(self, expect_id: int, timeout: float | None = None) -> list[dict]:
@@ -100,9 +108,9 @@ class Client:
             )
         return [r.model_dump() for r in resp.results]
 
-    def score(self, items: list[ScoreItem]) -> list[dict]:
+    def score(self, items: list[ScoreItem], fields=None) -> list[dict]:
         """Blocking convenience: send + recv."""
         if not items:
             return []
-        rid = self.send_score(items)
+        rid = self.send_score(items, fields=fields)
         return self.recv_score(rid, timeout=self.timeout_s)

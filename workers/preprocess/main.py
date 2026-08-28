@@ -1,6 +1,6 @@
 """Preprocess worker entrypoint — corpus → `.cache/{lang}`.
 
-Usage (scorer worker must be up, WITHOUT --sv-ref/--metrics):
+Usage (any resident scorer worker — it is calibration-free):
     workers/preprocess/.venv/bin/python workers/preprocess/main.py \
       --dataset /path/to/corpus/Chinese(PRC)
 

@@ -37,10 +37,11 @@ clips the centroid/sim pass is a millisecond matmul, incremental metrics
 would be complexity with no payoff.
 
 Scoring reuses `client/trainer.Client` (trainer-side bind of PUSH 5555 /
-PULL 5556), so the resident scorer worker is oblivious to this caller; run
-it WITHOUT --sv-ref/--metrics — the row `sim` is computed locally from the
-raw unit-norm ERes2NetV2 vectors, the scorer ref is irrelevant. Validation
-is fail-loudly: a malformed manifest/asset line raises — no silent skips.
+PULL 5556), so the resident scorer worker is oblivious to this caller. The
+scorer is calibration-free — preprocessing requests
+{vector, transcript, cer, mos} and the row `sim` is computed locally in
+`finalize` from the raw unit-norm ERes2NetV2 vectors. Validation is
+fail-loudly: a malformed manifest/asset line raises — no silent skips.
 Manifest↔wav mismatches are not fatal: they are recorded in `DropReasons`.
 """
 
@@ -61,7 +62,7 @@ import torchaudio.functional as AF
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from qwen3_tts_post_training.client.protocol import ScoreItem
+from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 
 CLEARVOICE_SR = 48000
@@ -444,7 +445,13 @@ def score_missing(
                         text=entries_by_name[row.name].text,
                     )
                     for row in chunk
-                ]
+                ],
+                fields={
+                    ScoreField.VECTOR,
+                    ScoreField.TRANSCRIPT,
+                    ScoreField.CER,
+                    ScoreField.MOS,
+                },
             ),
             timeout=client.timeout_s,
         )

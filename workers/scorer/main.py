@@ -24,15 +24,6 @@ def main() -> None:
     ap.add_argument(
         "--sv-dir", required=True, help="3D-Speaker root (pretrained/ inside)"
     )
-    ap.add_argument("--sv-ref", default=None, help="ERes2NetV2 centroid npy")
-    ap.add_argument(
-        "--metrics",
-        default=None,
-        help="metrics.json — its centroid doubles as the SV ref (exclusive with --sv-ref)",
-    )
-    ap.add_argument(
-        "--sv-ref-camp", default=None, help="CAM++ centroid npy (cross-monitor)"
-    )
     ap.add_argument("--asr-model", default="Qwen/Qwen3-ASR-1.7B-hf")
     ap.add_argument("--asr-batch", type=int, default=8)
     ap.add_argument("--mos-fold", type=int, default=0)
@@ -55,8 +46,6 @@ def main() -> None:
         help="ZMQ PUSH connect endpoint (trainer PULL binds here)",
     )
     args = ap.parse_args()
-    if args.metrics and args.sv_ref:
-        ap.error("--metrics and --sv-ref are mutually exclusive")
 
     print(f"[scorer] pid={os.getpid()} device={args.device}")
     print(f"[scorer] push {args.push_endpoint} pull {args.pull_endpoint}")
@@ -77,7 +66,7 @@ def main() -> None:
         req = worker.recv_request(timeout_ms=500)
         if req is None:
             continue
-        results, timing = scorers.score(req.items)
+        results, timing = scorers.score(req.items, req.fields)
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
         print(f"[scorer] req {req.id}: n={len(req.items)} timing={timing}")
         resp = ScoreResponse(id=req.id, results=results, timing=timing, rss_mb=rss)

@@ -30,9 +30,9 @@ def reward_config_from_metrics(path: str | Path) -> RewardConfig:
 
 
 def load_centroid(metrics_path: str | Path) -> np.ndarray:
-    """Unit-norm ERes2NetV2 centroid — what the scorer's `--metrics` mode
-    installs as the SV reference. Stored as centroid.npy (np.save, float64)
-    beside metrics.json — the only artifact that predates the per-stage npy
-    convention was a 192-float JSON list; same layout now as
-    codes/embedding."""
+    """Unit-norm ERes2NetV2 corpus centroid — the trainer loads it (via the
+    REQUIRED --metrics-path) and computes rollout sims locally as
+    vectors @ centroid; preprocess writes it in `finalize`. Stored as
+    centroid.npy (np.save, float64) beside metrics.json — same layout as the
+    codes/embedding artifacts."""
     return np.load(Path(metrics_path).parent / "centroid.npy")

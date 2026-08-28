@@ -1,6 +1,8 @@
-"""SV scoring: ERes2NetV2 (reward) + CAM++ (cross-monitor), vendored 3D-Speaker
-model defs + FBank frontend. Matches playground/compare_tts_sv.py exactly
-(same ckpt args, same 16k fbank mean-nor, same unit-norm cosine)."""
+"""SV embedding: ERes2NetV2 (reward) + CAM++ (kept as an available model
+def — no protocol entry today), vendored 3D-Speaker defs + FBank frontend.
+Matches playground/compare_tts_sv.py exactly (same ckpt args, same 16k
+fbank mean-nor, unit-norm float32 embeddings). Similarity to a reference is
+the CALLER's job — this worker is calibration-free."""
 
 from __future__ import annotations
 
@@ -63,7 +65,6 @@ class SVScorer:
         self.device = device
         self.fe = FBank(80, sample_rate=TARGET_SR, mean_nor=True)
         self._models: dict[str, tuple[torch.nn.Module, str]] = {}
-        self._refs: dict[str, np.ndarray | None] = {}
 
     def _load(self, name: str) -> tuple[torch.nn.Module, str]:
         if name not in self._models:
@@ -75,12 +76,6 @@ class SVScorer:
             model.to(self.device).eval()
             self._models[name] = (model, self.device)
         return self._models[name]
-
-    def set_ref(self, name: str, ref: Path | np.ndarray) -> None:
-        arr = np.load(ref) if isinstance(ref, (str, Path)) else np.asarray(ref)
-        arr = arr.astype(np.float32)
-        arr = arr / np.linalg.norm(arr)
-        self._refs[name] = arr
 
     @torch.no_grad()
     def embed(self, audio: np.ndarray, sr: int, name: str = "eres2netv2") -> np.ndarray:
@@ -95,12 +90,3 @@ class SVScorer:
     def embed_wav(self, wav_path: str, name: str = "eres2netv2") -> np.ndarray:
         audio, sr = sf.read(wav_path, dtype="float32", always_2d=True)
         return self.embed(audio.mean(axis=1), sr, name)
-
-    def sim_to_ref(self, emb: np.ndarray, name: str) -> float | None:
-        """Cosine of `emb` (unit-norm, from embed/embed_wav) to the stored
-        reference; None when no reference was set (preprocess mode — the
-        centroid is only computable after every clip has been embedded)."""
-        ref = self._refs.get(name)
-        if ref is None:
-            return None
-        return float(emb @ ref)

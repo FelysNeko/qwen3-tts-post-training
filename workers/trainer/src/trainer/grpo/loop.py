@@ -21,10 +21,13 @@ from pathlib import Path
 
 import torch
 
-from qwen3_tts_post_training.client.protocol import ScoreItem
+from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
-from qwen3_tts_post_training.reward.metrics import reward_config_from_metrics
-from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
+from qwen3_tts_post_training.reward.metrics import (
+    load_centroid,
+    reward_config_from_metrics,
+)
+from qwen3_tts_post_training.reward.reward import reward_v3
 from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
 from trainer.grpo.logprob import LogProbComputer
 from trainer.grpo.rollout import rollout_group
@@ -71,8 +74,9 @@ class TrainConfig:
     top_k: int = 50
     sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
 
-    # preprocess cache (PROJECT_STATUS §16): injects sv_center/sv_scale into
-    # RewardConfig; None keeps the playground-calibrated defaults
+    # preprocess cache (§16): REQUIRED — RewardConfig calibration AND the SV
+    # centroid (centroid.npy beside metrics.json) both come from it; sims are
+    # computed locally as vectors @ centroid
     metrics_path: str | None = None
 
     variant: str = "dr"
@@ -236,11 +240,15 @@ def _train_loop(
         kl_beta=cfg.kl_beta,
         num_code_groups=ttm.talker.config.num_code_groups,
     )
-    reward_cfg = (
-        reward_config_from_metrics(cfg.metrics_path)
-        if cfg.metrics_path
-        else RewardConfig()
+    assert cfg.metrics_path, (
+        "--metrics-path is required: RewardConfig calibration and the SV "
+        "centroid (centroid.npy beside metrics.json) both come from it"
     )
+    reward_cfg = reward_config_from_metrics(cfg.metrics_path)
+    sv_centroid = torch.as_tensor(
+        load_centroid(cfg.metrics_path), dtype=torch.float32, device=cfg.device
+    )
+    sv_centroid /= sv_centroid.norm()  # mirrors the old scorer set_ref recipe
     pool = _load_text_pool(cfg)
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
 
@@ -286,7 +294,8 @@ def _train_loop(
             }
             try:
                 rid = scorer.send_score(
-                    [ScoreItem(wav_path=str(p), text=prompt) for p in g["wavs"]]
+                    [ScoreItem(wav_path=str(p), text=prompt) for p in g["wavs"]],
+                    fields={ScoreField.VECTOR, ScoreField.CER, ScoreField.MOS},
                 )
             except Exception as e:  # noqa: BLE001
                 print(
@@ -323,7 +332,18 @@ def _train_loop(
                     continue
                 # trainer owns lifecycle: delete tmpfs wavs after scoring
                 _cleanup_wavs(g["wavs"])
-                for key in ("sim", "cer", "mos"):
+                # sims are local now: one batched matmul against the centroid
+                # (float32-exact transport; ~1e-7 accumulation difference vs
+                # the old scorer-side dot — see STATUS §16.9)
+                g["sim"] = (
+                    torch.tensor(
+                        [r["vector"] for r in results],
+                        dtype=torch.float32,
+                        device=cfg.device,
+                    )
+                    @ sv_centroid
+                )
+                for key in ("cer", "mos"):
                     g[key] = torch.tensor(
                         [r[key] for r in results],
                         dtype=torch.float32,

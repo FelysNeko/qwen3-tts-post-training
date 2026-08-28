@@ -1,13 +1,18 @@
-"""Multi-objective scorer: SV + ASR/CER + MOS batch scoring."""
+"""Multi-objective scorer: SV embedding + ASR/CER + MOS, dispatched by the
+request's ScoreField set — only the model groups a caller actually needs are
+run (and lazy-loaded). Calibration-free: similarities are the caller's job."""
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
 
-import numpy as np
-
-from qwen3_tts_post_training.client.protocol import ScoreItem, ScoreResult, Timing
+from qwen3_tts_post_training.client.protocol import (
+    ScoreField,
+    ScoreItem,
+    ScoreResult,
+    Timing,
+)
 
 
 class Scorers:
@@ -23,20 +28,7 @@ class Scorers:
             from scorer.sv import SVScorer
 
             t0 = time.time()
-            s = SVScorer(Path(self.args.sv_dir), self.args.device)
-            if self.args.sv_ref:
-                s.set_ref("eres2netv2", Path(self.args.sv_ref))
-            elif self.args.metrics:
-                # preprocess-produced calibration: centroid doubles as the SV ref
-                from qwen3_tts_post_training.reward.metrics import load_centroid
-
-                s.set_ref(
-                    "eres2netv2",
-                    np.asarray(load_centroid(self.args.metrics), dtype=np.float32),
-                )
-            if self.args.sv_ref_camp:
-                s.set_ref("campplus", Path(self.args.sv_ref_camp))
-            self._sv = s
+            self._sv = SVScorer(Path(self.args.sv_dir), self.args.device)
             print(f"[load] sv {time.time() - t0:.1f}s")
         return self._sv
 
@@ -68,44 +60,37 @@ class Scorers:
             print(f"[load] mos {time.time() - t0:.1f}s")
         return self._mos
 
-    def score(self, items: list[ScoreItem]) -> tuple[list[ScoreResult], Timing]:
-        t0 = time.time()
-        sims: list[float | None] = []
-        sim_camps: list[float | None] = []
-        vectors: list[list[float]] = []
-        for it in items:
-            emb = self.sv.embed_wav(it.wav_path, "eres2netv2")
-            vectors.append(emb.tolist())
-            sims.append(self.sv.sim_to_ref(emb, "eres2netv2"))
-            if self.args.sv_ref_camp:
-                sim_camps.append(
-                    self.sv.sim_to_ref(
-                        self.sv.embed_wav(it.wav_path, "campplus"), "campplus"
-                    )
-                )
-            else:
-                sim_camps.append(sims[-1])
-        t_sv = time.time() - t0
+    def score(
+        self, items: list[ScoreItem], fields: frozenset[ScoreField]
+    ) -> tuple[list[ScoreResult], Timing]:
+        results = [ScoreResult(wav_path=item.wav_path) for item in items]
+        t_sv = t_asr = t_mos = 0.0
 
-        t0 = time.time()
-        got = self.asr.score([it.wav_path for it in items], [it.text for it in items])
-        t_asr = time.time() - t0
+        if ScoreField.VECTOR in fields:
+            t0 = time.time()
+            embeddings = [
+                self.sv.embed_wav(item.wav_path, "eres2netv2") for item in items
+            ]
+            t_sv = time.time() - t0
+            for result, embedding in zip(results, embeddings):
+                result.vector = embedding.tolist()
 
-        t0 = time.time()
-        mos_scores = self.mos.score([it.wav_path for it in items])
-        t_mos = time.time() - t0
-
-        results = [
-            ScoreResult(
-                wav_path=it.wav_path,
-                sim=sims[i],
-                sim_camp=sim_camps[i],
-                vector=vectors[i],
-                transcript=got[i]["transcript"],
-                cer=got[i]["cer"],
-                mos=mos_scores[i],
+        if fields & {ScoreField.TRANSCRIPT, ScoreField.CER}:
+            t0 = time.time()
+            got = self.asr.score(
+                [item.wav_path for item in items], [item.text for item in items]
             )
-            for i, it in enumerate(items)
-        ]
+            t_asr = time.time() - t0
+            for result, row in zip(results, got):
+                result.transcript = row["transcript"]
+                result.cer = row["cer"]
+
+        if ScoreField.MOS in fields:
+            t0 = time.time()
+            mos_scores = self.mos.score([item.wav_path for item in items])
+            t_mos = time.time() - t0
+            for result, mos in zip(results, mos_scores):
+                result.mos = mos
+
         timing = Timing(sv=round(t_sv, 2), asr=round(t_asr, 2), mos=round(t_mos, 2))
         return results, timing
