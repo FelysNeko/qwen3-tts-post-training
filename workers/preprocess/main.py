@@ -4,10 +4,11 @@ Usage (scorer worker must be up, WITHOUT --sv-ref/--metrics):
     workers/preprocess/.venv/bin/python workers/preprocess/main.py \
       --dataset /path/to/corpus/Chinese(PRC)
 
-Four idempotent stages (see preprocess/pipeline.py): filter → clearvoice →
-codes → score. The clearvoice 48k output is the only derived audio — all
-downstream consumers resample from it on the fly. Interrupted runs resume
-per-clip.
+Four checksum-guarded stages (see preprocess/pipeline.py): filter →
+enhanced(clearvoice 48k) → codes → embedding. The enhanced 48k output is
+the only derived audio — all downstream consumers resample from it on the
+fly. Interrupted runs resume per-clip; corrupt files are regenerated and
+salvaged when the checksum reproduces.
 """
 
 from __future__ import annotations

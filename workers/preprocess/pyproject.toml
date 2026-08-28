@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "q3tts-worker-preprocess"
 version = "0.1.0"
-description = "Preprocessing worker: filter -> clearvoice -> resample 16k/24k -> codes -> scorer cache (asset.jsonl + metrics.json), one CUDA context (cuda:1)"
+description = "Preprocessing worker: filter -> enhanced (clearvoice 48k) -> codes -> embedding, checksum-guarded per-stage caches (asset.jsonl + metrics.json), one CUDA context (cuda:1)"
 requires-python = ">=3.12"
 dependencies = [
     "qwen-tts==0.1.1",

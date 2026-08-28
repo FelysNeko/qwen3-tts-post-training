@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
+
 from qwen3_tts_post_training.reward.reward import RewardConfig
 
 
@@ -18,7 +20,7 @@ def reward_config_from_metrics(path: str | Path) -> RewardConfig:
     """sv_center/sv_scale from the corpus sim distribution (mean/std of the
     per-clip cosine to the centroid). mos_tau stays at the current 2.5: the
     utmosv2 stats in metrics.json are informational until a gate rule is
-    decided (PROJECT_STATUS §16)."""
+    decided (STATUS.md §16)."""
     with open(path, encoding="utf-8") as f:
         metrics = json.load(f)
     return RewardConfig(
@@ -27,8 +29,10 @@ def reward_config_from_metrics(path: str | Path) -> RewardConfig:
     )
 
 
-def load_centroid(path: str | Path) -> list[float]:
+def load_centroid(metrics_path: str | Path) -> np.ndarray:
     """Unit-norm ERes2NetV2 centroid — what the scorer's `--metrics` mode
-    installs as the SV reference."""
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)["centroid"]
+    installs as the SV reference. Stored as centroid.npy (np.save, float64)
+    beside metrics.json — the only artifact that predates the per-stage npy
+    convention was a 192-float JSON list; same layout now as
+    codes/embedding."""
+    return np.load(Path(metrics_path).parent / "centroid.npy")

@@ -486,3 +486,15 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **`--metrics` 数值等价**：scorer 重启后 sim 0.9514841 vs asset `dot(vector,centroid)` 0.9514841——质心加载与 embed 确定性双验证；scorer `--metrics` 与 `--sv-ref` 互斥由 CLI 断言
 - ⚠️ **utmosv2 分布预警**：本 corpus（GT 音频）utmosv2 mean 2.40、p75=2.50——**约半数 GT 条目低于现行 τ=2.5**（旧 τ 由 playground angry 锚点标定，不随域迁移）。r_mos 地板只作用于 rollout 组（rollout MOS 分布待训练时观察），但"换 corpus 是否重标 τ"已从理论问题变成实际记录在案的数据点：metrics.json 的 percentiles 就是为这个决策留的
 - 运行顺序注意：全量 preprocess 期间 scorer 须以**无 ref** 模式跑（质心要等全部向量）；结束后重启 scorer `--metrics .cache/{lang}/metrics.json` + 训练 `--metrics-path` 同路径
+
+### 16.8 校验守卫的分阶段缓存重构（2026-08-28）
+
+**动因**：§16.2 的「产物存在即跳过」只查存在性——文件损坏、corpus 变更、上游漂移都检测不到。重构为**每阶段独立产物文件 + 逐行四重 checksum + 任务表**（`precompute_task_table`）。
+
+- **产物布局**：`enhanced/{name}.wav`（原 `clearvoice/`，「唯一派生音频」不变）+ `codes/{name}.npy`（`[T,16]` int32；用 `np.save` 不用 `torch.save`——zip 容器有确定性风险）+ `embedding/{name}.npy`（E2V2 192d float32）+ `asset.jsonl` + `metrics.json`
+- **行 schema v2**：`{name, text, transcript, cer, mos, sim（finalize 回填）, checksum {corpus, enhanced, codes, embedding}}`——codes/vector 移入文件；新旧 schema 互不兼容（裁决：直接删缓存重跑，无迁移）
+- **任务表 + 四层**：`TaskRow(name, corpus, enhanced, embedding, codes)` 四 bool（=缓存产物仍与磁盘一致），依赖序过层：corpus 层（源不匹配 → 下游全 False，源不可再生无 salvage）→ enhanced 层（重生成 → **新 sha == 存储 sha ⇒ 纯 bit-rot，salvage 下游不动**；≠ ⇒ 级联 codes/embedding False）→ codes 层（仅 enhanced+embedding 有效的行本地重提取，不惊动 scorer，同 salvage/级联）→ embedding 层（todo = embedding False；batched 串行；行即时 append 断点续跑）
+- **depth-2 流水线证伪（2026-08-28 全量实测）**：1825 条全量跑埋点 `extract 94.1s + recv 787.9s ≈ wall 884.6s`——**重叠≈0**。结构原因：recv 返回时 scorer 恰好做完当前 chunk，接着在下一轮 extract 期间干等（~0.85s/chunk）；scorer 是 8x 瓶颈（0.44s/clip vs 提取 0.05s/clip）。GRPO loop 的 rollout∥score 重叠之所以有效，是 trainer 侧 rollout 本身长；这里已拆回 batched 串行，wall 不变、代码少一层 inflight/drain
+- **centroid 独立成 `centroid.npy`（2026-08-28）**：与 codes/embedding 统一 np.save 约定（float64、单位范数）；metrics.json 不再内嵌 192-float JSON list，只留标量标定（sim/wer/utmosv2/provenance）。`reward.metrics.load_centroid(metrics_path)` 从 sibling 路径派生 npy——scorer CLI 与 wiring 零改动。选 npy 弃 .pt：消费方只当裸数组用（set_ref 吃 ndarray），且 centroid 不参与 checksum 体系（finalize 全量重建），torch 容器无加分项
+- **设计裁决**：确定性（clearvoice 固定种子 + codes/embedding 确定）使「重生成 sha 相等 ⇒ 输入未变」成立——复合 hash 方案（embedding = H(corpus, enhanced, …)）的记账可省，表+级联即其语义；模型指纹（全局 provenance）**本期不做**（裁决 2026-08-28）；metrics **永远全量重建**（~2k 行是毫秒 matmul，选择性重算无价值）；行 sim 由 finalize 对新质心统一回填（质心一漂移全体 sim 刷新，不做增量）
+- **验证**：probe 24 项（新增：表 bool 语义、corpus 级联、损坏只翻自己的位、finalize sim 回填+全量重建）；live smoke 三连——全新跑（4 clips 全落盘，codes `[95,16]` 等）→ 空闲幂等（`4 cached clips, 0 to process`）→ **salvage 实证**（人为损坏一条 enhanced → 重生成同字节 → 0 重打分 + asset.jsonl 逐字节不变）
