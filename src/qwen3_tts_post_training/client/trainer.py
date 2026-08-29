@@ -12,7 +12,7 @@ import time
 import zmq
 
 from qwen3_tts_post_training.client.protocol import (
-    ALL_FIELDS,
+    ScoreField,
     ScoreItem,
     ScoreRequest,
     ScoreResponse,
@@ -81,19 +81,18 @@ class Client:
             except zmq.ZMQError:
                 continue
 
-    def send_score(self, items: list[ScoreItem], fields=None) -> int:
-        """Non-blocking push. Returns req_id for recv_score. `fields=None`
-        requests ALL_FIELDS; pass a ScoreField subset for need-based scoring."""
+    def send_score(self, items: list[ScoreItem], fields: frozenset[ScoreField]) -> int:
+        """Non-blocking push. Returns req_id for recv_score. `fields` is
+        REQUIRED — every caller states exactly what it needs."""
+        assert fields, "empty fields request — nothing would be scored"
         if not items:
             return -1
         self._ensure_started()
         self._req_id += 1
         self._send_json(
-            ScoreRequest(
-                id=self._req_id,
-                items=items,
-                fields=ALL_FIELDS if fields is None else fields,
-            ).model_dump(mode="json")  # frozenset -> list, StrEnum -> str
+            ScoreRequest(id=self._req_id, items=items, fields=fields).model_dump(
+                mode="json"  # frozenset -> list, StrEnum -> str
+            )
         )
         return self._req_id
 
@@ -108,7 +107,9 @@ class Client:
             )
         return [r.model_dump() for r in resp.results]
 
-    def score(self, items: list[ScoreItem], fields=None) -> list[dict]:
+    def score(
+        self, items: list[ScoreItem], fields: frozenset[ScoreField]
+    ) -> list[dict]:
         """Blocking convenience: send + recv."""
         if not items:
             return []

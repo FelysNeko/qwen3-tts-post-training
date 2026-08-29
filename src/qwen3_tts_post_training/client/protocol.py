@@ -25,9 +25,6 @@ class ScoreField(StrEnum):
     MOS = "mos"
 
 
-ALL_FIELDS: frozenset[ScoreField] = frozenset(ScoreField)
-
-
 class ScoreItem(BaseModel):
     wav_path: str
     text: str
@@ -47,11 +44,13 @@ class ScoreResult(BaseModel):
 
 
 class ScoreRequest(BaseModel):
-    """Bottom-level ZMQ message: trainer -> scorer."""
+    """Bottom-level ZMQ message: trainer -> scorer. `fields` is REQUIRED —
+    every caller states exactly what it needs, there is no implicit
+    score-everything default."""
 
     id: int
     items: list[ScoreItem]
-    fields: frozenset[ScoreField] = ALL_FIELDS
+    fields: frozenset[ScoreField]
 
 
 class Timing(BaseModel):

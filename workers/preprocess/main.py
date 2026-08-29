@@ -47,7 +47,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-tokens", type=int, default=2)
     ap.add_argument("--min-seconds", type=float, default=0.1)
     ap.add_argument("--batch", type=int, default=16, help="scoring chunk size")
-    ap.add_argument("--limit", type=int, default=0, help="first N clips only (debug)")
     ap.add_argument(
         "--push-endpoint",
         default="tcp://127.0.0.1:5555",
@@ -105,7 +104,6 @@ def main() -> None:
             min_tokens=args.min_tokens,
             min_seconds=args.min_seconds,
             batch=args.batch,
-            limit=args.limit,
         )
     finally:
         client.close()

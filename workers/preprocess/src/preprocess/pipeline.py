@@ -20,29 +20,48 @@ layers then run in dependency order:
   regenerated checksum equal to the stored one into proof that the old file
   was mere bit-rot (salvage — downstream stays valid); a different checksum
   cascades invalidation downward.
-- codes: same salvage/cascade logic, re-extracted locally from a still-valid
-  enhanced wav (no scorer round-trip needed).
-- embedding: scorer round-trips (ASR/CER + SV vector + MOS) for everything
-  still invalid, batched. The scorer (cuda:0) is the throughput bottleneck
-  by ~8x (0.44s/clip vs 0.05s/clip for codes extraction) — client-side
-  pipelining was measured at zero benefit and dropped (STATUS.md §16.8).
+- codes: extracted locally wherever invalid, fresh clips included — no
+  scorer round-trip is ever needed for codes. Salvage/cascade semantics as
+  above.
+- embedding: scorer pass 1 — request {VECTOR} for every clip with an
+  invalid embedding artifact, write the npys, mark them valid. No rows are
+  written here; checksums are rebuilt from disk downstream.
+- post_apply_embedding_layer: with the pool settled, prune foreign
+  embeddings, then materialize the centroid — reuse centroid.npy when
+  nothing entered/left/changed the pool this run, recompute + persist
+  otherwise. Every material layer also prunes artifacts of clips that left
+  the filtered corpus scope, so expired content never lingers.
+- text: scorer pass 2 — re-score {TRANSCRIPT, CER, MOS} ONLY for clips with
+  no row yet or whose enhanced wav changed since `checksum.enhanced` was
+  recorded. cer is deterministic and MOS is not even stable across scorer
+  restarts (§16.9), so untouched clips keep their cached scores verbatim.
+  Runs after the centroid is materialized; each row carries its sim
+  computed directly against it.
+
+Both scorer passes are batched and fully serialized on purpose: the scorer
+(cuda:0) is the throughput bottleneck by ~8x, and client-side pipelining was
+measured at zero benefit and dropped (STATUS.md §16.8). Rows are appended to
+asset.jsonl live the moment a clip is complete, so an interrupted run keeps
+what it finished (duplicates are fine — load keeps the last row per clip).
 
 A table hole (missing/corrupt file) is therefore either filled in place or
-propagated to everything that depends on it. `finalize` backfills per-row
-`sim` against the freshly computed centroid (the centroid does not exist
-before every clip is embedded), writes the centroid as `centroid.npy` beside
-metrics.json (same np.save convention as codes/embedding), rewrites
-asset.jsonl compacted, and ALWAYS rebuilds metrics.json wholesale — at ~2k
-clips the centroid/sim pass is a millisecond matmul, incremental metrics
-would be complexity with no payoff.
+propagated to everything that depends on it. A row's fields are a WRITE-TIME
+snapshot: `score_text_missing` computes each row's `sim` against the
+materialized centroid, and nothing ever rewrites sims afterwards — the
+authoritative current-pool aggregates live in metrics.json + centroid.npy,
+which `finalize` rebuilds every run from the embeddings on disk against the
+materialized centroid (pool-change detection lives in
+`post_apply_embedding_layer`) and rewrites asset.jsonl compacted with kept
+rows' checksums refreshed from disk. At ~2k clips that pass is a millisecond
+matmul — incremental aggregates would be complexity with no payoff.
 
 Scoring reuses `client/trainer.Client` (trainer-side bind of PUSH 5555 /
 PULL 5556), so the resident scorer worker is oblivious to this caller. The
-scorer is calibration-free — preprocessing requests
-{vector, transcript, cer, mos} and the row `sim` is computed locally in
-`finalize` from the raw unit-norm ERes2NetV2 vectors. Validation is
-fail-loudly: a malformed manifest/asset line raises — no silent skips.
-Manifest↔wav mismatches are not fatal: they are recorded in `DropReasons`.
+scorer is calibration-free — pass 1 requests {vector}, pass 2 requests
+{transcript, cer, mos}, and the row `sim` is computed locally in `finalize`
+from the raw unit-norm ERes2NetV2 vectors. Validation is fail-loudly: a
+malformed manifest/asset line raises — no silent skips. Manifest↔wav
+mismatches are not fatal: they are recorded in `DropReasons`.
 """
 
 from __future__ import annotations
@@ -76,7 +95,6 @@ class Config:
     cache_dir: Path  # per-corpus dir (.cache/{lang})
     min_seconds: float = 0.1
     min_tokens: int = 2
-    limit: int = 0  # first N manifest entries only (debug)
 
     @property
     def manifest(self) -> Path:
@@ -118,12 +136,26 @@ class Checksum(BaseModel):
     codes: str
     embedding: str
 
+    @classmethod
+    def from_disk(cls, config: Config, name: str) -> Checksum:
+        """Authoritative artifact checksums, straight from disk — cached row
+        values are used only for invalidation tests, never as data."""
+        return cls(
+            corpus=sha256(config.corpus_dir / f"{name}.wav"),
+            enhanced=sha256(config.enhanced_dir / f"{name}.wav"),
+            codes=sha256(config.codes_dir / f"{name}.npy"),
+            embedding=sha256(config.embedding_dir / f"{name}.npy"),
+        )
+
 
 class AssetEntry(CorpusEntry):
     transcript: str
     cer: float
     mos: float
-    sim: float | None  # to centroid; backfilled by finalize
+    # sim to the centroid AT ROW-WRITE TIME — a frozen snapshot like
+    # transcript/cer/mos, never rewritten afterwards; the authoritative
+    # current-pool aggregates live in metrics.json (rebuilt every run)
+    sim: float
     checksum: Checksum
 
     def corpus_matches(self, config: Config) -> bool:
@@ -209,9 +241,6 @@ class Cache:
         corpus_entries = [
             entry for entry in corpus_entries if entry.name in wav_stems_set
         ]
-
-        if config.limit:
-            corpus_entries = corpus_entries[: config.limit]
 
         desired_corpus_entries = []
         less_than_min_tokens = []
@@ -331,6 +360,7 @@ def apply_enhanced_layer(
     clearvoice: a regenerated checksum equal to the stored one proves the
     old file was bit-rot (salvage — downstream untouched); a different
     checksum invalidates codes+embedding."""
+    prune_foreign(cache, cache.config.enhanced_dir, ".wav")
     todo = [row for row in table if not row.enhanced]
     if not todo:
         return table
@@ -377,11 +407,14 @@ def apply_enhanced_layer(
 def apply_codes_layer(
     cache: Cache, table: tuple[TaskRow, ...], speech_tokenizer
 ) -> tuple[TaskRow, ...]:
-    """Repair codes whose enhanced wav is still valid by re-extracting them
-    locally (no scorer round-trip). Same salvage/cascade logic as the
-    enhanced layer; only rows with a valid embedding are eligible — the
-    others are scored anyway and get their codes there."""
-    todo = [row for row in table if not row.codes and row.embedding]
+    """Codes artifacts: extract locally wherever invalid — no scorer
+    round-trip ever needed for codes. Fresh clips get their npy materialized
+    for the row the score passes will write; a regenerated checksum equal to
+    the stored one proves mere bit-rot (downstream untouched); a different
+    one is genuine drift — the enhanced layer has usually already cascaded
+    embedding, mark it again to stay safe (drift ⇒ re-embed)."""
+    prune_foreign(cache, cache.config.codes_dir, ".npy")
+    todo = [row for row in table if not row.codes]
     if not todo:
         return table
 
@@ -395,88 +428,183 @@ def apply_codes_layer(
         np.save(codes_path, codes)
 
         cached = cache.asset_cache.get(row.name)
-        salvaged = cached is not None and sha256(codes_path) == cached.checksum.codes
-        updated[row.name] = (
-            replace(row, codes=True)
-            if salvaged
-            else replace(row, codes=False, embedding=False)
-        )
+        if cached is None:
+            # fresh clip: nothing to salvage against — the file feeds the
+            # row that the score passes are about to write
+            updated[row.name] = replace(row, codes=True)
+        elif sha256(codes_path) == cached.checksum.codes:
+            updated[row.name] = replace(row, codes=True)  # bit-rot salvage
+        else:
+            updated[row.name] = replace(row, codes=True, embedding=False)
     return tuple(updated.get(row.name, row) for row in table)
 
 
-def score_missing(
+def append_row(config: Config, row: AssetEntry) -> None:
+    with open(config.asset_jsonl, "a", encoding="utf-8") as file:
+        file.write(row.model_dump_json() + "\n")
+
+
+def prune_foreign(cache: Cache, directory: Path, suffix: str) -> tuple[str, ...]:
+    """Delete artifacts whose clip left the filtered corpus scope — expired
+    content must not linger in the cache forever. Returns the removed clip
+    names."""
+    if not directory.is_dir():
+        return ()
+    keep = {entry.name for entry in cache.corpus_entries}
+    foreign_names = tuple(
+        path.stem for path in directory.glob(f"*{suffix}") if path.stem not in keep
+    )
+    for name in foreign_names:
+        (directory / f"{name}{suffix}").unlink()
+    if foreign_names:
+        print(
+            f"[prune] {directory.name}: removed {len(foreign_names)} foreign artifacts"
+        )
+    return foreign_names
+
+
+def apply_embedding_layer(
     cache: Cache,
     table: tuple[TaskRow, ...],
-    *,
-    speech_tokenizer,
     client: Client,
     batch: int,
-) -> list[AssetEntry]:
-    """Scorer round-trips for every clip with an invalid embedding (fresh
-    clips included), batched, fully serialized on purpose: the scorer
-    (cuda:0) is the bottleneck by ~8x, and a depth-2 overlap was measured at
-    ZERO benefit — the recv call absorbs the extraction window anyway
-    (STATUS.md §16.8). Rows are appended to asset.jsonl live, so an
-    interrupted run keeps what it finished."""
+) -> tuple[TaskRow, ...]:
+    """Scorer pass 1 — request {VECTOR} for every clip whose embedding
+    artifact is invalid, write the npys, mark them valid. No rows are
+    written here: checksums are rebuilt from disk by `score_text_missing` /
+    `finalize`, so a salvage-vs-cached-row distinction would be meaningless
+    at this layer. Batched, fully serialized on purpose: the scorer (cuda:0)
+    is the bottleneck by ~8x, and client-side pipelining was measured at
+    ZERO benefit (STATUS.md §16.8)."""
     config = cache.config
     todo = [row for row in table if not row.embedding]
     print(
-        f"[score] {len(cache.corpus_entries) - len(todo)} cached clips, "
+        f"[embed] {len(cache.corpus_entries) - len(todo)} cached clips, "
         f"{len(todo)} to process"
     )
+    if not todo:
+        return table
     entries_by_name = {entry.name: entry for entry in cache.corpus_entries}
-    config.codes_dir.mkdir(parents=True, exist_ok=True)
     config.embedding_dir.mkdir(parents=True, exist_ok=True)
+
+    updated: dict[str, TaskRow] = {}
+    start = time.monotonic()
+    for index in tqdm(range(0, len(todo), batch), desc="embed"):
+        chunk = todo[index : index + batch]
+        results = client.score(
+            [
+                ScoreItem(
+                    wav_path=str(config.enhanced_dir / f"{row.name}.wav"),
+                    text=entries_by_name[row.name].text,
+                )
+                for row in chunk
+            ],
+            fields={ScoreField.VECTOR},
+        )
+        for row, result in zip(chunk, results):
+            np.save(
+                config.embedding_dir / f"{row.name}.npy",
+                np.asarray(result["vector"], dtype=np.float32),
+            )
+            # the npy on disk is now the truth — rows get their checksums
+            # rebuilt from disk by score_text_missing / finalize
+            updated[row.name] = replace(row, embedding=True)
+    print(f"[embed] done in {time.monotonic() - start:.1f}s")
+    return tuple(updated.get(row.name, row) for row in table)
+
+
+def post_apply_embedding_layer(cache: Cache, table: tuple[TaskRow, ...]) -> np.ndarray:
+    """Materialize the centroid once the embedding pool has settled. `table`
+    is the PRE-embedding-layer view: its embedding bits still mark which
+    clips were (re)embedded this run — that plus foreign embeddings pruned
+    here is the pool-change signal (a deletion changes the pool just as
+    much). Unchanged pools reuse centroid.npy verbatim (deterministic
+    embeddings make a recomputed centroid byte-identical anyway); otherwise
+    the centroid is recomputed from disk and persisted. The return value
+    feeds `score_text_missing` (row sims) and `finalize` (metrics sims)."""
+    config = cache.config
+    removed = prune_foreign(cache, config.embedding_dir, ".npy")
+    pool_changed = bool(removed) or any(not row.embedding for row in table)
+    if not pool_changed and config.centroid_npy.exists():
+        return np.load(config.centroid_npy)
+
+    assert cache.corpus_entries, "no clips survived filtering — nothing to embed"
+    # every corpus_entry's embedding is on disk by now (the embedding layer
+    # ran first); manifest order keeps the float64 summation deterministic
+    vectors = np.stack(
+        [
+            np.load(config.embedding_dir / f"{entry.name}.npy")
+            for entry in cache.corpus_entries
+        ]
+    ).astype(np.float64)
+    norms = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    centroid = norms.mean(axis=0)
+    centroid /= np.linalg.norm(centroid)
+    np.save(config.centroid_npy, centroid)
+    return centroid
+
+
+def score_text_missing(
+    cache: Cache,
+    table: tuple[TaskRow, ...],
+    centroid: np.ndarray,
+    client: Client,
+    batch: int,
+) -> list[AssetEntry]:
+    """Scorer pass 2 — re-score {TRANSCRIPT, CER, MOS} only for clips whose
+    text scores are missing (fresh) or stale (the enhanced wav changed since
+    their row was recorded). cer is deterministic and MOS is not even stable
+    across scorer restarts, so untouched clips keep their cached scores
+    verbatim — this pass is the ONLY thing that rewrites them.
+
+    The centroid arrives materialized by `post_apply_embedding_layer`; each
+    row carries its sim computed directly against it (a write-time snapshot
+    — `finalize` never rewrites sims)."""
+    config = cache.config
+    entries_by_name = {entry.name: entry for entry in cache.corpus_entries}
+    todo = [
+        row
+        for row in table
+        if (cached := cache.asset_cache.get(row.name)) is None
+        or cached.checksum.enhanced != sha256(config.enhanced_dir / f"{row.name}.wav")
+    ]
+    print(f"[text] {len(todo)} clips to score")
+    if not todo:
+        return []
 
     rows: list[AssetEntry] = []
     start = time.monotonic()
-    for index in tqdm(range(0, len(todo), batch), desc="score"):
+    for index in tqdm(range(0, len(todo), batch), desc="text"):
         chunk = todo[index : index + batch]
-        for row in chunk:
-            codes = extract_codes(
-                speech_tokenizer, config.enhanced_dir / f"{row.name}.wav"
-            )
-            np.save(config.codes_dir / f"{row.name}.npy", codes)
-        results = client.recv_score(
-            client.send_score(
-                [
-                    ScoreItem(
-                        wav_path=str(config.enhanced_dir / f"{row.name}.wav"),
-                        text=entries_by_name[row.name].text,
-                    )
-                    for row in chunk
-                ],
-                fields={
-                    ScoreField.VECTOR,
-                    ScoreField.TRANSCRIPT,
-                    ScoreField.CER,
-                    ScoreField.MOS,
-                },
-            ),
-            timeout=client.timeout_s,
+        results = client.score(
+            [
+                ScoreItem(
+                    wav_path=str(config.enhanced_dir / f"{row.name}.wav"),
+                    text=entries_by_name[row.name].text,
+                )
+                for row in chunk
+            ],
+            fields={ScoreField.TRANSCRIPT, ScoreField.CER, ScoreField.MOS},
         )
         for row, result in zip(chunk, results):
-            embedding_path = config.embedding_dir / f"{row.name}.npy"
-            np.save(embedding_path, np.asarray(result["vector"], dtype=np.float32))
-            entry = entries_by_name[row.name]
+            # sim: this clip's unit-norm embedding against the materialized
+            # centroid — a write-time snapshot, never rewritten afterwards
+            embedding = np.load(config.embedding_dir / f"{row.name}.npy").astype(
+                np.float64
+            )
+            embedding /= np.linalg.norm(embedding)
             score_row = AssetEntry(
                 name=row.name,
-                text=entry.text,
+                text=entries_by_name[row.name].text,
                 transcript=result["transcript"],
                 cer=result["cer"],
                 mos=result["mos"],
-                sim=None,
-                checksum=Checksum(
-                    corpus=sha256(config.corpus_dir / f"{row.name}.wav"),
-                    enhanced=sha256(config.enhanced_dir / f"{row.name}.wav"),
-                    codes=sha256(config.codes_dir / f"{row.name}.npy"),
-                    embedding=sha256(embedding_path),
-                ),
+                sim=float(embedding @ centroid),
+                checksum=Checksum.from_disk(config, row.name),
             )
-            with open(config.asset_jsonl, "a", encoding="utf-8") as file:
-                file.write(score_row.model_dump_json() + "\n")
+            append_row(config, score_row)
             rows.append(score_row)
-    print(f"[score] done in {time.monotonic() - start:.1f}s")
+    print(f"[text] done in {time.monotonic() - start:.1f}s")
     return rows
 
 
@@ -484,12 +612,14 @@ def finalize(
     cache: Cache,
     table: tuple[TaskRow, ...],
     incremental_rows: list[AssetEntry],
-    *,
+    centroid: np.ndarray,
     model_path: str,
 ) -> None:
-    """Compact asset.jsonl (valid cached rows + incremental rows), backfill
-    per-row sim against the freshly computed centroid, write centroid.npy,
-    rebuild metrics.json wholesale."""
+    """Compact asset.jsonl — incremental rows as-is, kept rows with their
+    checksums refreshed from disk (their sim is NOT touched: it is the
+    write-time snapshot) — and rebuild the authoritative pool aggregates
+    (metrics.json) from the embeddings on disk against the centroid
+    materialized by `post_apply_embedding_layer`."""
     config = cache.config
     incremental_by_name = {row.name: row for row in incremental_rows}
 
@@ -499,26 +629,22 @@ def finalize(
         if row is None and any(
             task_row.name == entry.name and task_row.complete for task_row in table
         ):
-            row = cache.asset_cache[entry.name]
+            row = cache.asset_cache[entry.name].model_copy(
+                update={"checksum": Checksum.from_disk(config, entry.name)}
+            )
         assert row is not None, f"no valid row for clip {entry.name}"
         entries.append(row)
-
-    vectors = np.stack(
-        [np.load(config.embedding_dir / f"{entry.name}.npy") for entry in entries]
-    ).astype(np.float64)  # centroid precision matches the playground reference
-    norms = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
-    centroid = norms.mean(axis=0)
-    centroid /= np.linalg.norm(centroid)
-    sims = norms @ centroid
-    np.save(config.centroid_npy, centroid)
-    entries = [
-        row.model_copy(update={"sim": float(sim)}) for row, sim in zip(entries, sims)
-    ]
 
     config.cache_dir.mkdir(parents=True, exist_ok=True)
     with open(config.asset_jsonl, "w", encoding="utf-8") as file:
         for row in entries:
             print(row.model_dump_json(), file=file)
+
+    vectors = np.stack(
+        [np.load(config.embedding_dir / f"{entry.name}.npy") for entry in entries]
+    ).astype(np.float64)
+    norms = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    sims = norms @ centroid
 
     metrics = build_metrics(
         norms,
@@ -542,7 +668,6 @@ def finalize(
 
 def sync(
     cache: Cache,
-    *,
     speech_tokenizer,
     client: Client,
     device: str,
@@ -553,10 +678,11 @@ def sync(
     table = apply_corpus_layer(table)
     table = apply_enhanced_layer(cache, table, device)
     table = apply_codes_layer(cache, table, speech_tokenizer)
-    incremental_rows = score_missing(
-        cache, table, speech_tokenizer=speech_tokenizer, client=client, batch=batch
-    )
-    finalize(cache, table, incremental_rows, model_path=model_path)
+    pre_embedding = table  # embedding bits still mark this run's todo
+    table = apply_embedding_layer(cache, table, client=client, batch=batch)
+    centroid = post_apply_embedding_layer(cache, pre_embedding)
+    incremental_rows = score_text_missing(cache, table, centroid, client, batch)
+    finalize(cache, table, incremental_rows, centroid, model_path)
 
 
 def run_pipeline(
@@ -570,14 +696,12 @@ def run_pipeline(
     min_tokens: int,
     min_seconds: float,
     batch: int,
-    limit: int,
 ) -> Path:
     config = Config(
         corpus_dir=dataset,
         cache_dir=cache_root / dataset.name,
         min_tokens=min_tokens,
         min_seconds=min_seconds,
-        limit=limit,
     )
     cache = Cache.load(config, token_counter=tokenize_text)
     sync(
