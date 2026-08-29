@@ -16,6 +16,7 @@ from qwen3_tts_post_training.client.protocol import (
     ScoreItem,
     ScoreRequest,
     ScoreResponse,
+    ScoreResult,
 )
 
 
@@ -96,7 +97,9 @@ class Client:
         )
         return self._req_id
 
-    def recv_score(self, expect_id: int, timeout: float | None = None) -> list[dict]:
+    def recv_score(
+        self, expect_id: int, timeout: float | None = None
+    ) -> list[ScoreResult]:
         self._ensure_started()
         timeout = self.timeout_s if timeout is None else timeout
         raw = self._recv_json(timeout=timeout)
@@ -105,11 +108,11 @@ class Client:
             raise RuntimeError(
                 f"scorer id mismatch {resp.id} != {expect_id} (order broken?)"
             )
-        return [r.model_dump() for r in resp.results]
+        return resp.results
 
     def score(
         self, items: list[ScoreItem], fields: frozenset[ScoreField]
-    ) -> list[dict]:
+    ) -> list[ScoreResult]:
         """Blocking convenience: send + recv."""
         if not items:
             return []

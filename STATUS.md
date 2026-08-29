@@ -423,32 +423,37 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 
 ## 16. 预处理管线 `workers/preprocess` + `.cache` 数据契约（2026-08-27）
 
-**目标**：把「corpus wav 目录 → 训练就绪数据」固化成第三个 worker（结构同 trainer/scorer：独立 pyproject + `.venv`），产出 `.cache/{lang}/`（clearvoice wav + asset.jsonl + metrics.json）；训练侧标定全部改从 metrics.json 读，playground 依赖（sv_ref npy 路径 + 硬编码 0.8585/0.0966/2.5）就此解除。
+**目标**：把「corpus wav 目录 → 训练就绪数据」固化成第三个 worker（结构同 trainer/scorer：独立 pyproject + `.venv`），产出 `.cache/{lang}/`（enhanced wav + codes/embedding npy + asset.jsonl + centroid.npy + metrics.json）；训练侧标定全部改从 metrics.json 读，playground 依赖（sv_ref npy 路径 + 硬编码 0.8585/0.0966/2.5）就此解除。
 
 ### 16.1 输入 / 输出契约
 
 - **输入**（唯一必填）：`/path/to/{target_language}`（wav 目录）；约定 sibling `{target_language}.jsonl`，每行 `{"name", "text"}`，name ↔ `{target_language}/{name}.wav` 一对一。首跑数据集：`../delta-me13/corpora/tts/cyrene/Chinese(PRC)/`（1825 条 48kHz mono，982MB）。
-- **输出**（`.cache/{target_language}/`，`.gitignore` 已覆盖）：
-  - `clearvoice/{name}.wav` — MossFormer2_SE_48K 增强，48kHz PCM_16（时长不变）——**唯一派生音频**；下游全部现场重采样（SV `AF.resample`、ASR `load_audio(path, 16000)`、MOS `librosa.resample`、speech_tokenizer `encode(wav, sr=48000)`），不再自留 16k/24k 副本（原设计有三档，落地时核实零消费者后裁撤，省 ~2.3GB/语言）
-  - `asset.jsonl` — 每行 `{name, text, transcript, cer, codes, vector, utmosv2, checksum}`：cer（ASR 相对 text）、codes `[T,16]`（speech_tokenizer 对 48k clearvoice wav 提取，`encode` 内部自重采样）、vector（E2V2 192d 单位范数）、utmosv2（fold0）、checksum（原始 corpus wav 的 sha256，本期不消费，为未来 sync/recompute 增量命令预留）
-  - `metrics.json` — `centroid`（逐条 L2 归一 → 算术均值 → 再归一，与 playground/build_sv_reward.py 同式）、`sim` 分布 mean/std（= 新的 sv_center/sv_scale，替代 0.8585/0.0966）、`wer`（全池 mean CER，反映 ASR 在本域的表现）、`utmosv2` 分布（mean/std/p1–p99；**τ 本期维持 2.5 只记录不替换**，看过真实分布再定规则）、过滤计数与溯源参数（模型路径/过滤阈值/时间）
+- **输出**（`.cache/{target_language}/`，`.gitignore` 已覆盖；v2 契约，2026-08-29 现状）：
+  - `enhanced/{name}.wav` — MossFormer2_SE_48K 增强，48kHz PCM_16（时长不变）——**唯一派生音频**；下游全部现场重采样（SV `AF.resample`、ASR `load_audio(path, 16000)`、MOS `librosa.resample`、speech_tokenizer `encode(wav, sr=48000)`），不再自留 16k/24k 副本（原设计有三档，落地时核实零消费者后裁撤，省 ~2.3GB/语言）
+  - `codes/{name}.npy` — `[T,16]` int32（speech_tokenizer 对 48k enhanced wav 提取，`encode` 内部自重采样；`np.save` 不用 `torch.save`——zip 容器有确定性风险）
+  - `embedding/{name}.npy` — E2V2 192d float32 单位范数（`np.save`）
+  - `asset.jsonl` — 每行 `{name, text, transcript, cer, mos, sim, checksum {corpus, enhanced, codes, embedding}}`：transcript/cer/mos 为写时事实（text 层落行）；`sim` 是磁盘派生字段——finalize 对当时质心**全员现算**，pool 未变 ⇒ 逐位等于旧值，SV 升级 ⇒ 质心重算 + 全员刷新（零 scorer 往返）；checksum 现算于磁盘，不覆盖 MOS 的跨进程非确定性（§16.9 末条）
+  - `centroid.npy` — 单位范数 E2V2 质心（float64，`np.save`；`post_apply_embedding_layer` 物化——此后质心 ⟺ 磁盘池；finalize 无条件重建兜底）
+  - `metrics.json` — `sim`/`cer`/`mos` 三者统一 `{mean, std, percentiles(1..99)}` 对齐形状（sim stats = `RewardConfig.sv_center/sv_scale` 标定，cer 反映域内 ASR，mos 只记录待 τ 规则）+ `n_clips` + 溯源参数（dataset/model_path/min_tokens/min_seconds + `dropped`＝`DropReasons._asdict()` 扁平四键）——centroid 已独立 npy，`clearvoice`/`sv_model` provenance 键已移除（五稿 2026-08-29）
 
-### 16.2 四阶段流水（逐阶段幂等：产物存在即跳过，中断重跑安全）
+### 16.2 任务表 + 八步 `sync()`（逐层幂等，中断重跑安全）
 
-1. **filter**：jsonl 加载 + 一对一 wav 校验；token 数走 `Qwen3TTSModel.processor`（codes 阶段反正要加载它），时长走 `sf.info`；`--min-tokens 2 --min-seconds 0.1`（同 playground 旧默认）
-2. **clearvoice** → `clearvoice/{name}.wav`（48k，唯一派生音频）
-3. **codes**：`speech_tokenizer.encode(48k_wav, sr=48000).audio_codes[0]` → `[T,16]`
-4. **score**：复用 `client/trainer.Client`（bind 5555/5556，常驻 scorer 不感知新调用方），送 **48k** clearvoice wav + text（三个 scorer 全部内部自重采样：SV/ASR/MOS 均已核实），分块 push/pull → transcript/cer/mos/vector
+`sync()`（pipeline.py）一次跑完：`precompute_task_table` → corpus 层 → enhanced 层 → codes 层 → embedding 层 → post（质心物化）→ `collect_corpus_metrics`（text 打分）→ `finalize`（metrics 全量重建）。原始四阶段「产物存在即跳过」设计已被 §16.8 重构取代（只查存在性检测不到损坏/漂移）。
 
-### 16.3 协议扩展（core lib，向后兼容）
+- **filter**：jsonl 加载 + 一对一 wav 校验；token 数走 `Qwen3TTSModel.processor`（codes 阶段反正要加载它），时长走 `sf.info`；`--min-tokens 2 --min-seconds 0.1`（同 playground 旧默认）；drop 归因 = `DropReasons` NamedTuple 四键（orphan_corpus/orphan_manifest/less_than_min_tokens/less_than_min_seconds）
+- **任务表 + 四个 material 层**：`TaskRow(name, corpus, enhanced, embedding, codes)` 四 bool（= 行 checksum 是否仍描述磁盘），依赖序过层；精确 bit 语义——salvage（重生成 sha == 存储 sha ⇒ 纯 bit-rot）翻 True，真漂移/fresh 保持 False 自愈；corpus 层例外（源不匹配 → 下游全 False，源不可再生无 salvage），codes 层不做 embedding 级联（embedding 派生自 enhanced 而非 codes）；三个 material 层开头 `prune_foreign` 清理离开过滤范围的 clip 产物
+- **打分路径**：codes 层仅 enhanced+embedding 有效的行**本地**重提取（不惊动 scorer）；embedding 层走 scorer `{EMBEDDING}`（batched 串行——depth-2 重叠已证伪，§16.8）；text 打分走 scorer `{TRANSCRIPT, CER, MOS}`，todo = `not row.enhanced` 纯表读，单 append 句柄 + 每批 flush 落行（崩溃韧性）
 
-- `ScoreResult` += `vector: list[float] | None = None`（E2V2 单位范数嵌入）；`sim`/`sim_camp` 放宽为 `float | None`（None = 未设 ref）。embed 本来就在算，返回向量零成本
-- `SVScorer.score()` 拆出 `embed_wav(path, name)`；`multi_object` 无 ref 时不再 raise（sim=None、vector 照常）→ **scorer 可不带 `--sv-ref` 启动**（preprocess 模式：质心本就要等全部向量齐了才能算）
+### 16.3 协议（core lib，字段级按需 + 强类型终态；演化全记录见 §16.9）
 
-### 16.4 训练侧消费 metrics.json（一起做）
+- `ScoreField(StrEnum) = {EMBEDDING, TRANSCRIPT, CER, MOS}`（值 = wire key）；`ScoreRequest.fields` **必填**（空集 client 侧 assert 拒绝）——「需要什么就打什么分」，scorer 按字段组 lazy-load 派发，未请求组 timing 记 0
+- `ScoreResult` 公共可空字段（None = 未请求）+ 每字段一个 **`get_*_unwrap()`** 防呆读取（读错字段必炸，不让 None 悄悄漏到下游）；`recv_score` 返回 `list[ScoreResult]`（不降级 dict）；原 `sim`/`sim_camp` 字段已删——**sim 一律 caller 侧现算**（preprocess：finalize 对全池 embedding 现算；trainer：`vectors @ sv_centroid` 一次批量 matmul）
+- 精度论证：float32 ⊂ float64 → JSON 往返逐位精确；dot 从 scorer 挪到 caller 只改求和顺序，相对误差 ~1e-7，低于 sv_scale≈0.097 与一切 flameout 阈值 4-5 个量级
 
-- scorer `main.py` += `--metrics PATH`（与 `--sv-ref` 互斥）：读 `centroid` 当 ref → 与旧 `--sv-ref` npy 完全等价（同一向量）
-- trainer `TrainConfig` += `metrics_path`：启动时构建 `RewardConfig(sv_center/sv_scale/mos_tau)`，缺省回退现硬编码 → **零行为变更**；顺解 §5「needs_resample 标定常数重复」——标定值统一从 RewardConfig 取
+### 16.4 训练侧消费 metrics.json
+
+- trainer `--metrics-path` **必填**（assert）：`reward_config_from_metrics` 读 `sim.mean/std` → `RewardConfig.sv_center/sv_scale`；`load_centroid` 读 sibling `centroid.npy` → float32 renormalize（复刻旧 set_ref 配方）；`mos_tau` 维持 2.5（mos 统计只记录，待 gate 规则）
+- loop `send_score({EMBEDDING, CER, MOS})`，sim = 本地 `vectors @ centroid`；旧 scorer `--sv-ref/--metrics` 旗已随「scorer 彻底无标定」删除（§16.9）——一个常驻 scorer 服务 preprocess + 训练，零重配置
 
 ### 16.5 ClearVoice：pip 依赖移除，VENDORED MossFormer2_SE_48K（2026-08-27 定稿）
 
@@ -511,4 +516,9 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **验证**：probe 23 项（协议子集往返/默认全量/ScoreField==result keys/请求 mode=json 可序列化——第一版 `model_dump()` python mode 保留 frozenset 导致 zmq `send_json` 崩，已修并加探针防回归）；live 实测——损坏 embedding 重打分，transcript/cer/sim 对基线**逐位一致**（vector 传输无损 + 本地 matmul 等价旧 scorer dot）；同进程二次重打分 MOS delta=0.0
 - **字段级补全贯彻（2026-08-28 续）**：`score_missing` 拆为 `embed_missing`（{VECTOR}，text 仍有效的行当场以 cached 合并落行）+ `score_text_missing`（{TRANSCRIPT,CER,MOS}，todo = 无行或 `checksum.enhanced` 不匹配——行内分数只依赖 enhanced+text，这是精确失效判据）；codes 提取整体搬回 `apply_codes_layer`（门控 `not codes`，吸收 fresh 提取——embedding-rot 行不再被无关重提 codes）；checksum 统一 `Checksum.from_disk` 现算，行内旧值只做失效判定。**修复路径的 MOS 漂移根除**：损坏 embedding → `[text] 0 clips to score` → 新行含 MOS 逐位一致（mos 2.447265625 == 2.447265625）；preprocess scorer 调用收敛到 `client.score()` 便捷方法（两步 send/recv 形式是 depth-2 遗留，trainer loop 的跨组流水线仍合法使用）
 - **sim 快照化 + 行写入权收敛（2026-08-28 终稿）**：`ScoreRequest.fields` 变**必填**（`ALL_FIELDS` 删除，空 fields 在 client 侧 assert 拒绝；probe 断言缺 fields 必须 raise）；`embed_missing` → `apply_embedding_layer`（与其余三层同构：写 npy + bit 一律 True，**不写行**——行由磁盘重建，salvage 概念在此层失去意义）；**质心计算前移**到 `score_text_missing` 开头（此时全池 embedding 必在盘上）——行内 `sim` 当场实算，`sim=None` 占位 + finalize 回填机制消亡；`AssetEntry.sim` 必填，语义 = **写入时快照**（与 transcript/cer/mos 同一冻结原则，永不改写）；`finalize` = 权威刷新点：kept 行仅刷 checksum（磁盘现算，sim 不动）+ **无条件**重算/存质心 + 全量重建 metrics（兜底「clip 被裁但 text todo=0」的池变化）。行写入权 = text 层（活，保崩溃韧性）+ finalize（权威 compact）。验证：空闲跑 asset.jsonl+centroid.npy **逐字节不变**；损坏 embedding → `[embed] 1 / [text] 0` → 行含 mos+sim 位等（mos 2.447265625 / sim 0.9423833750032248 双双保持）
+- **prune + post 层 + sim 派生化（2026-08-28 二稿，推翻上条的部分裁决）**：`--limit` 调试旗**整体删除**（调试 = probe 自建小 cache）；质心物化从 text pass 前移为独立 **`post_apply_embedding_layer`**（契约：此后 centroid.npy ⟺ 磁盘池；复用/重算由池变化信号决定）；三个 material 层开头各自 `prune_foreign`——离开过滤范围的 clip 其产物全部清理（过期内容不再无限留存）；**bit 语义精确化**（用户模型）：bit = 「行 checksum 是否仍描述磁盘」——embedding 层做 sha 对比，bit-rot（重生成字节相同）→ salvage 翻 True，真漂移/fresh → 保持 False；`post` 消费**活表**（`pre_embedding` 快照别名删除——旧语义下才需要），`removed ∨ any(not embedding)` 即池变化；**finalize 重写为 map-merge**：text pass 返回 `name_to_text`，finalize 按新覆盖旧组装 transcript/cer/mos，而 **checksum+sim 归为磁盘派生字段、每轮全员现算**（pool 未变 ⇒ 逐位等于旧值；embedding 漂移（如 SV 升级）⇒ 质心重算 + 全员 sim 刷新，零 scorer 往返——sim 消费 embedding 的彻底版，此前的「写入时快照」裁决就此作废）。验证：probe 28 项（新增漂移全员刷新/裁剪 clip 三目录清理/post 复用-重算双路径）；live——空闲跑双文件逐位一致（首轮为 sim 计算路径统一的 1-ULP 一次性迁移，次轮起定点）；损坏 embedding → **salvage → 质心复用** + `[text] 0` + 行含 mos+sim 位等。后续加固（未做）：metrics.json provenance 的 `sv_model` 加 ckpt sha256；centroid.npy 旁存池指纹做复用自校验
 - **MOS 跨进程非确定性（本次实测发现，与协议改动正交）**：同一 clip 跨 scorer 进程重启 MOS 漂移 ~0.17（2.619→2.447），同进程内重复位等（0.0）——GPU 核级非确定性（cudnn autotune 类），任何 scorer 重启都会触发。行 checksum 不覆盖 MOS；metrics.json 的 utmos 统计因此混有跨运行的 run 级噪声（信息性用途，不影响 τ 决策方向，如需统一需全量重打分一次）
+- **强类型协议 + 精确语义收尾（2026-08-28 三稿；ScoreResult 设计回收一版后定型）**：第一版把 payload 全隐藏（extra="allow" + model_post_init 收编 + property 独占读取）——功能验证通过但机制过巧，按用户裁决**回收**，定型为：`ScoreResult` 公共可空字段（None = 未请求）+ 每个可空字段一个 **`get_*_unwrap()`**（assert 剥离 None 的防呆读取——知道请求了什么的调用点用 unwrap，读错字段必炸而非让 None 悄悄漏到下游；直接属性访问是诚实类型）；`ScoreField.VECTOR → EMBEDDING`（值 `"vector"→"embedding"`），`recv_score` 直接返回 `list[ScoreResult]`（不再 `model_dump` 降级为 dict），trainer/preprocess 全部走 unwrap 读取；text 层 live-append 的 `append_row`（每行开一次文件）删除——**单个 append 模式句柄外提到批次循环外** + 每批 `flush()`（崩溃韧性等价旧逐行开关）。同时 `apply_enhanced_layer/apply_codes_layer` 收敛到与 embedding 层相同的精确 bit 语义（salvage→翻 True；漂移/fresh→保持 False 自愈），`score_text` todo 由此变纯表读 `not row.enhanced`（sha 复查删除），codes 层对 embedding 的**过度级联**删除（embedding 派生自 enhanced 而非 codes——qwen-tts 升级不再误触发全量重嵌）。验证：probe 28 项（协议段重写：unrequested=None + unwrap 防呆 raise/嵌套 ScoreResponse 往返/枚举值=wire keys）；live——新协议 scorer 重启后空闲双文件逐字节一致；损坏 embedding → salvage → 重嵌 1 条 4.7s + 质心复用 + `[text] 0` + 行含 mos+sim 位等
+- **NamedTuple 化 + 命名收敛（2026-08-28 四稿）**：`DropReasons` dataclass→**NamedTuple**——手写 `to_dict`（连同 `corpus.orphan`/`duration`/`manifest.length` 那层重命名嵌套）删除，metrics.json 的 `dropped` provenance 改 `._asdict()`（stdlib API，扁平 + 字段本名，一次性变形；reward 端无消费者已验证）；probe 属性访问/kwargs 构造零改动。`score_text → collect_corpus_metrics`（返回注解顺手修正为 `dict[str, ScoreResult]`，上轮漏改）；`build_metrics` **内联进 finalize**（scalar 契约的验证随之折叠进 probe 的 finalize 块：sim mean/std 手算参考 + wer/utmos 标量 + 扁平 dropped key 契约，覆盖从「调助手函数」升级为「断言真实 finalize 产物」）。验证：probe 全过；live——首轮 metrics.json 因 dropped 变形重写（dropped=44 tokens/2 seconds，n_clips 1779），次轮起三文件全部字节稳定
+- **metrics 键名对齐（2026-08-29 五稿）**：`wer → cer`、`utmosv2 → mos`（与产出它们的量同名），三者统一 `{mean, std, percentiles(1..99)}` 对齐形状——sim 也补上 percentiles；`clearvoice`/`sv_model` 两个 provenance 键移除（用户裁决：暂时不要）。reward 端零波及（`reward_config_from_metrics` 只读 sim.mean/std，`wer` 键本就无人消费）。验证：probe 标量检查更新（sim percentiles 手算参考 + cer 全零分布逐键相等 + mos mean/中位）；live——首轮 metrics.json 重写（sim 0.8709 / cer 0.0579 / mos 2.6），次轮三文件字节稳定
+- **契约段同步（2026-08-29 六稿，纯文档）**：§16.1–16.4 仍停在 2026-08-27 原始设计（`clearvoice/` 目录名、v1 行 schema、内嵌 centroid、`--metrics` 旗、`sim/sim_camp` 可空、`vector` 字段名）——五轮演进只记在日期 bullet 里，契约段从未跟上，代码侧 grep 证实零残留（全部旧引用都在日期记录内）。重写为现状：§16.1 = v2 输出契约（enhanced/codes/embedding 三目录 + asset v2 行 + centroid.npy + metrics 对齐形状）；§16.2 = 任务表 + 八步 `sync()`（含原始四阶段设计的取代指针）；§16.3 = 字段级按需 + unwrap 终态；§16.4 = 训练侧必填消费。日期记录（§16.5–16.9）一律不动

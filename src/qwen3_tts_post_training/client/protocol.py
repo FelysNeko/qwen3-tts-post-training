@@ -16,10 +16,10 @@ from pydantic import BaseModel
 
 class ScoreField(StrEnum):
     """What a caller wants back per wav. The scorer derives which model
-    groups to run ({VECTOR} → SV embed, {TRANSCRIPT, CER} → ASR, {MOS} →
+    groups to run ({EMBEDDING} → SV embed, {TRANSCRIPT, CER} → ASR, {MOS} →
     MOS), lazy-loads only those, and None-fills everything unrequested."""
 
-    VECTOR = "vector"
+    EMBEDDING = "embedding"
     TRANSCRIPT = "transcript"
     CER = "cer"
     MOS = "mos"
@@ -32,15 +32,40 @@ class ScoreItem(BaseModel):
 
 class ScoreResult(BaseModel):
     """Unrequested fields come back None; requested ones are always filled.
-    `vector` is the raw unit-norm ERes2NetV2 embedding — float32-exact
+    `embedding` is the raw unit-norm ERes2NetV2 embedding — float32-exact
     through the JSON round-trip (float32 ⊂ float64) — and the similarity to
-    the corpus centroid is the caller's job (one batched matmul)."""
+    the corpus centroid is the caller's job (one batched matmul).
+
+    Two read paths: plain attribute access is the honest one (typed
+    `| None`); the `get_*_unwrap` methods are for call sites that know what
+    they requested — the assert strips the None and crashes on a field the
+    request did not ask for instead of leaking None downstream (防呆)."""
 
     wav_path: str
-    vector: list[float] | None = None
+    embedding: list[float] | None = None
     transcript: str | None = None
     cer: float | None = None
     mos: float | None = None
+
+    def get_embedding_unwrap(self) -> list[float]:
+        embedding = self.embedding
+        assert embedding is not None, "embedding was not requested from the scorer"
+        return embedding
+
+    def get_transcript_unwrap(self) -> str:
+        transcript = self.transcript
+        assert transcript is not None, "transcript was not requested from the scorer"
+        return transcript
+
+    def get_cer_unwrap(self) -> float:
+        cer = self.cer
+        assert cer is not None, "cer was not requested from the scorer"
+        return cer
+
+    def get_mos_unwrap(self) -> float:
+        mos = self.mos
+        assert mos is not None, "mos was not requested from the scorer"
+        return mos
 
 
 class ScoreRequest(BaseModel):

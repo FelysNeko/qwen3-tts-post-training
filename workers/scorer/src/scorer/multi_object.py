@@ -66,14 +66,14 @@ class Scorers:
         results = [ScoreResult(wav_path=item.wav_path) for item in items]
         t_sv = t_asr = t_mos = 0.0
 
-        if ScoreField.VECTOR in fields:
+        if ScoreField.EMBEDDING in fields:
             t0 = time.time()
             embeddings = [
                 self.sv.embed_wav(item.wav_path, "eres2netv2") for item in items
             ]
             t_sv = time.time() - t0
             for result, embedding in zip(results, embeddings):
-                result.vector = embedding.tolist()
+                result.embedding = embedding.tolist()
 
         if fields & {ScoreField.TRANSCRIPT, ScoreField.CER}:
             t0 = time.time()

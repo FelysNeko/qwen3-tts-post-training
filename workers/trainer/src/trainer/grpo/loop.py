@@ -295,7 +295,7 @@ def _train_loop(
             try:
                 rid = scorer.send_score(
                     [ScoreItem(wav_path=str(p), text=prompt) for p in g["wavs"]],
-                    fields={ScoreField.VECTOR, ScoreField.CER, ScoreField.MOS},
+                    fields={ScoreField.EMBEDDING, ScoreField.CER, ScoreField.MOS},
                 )
             except Exception as e:  # noqa: BLE001
                 print(
@@ -337,18 +337,22 @@ def _train_loop(
                 # the old scorer-side dot — see STATUS §16.9)
                 g["sim"] = (
                     torch.tensor(
-                        [r["vector"] for r in results],
+                        [r.get_embedding_unwrap() for r in results],
                         dtype=torch.float32,
                         device=cfg.device,
                     )
                     @ sv_centroid
                 )
-                for key in ("cer", "mos"):
-                    g[key] = torch.tensor(
-                        [r[key] for r in results],
-                        dtype=torch.float32,
-                        device=cfg.device,
-                    )
+                g["cer"] = torch.tensor(
+                    [r.get_cer_unwrap() for r in results],
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                g["mos"] = torch.tensor(
+                    [r.get_mos_unwrap() for r in results],
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
                 groups.append(g)
             t_score = time.monotonic() - t_s0
 

@@ -19,7 +19,7 @@ from qwen3_tts_post_training.reward.reward import RewardConfig
 def reward_config_from_metrics(path: str | Path) -> RewardConfig:
     """sv_center/sv_scale from the corpus sim distribution (mean/std of the
     per-clip cosine to the centroid). mos_tau stays at the current 2.5: the
-    utmosv2 stats in metrics.json are informational until a gate rule is
+    mos stats in metrics.json are informational until a gate rule is
     decided (STATUS.md §16)."""
     with open(path, encoding="utf-8") as f:
         metrics = json.load(f)
