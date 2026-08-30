@@ -19,9 +19,9 @@ from pathlib import Path
 
 from preprocess.pipeline import run_pipeline
 
-logger = logging.getLogger(__name__)
+from qwen3_tts_post_training.paths import repo_root
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--cache-root",
         type=Path,
-        default=REPO_ROOT / ".cache",
+        default=repo_root() / ".cache",
         help="cache root; artifacts land at {cache-root}/{dataset.name}/",
     )
     ap.add_argument("--min-tokens", type=int, default=2)

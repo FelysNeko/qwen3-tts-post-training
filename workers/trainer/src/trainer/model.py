@@ -82,20 +82,21 @@ class ModelWrapper:
         self,
         model_path: str,
         device: str = "cuda:1",
-        dtype: torch.dtype = torch.bfloat16,
     ):
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
+        # bf16 everywhere, deliberately hardcoded — no CLI flag, no config
+        # field; a dtype experiment edits this line and nothing else
+        self.dtype = torch.bfloat16
         wrapper = Qwen3TTSModel.from_pretrained(
             model_path,
             device_map=device,
-            dtype=dtype,
+            dtype=self.dtype,
             attn_implementation="flash_attention_2",
         )
         self.model = wrapper.model  # Qwen3TTSForConditionalGeneration
         self.processor = wrapper.processor
         self.device = device
-        self.dtype = dtype
         self.talker = self.model.talker
 
     def tokenize_assistant(self, text: str) -> torch.Tensor:

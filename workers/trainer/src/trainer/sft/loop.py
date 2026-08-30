@@ -42,16 +42,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.system import gpu_allocated_mb, peak_rss_mb
 from trainer.sft.model import (
     SftTrainerModel,
     extract_speaker_vec,
-    load_base_speaker_encoder,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,19 +58,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SftConfig:
-    # SFT ALWAYS starts from a base ckpt (official posture — the finetuned
-    # PhiLia093 ckpt is retired; GRPO continues from pipeline-produced
-    # custom_voice exports instead). Local dir or HF repo id.
+    # SFT starts ONLY from a base ckpt (asserted after load: base models
+    # ship the in-model speaker encoder, custom_voice ckpts carry none) —
+    # the finetuned PhiLia093 ckpt is retired; GRPO continues from
+    # pipeline-produced custom_voice exports instead. Local dir or HF repo id.
     model_path: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     device: str = "cuda:1"
-    dtype: str = "bfloat16"
-    # Only consulted when the ckpt is custom_voice (no in-model speaker
-    # encoder): borrow it from the matching-size base ckpt — local dir or
-    # HF repo id. A base ckpt (the default start) has its own.
-    base_model_path: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
-    cache_dir: str | None = None  # .cache/{lang}/ — REQUIRED
-    speaker_audio: str | None = None  # reference wav → speaker embedding — REQUIRED
+    # .cache/{lang}/ — REQUIRED. The None default exists only because the
+    # CLI bridge constructs a default instance first (replace()); the CLI
+    # rejects a missing flag and run_* asserts for direct-construction
+    # callers — no code path may consume cfg.cache_dir == None.
+    cache_dir: str | None = None
+    # Reference wav → speaker embedding. None (default) = the cache's
+    # metrics.json `medoid` clip (pool ERes2NetV2 medoid, STATUS §19.4);
+    # an explicit path overrides.
+    speaker_audio: str | None = None
     limit: int | None = None  # debug cap on dataset rows
 
     batch_size: int = 2
@@ -89,35 +91,6 @@ class SftConfig:
     resume: bool = False
 
     export_name: str = "cyrene"  # spk_id entry written by export_custom_voice
-
-
-# ---------------------------------------------------------------------------
-# data
-# ---------------------------------------------------------------------------
-
-
-def load_sft_dataset(
-    cache_dir: str | Path, limit: int | None = None
-) -> list[tuple[str, torch.Tensor]]:
-    """(text, codes[T,16] long) pairs from the preprocess cache."""
-    cache = Path(cache_dir)
-    assert cache.is_dir(), f"cache dir not found: {cache}"
-    rows = [
-        json.loads(line)
-        for line in (cache / "asset.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    data: list[tuple[str, torch.Tensor]] = []
-    for row in rows:
-        codes_path = cache / "codes" / f"{row['name']}.npy"
-        assert codes_path.exists(), (
-            f"missing codes for {row['name']!r} — run the preprocess pipeline first"
-        )
-        codes = torch.from_numpy(np.load(codes_path)).long()
-        data.append((row["text"], codes))
-    if limit is not None:
-        data = data[:limit]
-    return data
 
 
 # ---------------------------------------------------------------------------
@@ -253,23 +226,24 @@ def _assert_model_available(model_path: str) -> None:
 
 def run_sft(cfg: SftConfig | None = None) -> None:
     cfg = cfg or SftConfig()
-    dtype = getattr(torch, cfg.dtype)
-
     _assert_model_available(cfg.model_path)
     assert cfg.cache_dir, "--cache-dir is required (a .cache/{lang}/ preprocess output)"
-    assert cfg.speaker_audio, (
-        "--speaker-audio is required: one reference wav provides the speaker "
-        "embedding used for every training item (and baked into the export)"
-    )
+    layout = CacheLayout(Path(cfg.cache_dir))
+    if cfg.speaker_audio is None:
+        cfg.speaker_audio = str(layout.speaker_ref())
+        logger.info(f"speaker audio: {cfg.speaker_audio} (cache medoid)")
 
     torch.manual_seed(cfg.seed)
-    model = SftTrainerModel(cfg.model_path, device=cfg.device, dtype=dtype)
-    if model.model.speaker_encoder is None:
-        load_base_speaker_encoder(model, cfg.base_model_path)
+    model = SftTrainerModel(cfg.model_path, device=cfg.device)
+    assert model.model.speaker_encoder is not None, (
+        f"{cfg.model_path} has no in-model speaker_encoder — SFT starts ONLY "
+        "from a base ckpt (tts_model_type == 'base'); custom_voice ckpts "
+        "carry none (continue GRPO from those, not SFT)"
+    )
     speaker_vec = extract_speaker_vec(model, cfg.speaker_audio)
     model.model.train()
 
-    data = load_sft_dataset(cfg.cache_dir, limit=cfg.limit)
+    data = layout.load_sft_dataset(limit=cfg.limit)
     assert data, "empty dataset"
     batch_size = cfg.batch_size
     n_batches = (len(data) + batch_size - 1) // batch_size

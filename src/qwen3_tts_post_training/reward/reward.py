@@ -33,8 +33,12 @@ import torch
 
 @dataclass
 class RewardConfig:
-    sv_center: float = 0.8585
-    sv_scale: float = 0.0966
+    # sv_center/sv_scale are REQUIRED — no defaults (the 0.8585/0.0966
+    # playground pair was removed 2026-08-30): calibration MUST come from the
+    # pool's metrics.json via cache.CacheLayout.reward_config; a silent
+    # fallback would let a foreign or stale pool look healthy
+    sv_center: float
+    sv_scale: float
     mos_tau: float = 2.5
     lam_sv: float = 1.0
     lam_wer: float = 1.0
@@ -76,7 +80,7 @@ def reward_v3(
     sim: torch.Tensor,
     cer: torch.Tensor,
     mos: torch.Tensor,
-    cfg: RewardConfig | None = None,
+    cfg: RewardConfig,
     group_dim: int = -1,
 ) -> tuple[torch.Tensor, RewardBreakdown]:
     """v3.1 composite reward: RAW component magnitudes, no within-group std
@@ -89,11 +93,12 @@ def reward_v3(
     indicator (breakdown + needs_resample); a degenerate component (std <
     flameout_eps) is zeroed so it cannot leak a constant offset either.
 
-    Component scales (per take): r_sv ∈ (0,1) sigmoid; r_wer ∈ [0,1];
-    r_mos = max(0, τ−mos), linear penalty in MOS units, λ_mos=0.2.
-    """
-    cfg = cfg or RewardConfig()
+    cfg is REQUIRED: sv_center/sv_scale come from the pool's metrics.json
+    (cache.CacheLayout.reward_config) — there is no default calibration.
 
+    Component scales (per take): r_sv ∈ (0,1) sigmoid; r_wer ∈ [0,1];
+     r_mos = max(0, τ−mos), linear penalty in MOS units, λ_mos=0.2.
+    """
     r_sv = r_sv_fn(sim, cfg)
     r_wer = r_wer_fn(cer, cfg)
     r_mos = r_mos_fn(mos, cfg)

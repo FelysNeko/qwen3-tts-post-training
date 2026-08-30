@@ -9,6 +9,8 @@ from dataclasses import replace
 from trainer.grpo.loop import TrainConfig, run_grpo
 from trainer.sft.loop import SftConfig, run_sft
 
+from qwen3_tts_post_training.paths import repo_root
+
 
 def main() -> None:
     logging.basicConfig(
@@ -18,7 +20,12 @@ def main() -> None:
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--model-path", type=str)
     shared.add_argument("--device", type=str)
-    shared.add_argument("--dtype", type=str)
+    shared.add_argument("--cache-dir", type=str)
+    shared.add_argument(
+        "--namespace",
+        type=str,
+        help="cache selector: <repo>/.cache/{namespace} (e.g. Chinese(PRC))",
+    )
     shared.add_argument("--lr", type=float)
     shared.add_argument("--warmup-steps", type=int)
     shared.add_argument("--weight-decay", type=float)
@@ -32,8 +39,6 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sft = subparsers.add_parser("sft", parents=[shared])
-    sft.add_argument("--base-model-path", default=None)
-    sft.add_argument("--cache-dir", default=None)
     sft.add_argument("--speaker-audio", default=None)
     sft.add_argument("--limit", type=int, default=None)
     sft.add_argument("--batch-size", type=int, default=None)
@@ -57,7 +62,6 @@ def main() -> None:
     grpo.add_argument(
         "--sampler-impl", default=None, choices=["hf", "fast", "compiled", "graphed"]
     )
-    grpo.add_argument("--metrics-path", default=None)
     grpo.add_argument("--variant", default=None, choices=["vanilla", "dr", "gspo"])
     grpo.add_argument("--kl-beta", type=float, default=None)
     grpo.add_argument("--scorer-push-endpoint", default=None)
@@ -65,11 +69,23 @@ def main() -> None:
     grpo.add_argument("--scorer-timeout", type=float, default=None)
 
     args = parser.parse_args()
+    # --namespace = --cache-dir 的简写（<repo>/.cache/{namespace}，与
+    # preprocess 的默认 cache-root 对齐）；显式 --cache-dir 与之互斥；
+    # 两者皆缺在此直接拒绝，不溜到 run_* 的 assert
+    if args.namespace is not None:
+        if args.cache_dir is not None:
+            parser.error("--namespace and --cache-dir are mutually exclusive")
+        cache = repo_root() / ".cache" / args.namespace
+        if not cache.is_dir():
+            parser.error(f"cache dir not found: {cache}")
+        args.cache_dir = str(cache)
+    elif args.cache_dir is None:
+        parser.error("--cache-dir (or --namespace) is required")
     # CLI 覆盖（未给的键 = None → 落回各分支 dataclass 的默认值）
     overrides = {
         key: value
         for key, value in vars(args).items()
-        if key != "command" and value is not None
+        if key not in ("command", "namespace") and value is not None
     }
 
     if args.command == "sft":

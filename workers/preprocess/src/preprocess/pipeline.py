@@ -83,6 +83,7 @@ import torchaudio.functional as AF
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import (
     ScoreField,
     ScoreItem,
@@ -109,28 +110,10 @@ class Config:
         return self.corpus_dir.parent / f"{self.corpus_dir.stem}.jsonl"
 
     @property
-    def enhanced_dir(self) -> Path:
-        return self.cache_dir / "enhanced"
-
-    @property
-    def codes_dir(self) -> Path:
-        return self.cache_dir / "codes"
-
-    @property
-    def embedding_dir(self) -> Path:
-        return self.cache_dir / "embedding"
-
-    @property
-    def centroid_npy(self) -> Path:
-        return self.cache_dir / "centroid.npy"
-
-    @property
-    def asset_jsonl(self) -> Path:
-        return self.cache_dir / "asset.jsonl"
-
-    @property
-    def metrics_json(self) -> Path:
-        return self.cache_dir / "metrics.json"
+    def layout(self) -> CacheLayout:
+        """The shared cache-layout view — path knowledge lives in
+        qwen3_tts_post_training.cache, not here."""
+        return CacheLayout(self.cache_dir)
 
 
 class CorpusEntry(BaseModel):
@@ -150,9 +133,9 @@ class Checksum(BaseModel):
         values are used only for invalidation tests, never as data."""
         return cls(
             corpus=sha256(config.corpus_dir / f"{name}.wav"),
-            enhanced=sha256(config.enhanced_dir / f"{name}.wav"),
-            codes=sha256(config.codes_dir / f"{name}.npy"),
-            embedding=sha256(config.embedding_dir / f"{name}.npy"),
+            enhanced=sha256(config.layout.enhanced_dir / f"{name}.wav"),
+            codes=sha256(config.layout.codes_dir / f"{name}.npy"),
+            embedding=sha256(config.layout.embedding_dir / f"{name}.npy"),
         )
 
 
@@ -171,15 +154,15 @@ class AssetEntry(CorpusEntry):
         return path.is_file() and sha256(path) == self.checksum.corpus
 
     def enhanced_matches(self, config: Config) -> bool:
-        path = config.enhanced_dir / f"{self.name}.wav"
+        path = config.layout.enhanced_dir / f"{self.name}.wav"
         return path.is_file() and sha256(path) == self.checksum.enhanced
 
     def codes_matches(self, config: Config) -> bool:
-        path = config.codes_dir / f"{self.name}.npy"
+        path = config.layout.codes_dir / f"{self.name}.npy"
         return path.is_file() and sha256(path) == self.checksum.codes
 
     def embedding_matches(self, config: Config) -> bool:
-        path = config.embedding_dir / f"{self.name}.npy"
+        path = config.layout.embedding_dir / f"{self.name}.npy"
         return path.is_file() and sha256(path) == self.checksum.embedding
 
 
@@ -261,8 +244,8 @@ class Cache:
         )
 
         config.cache_dir.mkdir(parents=True, exist_ok=True)
-        config.asset_jsonl.touch(exist_ok=True)
-        with open(config.asset_jsonl, encoding="utf-8") as file:
+        config.layout.asset_jsonl.touch(exist_ok=True)
+        with open(config.layout.asset_jsonl, encoding="utf-8") as file:
             asset_cache = {
                 entry.name: entry
                 for entry in (AssetEntry.model_validate_json(line) for line in file)
@@ -332,7 +315,7 @@ def apply_enhanced_layer(
     untouched; a different checksum is genuine drift — the bit stays False
     and every derived artifact cascades to False (they were built from the
     old bytes)."""
-    prune_foreign(cache, cache.config.enhanced_dir, ".wav")
+    prune_foreign(cache, cache.config.layout.enhanced_dir, ".wav")
     todo = [row for row in table if not row.enhanced]
     if not todo:
         return table
@@ -344,7 +327,7 @@ def apply_enhanced_layer(
     )
 
     config = cache.config
-    config.enhanced_dir.mkdir(parents=True, exist_ok=True)
+    config.layout.enhanced_dir.mkdir(parents=True, exist_ok=True)
     model = load_mossformer2_se_48k(ensure_clearvoice(), device)
     mossformer_config = MossFormer2SE48KConfig()
 
@@ -357,7 +340,7 @@ def apply_enhanced_layer(
             ).numpy()
         torch.manual_seed(0)  # kaldi fbank dither=1.0 consumes the global RNG
         enhanced = enhance(model, mossformer_config, audio, device)
-        enhanced_path = config.enhanced_dir / f"{row.name}.wav"
+        enhanced_path = config.layout.enhanced_dir / f"{row.name}.wav"
         sf.write(str(enhanced_path), enhanced, CLEARVOICE_SR, subtype="PCM_16")
 
         cached = cache.asset_cache.get(row.name)
@@ -387,18 +370,18 @@ def apply_codes_layer(
     it False and it self-heals at finalize. Embedding is NOT downstream of
     codes (both derive from enhanced), so this layer never cascades — an
     enhanced drift already cascaded it in the enhanced layer."""
-    prune_foreign(cache, cache.config.codes_dir, ".npy")
+    prune_foreign(cache, cache.config.layout.codes_dir, ".npy")
     todo = [row for row in table if not row.codes]
     if not todo:
         return table
 
     config = cache.config
-    config.codes_dir.mkdir(parents=True, exist_ok=True)
+    config.layout.codes_dir.mkdir(parents=True, exist_ok=True)
 
     updated: dict[str, TaskRow] = {}
     for row in tqdm(todo, desc="codes"):
-        codes = extract_codes(speech_tokenizer, config.enhanced_dir / f"{row.name}.wav")
-        codes_path = config.codes_dir / f"{row.name}.npy"
+        codes = extract_codes(speech_tokenizer, config.layout.enhanced_dir / f"{row.name}.wav")
+        codes_path = config.layout.codes_dir / f"{row.name}.npy"
         np.save(codes_path, codes)
 
         cached = cache.asset_cache.get(row.name)
@@ -418,7 +401,7 @@ def load_embeddings(cache: Cache) -> dict[str, np.ndarray]:
     first."""
     vectors = np.stack(
         [
-            np.load(cache.config.embedding_dir / f"{entry.name}.npy")
+            np.load(cache.config.layout.embedding_dir / f"{entry.name}.npy")
             for entry in cache.corpus_entries
         ]
     ).astype(np.float64)
@@ -467,7 +450,7 @@ def apply_embedding_layer(
     if not todo:
         return table
     entries_by_name = {entry.name: entry for entry in cache.corpus_entries}
-    config.embedding_dir.mkdir(parents=True, exist_ok=True)
+    config.layout.embedding_dir.mkdir(parents=True, exist_ok=True)
 
     updated: dict[str, TaskRow] = {}
     start = time.monotonic()
@@ -476,7 +459,7 @@ def apply_embedding_layer(
         results = client.score(
             [
                 ScoreItem(
-                    wav_path=str(config.enhanced_dir / f"{row.name}.wav"),
+                    wav_path=str(config.layout.enhanced_dir / f"{row.name}.wav"),
                     text=entries_by_name[row.name].text,
                 )
                 for row in chunk
@@ -484,7 +467,7 @@ def apply_embedding_layer(
             fields={ScoreField.EMBEDDING},
         )
         for row, result in zip(chunk, results):
-            embedding_path = config.embedding_dir / f"{row.name}.npy"
+            embedding_path = config.layout.embedding_dir / f"{row.name}.npy"
             np.save(
                 embedding_path,
                 np.asarray(result.get_embedding_unwrap(), dtype=np.float32),
@@ -515,17 +498,17 @@ def post_apply_embedding_layer(
     (row sims)
     and `finalize` (metrics sims)."""
     config = cache.config
-    removed = prune_foreign(cache, config.embedding_dir, ".npy")
+    removed = prune_foreign(cache, config.layout.embedding_dir, ".npy")
     pool_changed = bool(removed) or any(not row.embedding for row in table)
-    if not pool_changed and config.centroid_npy.exists():
-        return np.load(config.centroid_npy)
+    if not pool_changed and config.layout.centroid_npy.exists():
+        return np.load(config.layout.centroid_npy)
 
     assert cache.corpus_entries, "no clips survived filtering — nothing to embed"
     # manifest order keeps the float64 summation deterministic
     norms = np.stack([name_to_norms[entry.name] for entry in cache.corpus_entries])
     centroid = norms.mean(axis=0)
     centroid /= np.linalg.norm(centroid)
-    np.save(config.centroid_npy, centroid)
+    np.save(config.layout.centroid_npy, centroid)
     return centroid
 
 
@@ -559,13 +542,13 @@ def collect_corpus_metrics(
 
     text_results: dict[str, ScoreResult] = {}
     start = time.monotonic()
-    with open(config.asset_jsonl, "a", encoding="utf-8") as asset_file:
+    with open(config.layout.asset_jsonl, "a", encoding="utf-8") as asset_file:
         for index in tqdm(range(0, len(todo), batch), desc="text"):
             chunk = todo[index : index + batch]
             results = client.score(
                 [
                     ScoreItem(
-                        wav_path=str(config.enhanced_dir / f"{row.name}.wav"),
+                        wav_path=str(config.layout.enhanced_dir / f"{row.name}.wav"),
                         text=entries_by_name[row.name].text,
                     )
                     for row in chunk
@@ -640,12 +623,23 @@ def finalize(
         )
 
     config.cache_dir.mkdir(parents=True, exist_ok=True)
-    with open(config.asset_jsonl, "w", encoding="utf-8") as file:
+    with open(config.layout.asset_jsonl, "w", encoding="utf-8") as file:
         for row in entries:
             print(row.model_dump_json(), file=file)
 
     cer_values = np.asarray([row.cer for row in entries])
     mos_values = np.asarray([row.mos for row in entries])
+    # speaker-conditioning reference: the pool's ERes2NetV2 medoid (max
+    # mean-pairwise cosine — the clip closest to every other clip in the
+    # space that hears channel/quality differences; STATUS §19.4). The SFT
+    # worker selects in E2V2 but EMBEDS this clip with the model's own
+    # speaker encoder — E2V2 vectors can't enter the talker slot.
+    assert len(norms) >= 1, "empty pool"
+    pairwise = norms @ norms.T
+    mean_pairwise = (pairwise.sum(axis=1) - np.diagonal(pairwise)) / max(
+        len(norms) - 1, 1
+    )
+    medoid_name = cache.corpus_entries[int(np.argmax(mean_pairwise))].name
     # aligned scalar shape: every metric is {mean, std, percentiles} over
     # the pool (sim stats feed RewardConfig sv_center/sv_scale; cer reflects
     # domain ASR performance; mos stats are recorded for a future gate
@@ -676,15 +670,16 @@ def finalize(
             },
         },
         "n_clips": len(norms),
+        "medoid": medoid_name,
         "dataset": str(config.corpus_dir.resolve()),
         "model_path": model_path,
         "min_tokens": config.min_tokens,
         "min_seconds": config.min_seconds,
         "dropped": cache.drop_reasons._asdict(),
     }
-    with open(config.metrics_json, "w", encoding="utf-8") as file:
+    with open(config.layout.metrics_json, "w", encoding="utf-8") as file:
         json.dump(metrics, file, ensure_ascii=False, indent=2)
-    logger.info(f"metrics written: {config.metrics_json}")
+    logger.info(f"metrics written: {config.layout.metrics_json}")
 
 
 def sync(

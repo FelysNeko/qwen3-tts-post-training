@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-08-26（§15 双后端重构 + 全 16 码本 logprob + MTP γ 显式化）
+最后更新：2026-08-30（§19 原生 speaker encoder A/B —— 决策 E2V2 维持不变）
 
 ## 1. 目标
 
@@ -452,7 +452,7 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 
 ### 16.4 训练侧消费 metrics.json
 
-- trainer `--metrics-path` **必填**（assert）：`reward_config_from_metrics` 读 `sim.mean/std` → `RewardConfig.sv_center/sv_scale`；`load_centroid` 读 sibling `centroid.npy` → float32 renormalize（复刻旧 set_ref 配方）；`mos_tau` 维持 2.5（mos 统计只记录，待 gate 规则）
+- trainer 的标定入口 = **cache 目录本身**（`--cache-dir`/`--namespace`，shared argparse，SFT/GRPO 同参；`--namespace {lang}` 简写 = `<repo>/.cache/{lang}`，与 preprocess 默认 cache-root 对齐）：`reward_config_from_metrics` 读 `<cache-dir>/metrics.json` 的 `sim.mean/std` → `RewardConfig.sv_center/sv_scale`；`load_centroid` 读 sibling `centroid.npy` → float32 renormalize（复刻旧 set_ref 配方）；`mos_tau` 维持 2.5（mos 统计只记录，待 gate 规则）。**`--metrics-path` 已删（2026-08-30）**：metrics.json 永远与训练数据同 cache，本地 cache + 外部 metrics 的跨池错配无人能 gating——旧旗标（§16.9 起必填、当日改 `--cache-dir` 可代）演进终结于单入口不变量。同日 `RewardConfig.sv_center/sv_scale` 默认值删除（0.8585/0.0966 playground 对退役）：两字段必填、`reward_v3` 的 cfg 必传——静默回退会让外来/过期标定看似健康；标定语义边界见「池几何 → metrics，策略/权重/护栏 → 代码默认值」
 - loop `send_score({EMBEDDING, CER, MOS})`，sim = 本地 `vectors @ centroid`；旧 scorer `--sv-ref/--metrics` 旗已随「scorer 彻底无标定」删除（§16.9）——一个常驻 scorer 服务 preprocess + 训练，零重配置
 
 ### 16.5 ClearVoice：pip 依赖移除，VENDORED MossFormer2_SE_48K（2026-08-27 定稿）
@@ -528,9 +528,9 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 
 ### 17.1 结构（薄封装，全部复用已验证内核）
 
-- `model.py`：`SftTrainerModel(ModelWrapper)`——**全量 FT**（talker 全栈含 code_predictor/MTP 头，官方语义；GRPO 冻 predictor 的姿态在此不适用）；冻结仅 `speaker_encoder`（输出 detach 进 slot 6，天然无梯度）。`speech_tokenizer` 是普通包装对象（非 nn.Module），参数本就不在模型树。`load_base_speaker_encoder`：custom_voice ckpt 无 speaker encoder（仅 `tts_model_type == "base"` 时构造）→ 从 base safetensors 惰性抽 `speaker_encoder.*`（`safe_open`，76 张量 strict load）——SFT 从 base 出发时自动跳过
-- speaker 条件：**用户指定一条参考音频**（`--speaker-audio`）→ soundfile 读（stereo→mono）→ librosa 24k 重采样 → 模型自带 `extract_speaker_embedding` → `[hidden]` 向量广播进 slot 6（teacher_forcing 的 spk 查表同路径），启动时提一次全程复用；官方逐条 `ref_mels→speaker_encoder().detach()` 的单说话人退化版
-- `loop.py`：`load_sft_dataset`（asset 行 + codes npy → (text, [T,16] long)，缺 npy 即 assert）→ 每 epoch 种子洗牌切片 → `collate → teacher_forcing → CE`。**loss 单 shift 配对**：`CE(talker_logits, codec_0_labels[:,1:], ignore_index=-100) + 0.3·CE(sub_talker_logits, talker_codec_ids[:,1:])`——官方 `sft_12hz.py` 的 double-shift bug（`inputs_embeds[:, :-1]` + 内部 HF CE 再 shift 一次 → logits@p-2 vs 标签@p+1；`hidden_states[codec_mask[:, :-1]]` 选位 p 的 hidden 泄漏目标）不复现，`outputs.loss` 不可用
+- `model.py`：`SftTrainerModel(ModelWrapper)`——**全量 FT**（talker 全栈含 code_predictor/MTP 头，官方语义；GRPO 冻 predictor 的姿态在此不适用）；冻结仅 `speaker_encoder`（输出 detach 进 slot 6，天然无梯度）。`speech_tokenizer` 是普通包装对象（非 nn.Module），参数本就不在模型树。**base-only 硬化（2026-08-30）**：曾有的 `load_base_speaker_encoder`（custom_voice 起点从 base safetensors 惰性借 76 张量）整体删除 + `--base-model-path` 旗删——用户既定姿态「SFT 只允许从 base 出发」，`run_sft` 加载后 assert in-model speaker_encoder，custom_voice 起点直接拒绝（续练走 GRPO，不是 SFT）
+- speaker 条件：**cache metrics.json 的 `medoid` 条目**（池 E2V2 max-mean-pairwise clip，`--speaker-audio` 可覆盖）→ soundfile 读（stereo→mono）→ librosa 24k 重采样 → 模型自带 `extract_speaker_embedding` → `[hidden]` 向量广播进 slot 6（teacher_forcing 的 spk 查表同路径），启动时提一次全程复用；官方逐条 `ref_mels→speaker_encoder().detach()` 的单说话人退化版。选取在 E2V2（听得到通道/质量差异的空间）、嵌入用模型自带 encoder（E2V2 192d 进不了 slot）——决策与数字见 §19.4
+- `loop.py`：`CacheLayout.load_sft_dataset`（core lib cache.py；asset 行 + codes npy → (text, [T,16] long)，缺 npy 即 assert）→ 每 epoch 种子洗牌切片 → `collate → teacher_forcing → CE`。**loss 单 shift 配对**：`CE(talker_logits, codec_0_labels[:,1:], ignore_index=-100) + 0.3·CE(sub_talker_logits, talker_codec_ids[:,1:])`——官方 `sft_12hz.py` 的 double-shift bug（`inputs_embeds[:, :-1]` + 内部 HF CE 再 shift 一次 → logits@p-2 vs 标签@p+1；`hidden_states[codec_mask[:, :-1]]` 选位 p 的 hidden 泄漏目标）不复现，`outputs.loss` 不可用
 - 超参照抄官方：AdamW lr 2e-5 / wd 0.01 / grad_accum 4 / clip 1.0 + 线性 warmup 10（GRPO 教训：Adam 首步 sign jolt）；`model.train()`；fp32 CE
 - ckpt：**滚动 `latest.pt`**（trainable state_dict + optimizer + 批位 pos；全量 FT 每步编号文件太贵）+ `--resume`（key 集合 assert 防 architecture 漂移）
 - `export_custom_voice`：白名单拷贝（config/generation/preprocessor/tokenizer/vocab/merges + `speech_tokenizer/`）→ config 手术（`tts_model_type=custom_voice` + `spk_id`/`spk_is_dialect` 写入 `--export-name`，已存在复用其 slot，新名分配 max+1）→ safetensors **仅 `talker.*` 键**（与原版 model.safetensors 布局同构；官方脚本存全量 state_dict 反而多键）+ 参考音频 embedding 烘入 `codec_embedding.weight[slot]`；repo id 源经 `snapshot_download` 解析（训练后 cache 命中）
@@ -565,3 +565,34 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **模块解析本就不靠 hack**：三个 worker 的 pyproject 都是 `uv_build` 后端 + `module-name` 配置，`uv sync` 默认把项目自身 editable 装进自己的 .venv（实测 `import scorer/preprocess/trainer` 直指 `src/`，无 path 介入）；scorer/preprocess 入口的两行 `sys.path.insert` 是历史残留，已删（连带仅为其存在的 `import sys`/`Path` 导入）。`[project.scripts]` 未加——bin 壳与解析无关，AGENTS 命令惯例统一 `.venv/bin/python workers/xxx/main.py`
 - **`src/qwen3_tts_post_training/system.py`**（新）：`peak_rss_mb()`（getrusage ru_maxrss）/`current_rss_mb()`（/proc/self/statm，OSError → -1）/`gpu_allocated_mb(device)`/`gpu_reserved_mb(device)`（torch 分配器视角，round 1 位）——数值语义与原内联表达式逐字节一致；调用点收敛：grpo/sft monitor + scorer `ScoreResponse.rss_mb`，三个文件的 `import resource` 全清
 - **`train/grpo.py` → `workers/trainer/src/trainer/grpo/grpo.py`**（`git mv`，唯一消费方 loop.py）：核心库瘦身为真正三方共享的 `reward/` + `client/` + `system.py`
+
+## 19. 原生 speaker encoder A/B：决策 = E2V2 维持不变（2026-08-30）
+
+**背景**：`qwen3_tts` 自带 ECAPA-TDNN speaker encoder（`Qwen3TTSSpeakerEncoder`，24k mel128 → ASP+fc，输出不归一化；CustomVoice ckpt 不带权重，当时从 `Qwen/Qwen3-TTS-12Hz-{0.6B,1.7B}-Base` 借——探针期复用了 SFT 的 `load_base_speaker_encoder`，该借用路径已于 2026-08-30 随 base-only 硬化删除，见 §17.1）。问题 = 能否替换外聘 ERes2NetV2 当 r_sv。**此前无任何决策记录**（playground SV bake-off §一 只测了 E2V2/CAM++/ECAPA，原生候选从未入册），本轮补测后**用户拍板：E2V2 不变**。探针 = `probes/native_embedding/`（脚本 + report*.json + 负样本集 + rollout 音频，gitignore 覆盖）。
+
+### 19.1 GT 池几何（1779 条 enhanced wav，24k，fp32，跨进程位等）
+
+* 提取：mel 配方逐行复刻 `modeling_qwen3_tts.extract_speaker_embedding`（n_fft 1024/hop 256/win 1024/fmax 12k），48k→24k librosa，全池 19s。0.6B(enc 1024)/1.7B(enc 2048) 行为几乎相同（σ 0.0124 vs 0.0126），尺寸无谓
+* sim→质心：E2V2 **0.8709±0.0880** vs 原生 **0.9879±0.0124**（σ 紧 7×）；pairwise 0.758±0.117 vs **0.976±0.018**——原生把全池看成一个点（提纯的"说话人身份"提取器，丢掉的正是 r_sv 喂养的通道/质量/内容变化）
+* 逐 clip 相关：P 0.871 / S 0.807；尾部重叠 bottom50 37/50（坏 clip 共识）、top50 17/50（好 take 上失明）
+* ⚠️ 首跑撞上一次瞬态 GPU 故障（单 clip 非有限值 → centroid assert；守卫已加：非有限行诊断 + 只用有限行算质心；复跑两次位等 0.0）
+
+### 19.2 rollout 组内 z-spread（16 组 × 8 = 128 takes，PhiLia093=1.7B custom_voice，种子 = 生产约定 `seed*1000003+step*1009+gi` step0）
+
+* pooled within-group z_std：E2V2 0.296 vs 原生 0.190（**ratio 0.64，不是池上 σ 比的 1/7**）——池几何的悲观预判在 rollout 上没有全额兑现
+* 分组型看才是重点：健康组（12/16）原生 ≈ E2V2 的 1/3（多为噪声压缩，MD §10 附3：健康 take 的 E2V2 散布大半是 take 间噪声）；**真退化组（g08/g10 OOD 崩坏）追平甚至反超**（0.462 vs 0.421）；**绕口令组 g12 sigmoid 地板反转**：E2V2 sim 塌到 0.66（z -2.4）→ r 贴地 → adv_std 0.018 < 原生 0.035（原生停在响应区）
+* 全 takes spearman 0.791。结论从"基本不能换"上调为"值得 A/B"，引出负样本判别
+
+### 19.3 负样本判别（17 条五轴，vs 各自池标定 z；report_negatives.json）
+
+* 构成：官方 bucket 2 条（clone.wav/tokenizer_demo_1）+ LibriSpeech 6 说话人 + 同名台词 EN/JA/KO 三位 CV（**是不同配音演员**，不是同人错语种——初版标签已改 `other_va`）+ **域内中文轴**（官方 0.6B-CustomVoice 内置音色 vivian/serena/uncle_fu × 2 池文本，`builtin_zh.py` 现场生成，HF cache +2GB）
+* 汇总：E2V2 均值 z **-6.01**（最差 clip -2.71）vs 原生 **-3.81**（最差 clip **-1.09**）；**双方 100% 分离负样本 vs 健康 take**
+* **域内中文轴（公平对照，回应"E2V2 是 zh-cn 专精"的质疑）**：E2V2 对中文内置音色照旧 -5.1~-7.6σ（分离力是真实判别力，非域外推力）；原生对女声（vivian/serena）只有 -1.1~-1.5σ，与它健康 rollout 下界 -0.67 仅隔 0.4σ（serena_1 为全场最弱负样本）——**"干净语音高原"**：native 把"干净专业语音"与"目标说话人"混为一谈，男声（-3.4）才拉开
+* qwen.ai 博客音频不可得：纯 CSR SPA，`/api/v2/article/retrieval` 服务端恒空列表，OSS 直链/列表无权限；负样本以等价素材重组
+
+### 19.4 决策与定位
+
+* **r_sv 主驱动维持 ERes2NetV2 不变**（三重验证：池几何 + rollout z-spread + 域内/域外负样本判别）
+* 原生编码器定位：不采用；至多当"崩坏护栏/交叉监控"，且相对 CAM++ 无明显优势（信号 87% 与 E2V2 冗余、健康组第二意见幅度小）
+* **SFT 条件向量随之定稿（2026-08-30 固化进管线）**：选 medoid **在 E2V2**（唯一听得到通道/质量/韵律差异的空间；原生空间 pairwise 0.976 排名压在窄带里，选 clip 分辨率不足），嵌入**用原生 encoder**（E2V2 192d 进不了 talker slot）——E2V2-medoid 那条 clip 的原生嵌入 vs 原生 centroid 的 cos = 0.9957/0.9951（0.6B/1.7B），数值上是同一向量，选真实 clip 取其 on-manifold + 可听审计 + 与 MD 旧池 medoid 连续（当前增强池 medoid 仍是 `side4_shitang_cyrene_109_f`，mean pairwise 0.8437 / 旧 0.8284）。落地：finalize 写 `medoid` 进 metrics.json（mean-pairwise argmax，空池 assert、n=1 退化为该 clip；mean_pairwise 数值不入册——池内聚度已由 sim 统计承载，无消费者）、`cache.CacheLayout.speaker_ref` 解析 sibling enhanced wav、SFT `--speaker-audio` 变可选（默认 = cache medoid，显式传入仍覆盖）；probe 32 项（medoid 手算参考 + 漂移刷新 + missing-key assert）。同日 `reward/metrics.py` 整体并入 `cache.py` 作 `CacheLayout` 方法（reward_config/load_centroid/speaker_ref + 每名 artifact 路径助手；preprocess `Config` 的 6 个重复 property 换成 `layout` 委托——layout 知识单源化，消费方一律复用）
+* 遗留数据点（不阻塞）：原生编码器跨进程位等（E2V2 同）；`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 已入 HF cache（可删可留）；torchaudio 无 sox 仅启动警告无害

@@ -63,12 +63,11 @@ class LoraTrainerModel(ModelWrapper):
         self,
         model_path: str,
         device: str = "cuda:1",
-        dtype: torch.dtype = torch.bfloat16,
         lora_r: int = 16,
         lora_alpha: float = 64,
         rsloRA: bool = True,
     ):
-        super().__init__(model_path, device=device, dtype=dtype)
+        super().__init__(model_path, device=device)
 
         # rsLoRA on the talker MLP (gate/up/down), semantic head stays trainable
         self.lora_modules = self._attach_lora(r=lora_r, alpha=lora_alpha, rsloRA=rsloRA)

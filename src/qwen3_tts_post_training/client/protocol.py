@@ -3,7 +3,7 @@
 Audio crosses as absolute tmpfs paths (/dev/shm); scores come back raw —
 sigmoid/std/lambda composition lives in qwen3_tts_post_training.reward. The
 scorer is calibration-free: it returns raw embeddings, and the caller derives
-similarities against its own centroid (`reward.metrics.load_centroid`).
+similarities against its own centroid (`cache.CacheLayout.load_centroid`).
 Validated with pydantic — no manual json building.
 """
 

@@ -21,12 +21,9 @@ from pathlib import Path
 
 import torch
 
+from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
-from qwen3_tts_post_training.reward.metrics import (
-    load_centroid,
-    reward_config_from_metrics,
-)
 from qwen3_tts_post_training.reward.reward import reward_v3
 from qwen3_tts_post_training.system import (
     current_rss_mb,
@@ -62,7 +59,6 @@ TEXT_POOL = (
 class TrainConfig:
     model_path: str = "/mnt/d/Repository/models/PhiLia093-TTS/"
     device: str = "cuda:1"
-    dtype: str = "bfloat16"
     lora_r: int = 16
     lora_alpha: float = 64
     speaker: str = "cyrene"
@@ -82,10 +78,13 @@ class TrainConfig:
     top_k: int = 50
     sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
 
-    # preprocess cache (§16): REQUIRED — RewardConfig calibration AND the SV
-    # centroid (centroid.npy beside metrics.json) both come from it; sims are
-    # computed locally as vectors @ centroid
-    metrics_path: str | None = None
+    # preprocess cache (§16): the SINGLE source for calibration AND data —
+    # metrics.json (sim stats → RewardConfig) + centroid.npy MUST come from
+    # the same cache dir the training belongs to; an external-metrics path
+    # would allow cross-pool calibration mismatch, so there is no such flag.
+    # REQUIRED: the CLI rejects a missing --cache-dir/--namespace; the None
+    # default exists only for the replace() construction — run_* asserts.
+    cache_dir: str | None = None
 
     variant: str = "dr"
     kl_beta: float = 0.001
@@ -186,7 +185,6 @@ def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
 
 def run_grpo(cfg: TrainConfig | None = None) -> None:
     cfg = cfg or TrainConfig()
-    dtype = getattr(torch, cfg.dtype)
 
     assert Path(cfg.model_path).exists(), (
         f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
@@ -195,7 +193,6 @@ def run_grpo(cfg: TrainConfig | None = None) -> None:
     ttm = LoraTrainerModel(
         cfg.model_path,
         device=cfg.device,
-        dtype=dtype,
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
     )
@@ -239,13 +236,15 @@ def _train_loop(
         kl_beta=cfg.kl_beta,
         num_code_groups=ttm.talker.config.num_code_groups,
     )
-    assert cfg.metrics_path, (
-        "--metrics-path is required: RewardConfig calibration and the SV "
-        "centroid (centroid.npy beside metrics.json) both come from it"
+    assert cfg.cache_dir, (
+        "--cache-dir (or --namespace) is required: metrics.json + centroid.npy "
+        "always come from the SAME cache as the training data — calibration "
+        "from a foreign pool cannot be gated"
     )
-    reward_cfg = reward_config_from_metrics(cfg.metrics_path)
+    layout = CacheLayout(Path(cfg.cache_dir))
+    reward_cfg = layout.reward_config()
     sv_centroid = torch.as_tensor(
-        load_centroid(cfg.metrics_path), dtype=torch.float32, device=cfg.device
+        layout.load_centroid(), dtype=torch.float32, device=cfg.device
     )
     sv_centroid /= sv_centroid.norm()  # mirrors the old scorer set_ref recipe
     pool = _load_text_pool(cfg)
