@@ -522,3 +522,26 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **NamedTuple 化 + 命名收敛（2026-08-28 四稿）**：`DropReasons` dataclass→**NamedTuple**——手写 `to_dict`（连同 `corpus.orphan`/`duration`/`manifest.length` 那层重命名嵌套）删除，metrics.json 的 `dropped` provenance 改 `._asdict()`（stdlib API，扁平 + 字段本名，一次性变形；reward 端无消费者已验证）；probe 属性访问/kwargs 构造零改动。`score_text → collect_corpus_metrics`（返回注解顺手修正为 `dict[str, ScoreResult]`，上轮漏改）；`build_metrics` **内联进 finalize**（scalar 契约的验证随之折叠进 probe 的 finalize 块：sim mean/std 手算参考 + wer/utmos 标量 + 扁平 dropped key 契约，覆盖从「调助手函数」升级为「断言真实 finalize 产物」）。验证：probe 全过；live——首轮 metrics.json 因 dropped 变形重写（dropped=44 tokens/2 seconds，n_clips 1779），次轮起三文件全部字节稳定
 - **metrics 键名对齐（2026-08-29 五稿）**：`wer → cer`、`utmosv2 → mos`（与产出它们的量同名），三者统一 `{mean, std, percentiles(1..99)}` 对齐形状——sim 也补上 percentiles；`clearvoice`/`sv_model` 两个 provenance 键移除（用户裁决：暂时不要）。reward 端零波及（`reward_config_from_metrics` 只读 sim.mean/std，`wer` 键本就无人消费）。验证：probe 标量检查更新（sim percentiles 手算参考 + cer 全零分布逐键相等 + mos mean/中位）；live——首轮 metrics.json 重写（sim 0.8709 / cer 0.0579 / mos 2.6），次轮三文件字节稳定
 - **契约段同步（2026-08-29 六稿，纯文档）**：§16.1–16.4 仍停在 2026-08-27 原始设计（`clearvoice/` 目录名、v1 行 schema、内嵌 centroid、`--metrics` 旗、`sim/sim_camp` 可空、`vector` 字段名）——五轮演进只记在日期 bullet 里，契约段从未跟上，代码侧 grep 证实零残留（全部旧引用都在日期记录内）。重写为现状：§16.1 = v2 输出契约（enhanced/codes/embedding 三目录 + asset v2 行 + centroid.npy + metrics 对齐形状）；§16.2 = 任务表 + 八步 `sync()`（含原始四阶段设计的取代指针）；§16.3 = 字段级按需 + unwrap 终态；§16.4 = 训练侧必填消费。日期记录（§16.5–16.9）一律不动
+## 17. SFT worker `workers/trainer/sft/`（2026-08-29）
+
+**战略位置**：SFT 永远从 base ckpt 出发（`Qwen/Qwen3-TTS-12Hz-{0.6B,1.7B}-Base`，HF repo id 直传自动抓取；已微调的 `PhiLia093` 退役），产出的 custom_voice export 是 GRPO worker 的续训起点。数据 = preprocess cache（`asset.jsonl` + `codes/*.npy`）——codes 的 12Hz token 空间跨模型尺寸同构（codec id 2149/2150/2148/2155/2156/2157 与 vocab 3072/2048 全同；0.6B 上 sem CE 起步 1.08 实证非 OOD）。
+
+### 17.1 结构（薄封装，全部复用已验证内核）
+
+- `model.py`：`SftTrainerModel(ModelWrapper)`——**全量 FT**（talker 全栈含 code_predictor/MTP 头，官方语义；GRPO 冻 predictor 的姿态在此不适用）；冻结仅 `speaker_encoder`（输出 detach 进 slot 6，天然无梯度）。`speech_tokenizer` 是普通包装对象（非 nn.Module），参数本就不在模型树。`load_base_speaker_encoder`：custom_voice ckpt 无 speaker encoder（仅 `tts_model_type == "base"` 时构造）→ 从 base safetensors 惰性抽 `speaker_encoder.*`（`safe_open`，76 张量 strict load）——SFT 从 base 出发时自动跳过
+- speaker 条件：**用户指定一条参考音频**（`--speaker-audio`）→ soundfile 读（stereo→mono）→ librosa 24k 重采样 → 模型自带 `extract_speaker_embedding` → `[hidden]` 向量广播进 slot 6（teacher_forcing 的 spk 查表同路径），启动时提一次全程复用；官方逐条 `ref_mels→speaker_encoder().detach()` 的单说话人退化版
+- `loop.py`：`load_sft_dataset`（asset 行 + codes npy → (text, [T,16] long)，缺 npy 即 assert）→ 每 epoch 种子洗牌切片 → `collate → teacher_forcing → CE`。**loss 单 shift 配对**：`CE(talker_logits, codec_0_labels[:,1:], ignore_index=-100) + 0.3·CE(sub_talker_logits, talker_codec_ids[:,1:])`——官方 `sft_12hz.py` 的 double-shift bug（`inputs_embeds[:, :-1]` + 内部 HF CE 再 shift 一次 → logits@p-2 vs 标签@p+1；`hidden_states[codec_mask[:, :-1]]` 选位 p 的 hidden 泄漏目标）不复现，`outputs.loss` 不可用
+- 超参照抄官方：AdamW lr 2e-5 / wd 0.01 / grad_accum 4 / clip 1.0 + 线性 warmup 10（GRPO 教训：Adam 首步 sign jolt）；`model.train()`；fp32 CE
+- ckpt：**滚动 `latest.pt`**（trainable state_dict + optimizer + 批位 pos；全量 FT 每步编号文件太贵）+ `--resume`（key 集合 assert 防 architecture 漂移）
+- `export_custom_voice`：白名单拷贝（config/generation/preprocessor/tokenizer/vocab/merges + `speech_tokenizer/`）→ config 手术（`tts_model_type=custom_voice` + `spk_id`/`spk_is_dialect` 写入 `--export-name`，已存在复用其 slot，新名分配 max+1）→ safetensors **仅 `talker.*` 键**（与原版 model.safetensors 布局同构；官方脚本存全量 state_dict 反而多键）+ 参考音频 embedding 烘入 `codec_embedding.weight[slot]`；repo id 源经 `snapshot_download` 解析（训练后 cache 命中）
+
+### 17.2 显存账与事故（16GB 卡现实）
+
+- **1.7B 全量 FT + AdamW(bf16) 物理不可行**：1.92B 参数 → params/grads/exp_avg/exp_avg_sq 四份 bf16 = 14.3GiB 地板 > 16GB（官方脚本默认给 ≥24GB 卡，零冻结零 ckpt 零 8bit）；参数分布：28 层 73.5%、text_embedding 311M 16.2%（文本词表已全训，冻结损失最小）、code_predictor 9.1%。裁剪选项（冻 predictor+text_emb ~7GB / 8-bit Adam / Adafactor）已议未行——**先用 0.6B 实验**（用户裁决）
+- 0.6B（906M 参数）实测：B2/accum4 GPU 5.6GB 稳跑；WSL2 **15GB 系统 RAM** 是另一条红线——首轮 smoke 死机复盘 = 中止的工具调用未杀 setsid 重跑进程 + scorer 常驻 3.2GB → 双模型栈系统 OOM（AGENTS「一次一个重实验」再证实）。稳态配方 **B1/accum4**：RAM 3.2GB / GPU 5.6GB / 单步 0.2-0.5s
+
+### 17.3 验证（live smoke @ 0.6B-Base，8 clips 1 epoch）
+
+- `speaker_vec [1024]`（自带 encoder）、trainable 906M；B1 两步 loss 2.49→2.83（sem 1.08→1.46，值域健康）、grad_norm 27-49、lr warmup 2e-6→4e-6
+- 导出产物：custom_voice + `spk_id {cyrene: 3000}`、talker.* 前缀 403 张量、row3000 norm 10.44 vs base 0.015（未训练随机行被烘焙覆盖）
+- **L4 decode sanity**：导出目录直接 `Qwen3TTSModel.from_pretrained` → `generate_custom_voice(speaker='cyrene', language='Auto')` → 4.16s/finite/peak 0.87（~20 字句长合理）

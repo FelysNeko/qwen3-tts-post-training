@@ -5,7 +5,7 @@ GRPO post-training pipeline for Qwen3-TTS CustomVoice. Python 3.12, uv-managed. 
 ## Layout
 
 - `src/qwen3_tts_post_training/` — core lib (pure torch, no model runtime): `reward/reward.py` (reward_v3) + `reward/metrics.py` (preprocess metrics.json → RewardConfig/centroid), `client/` (protocol + trainer/scorer ZMQ clients), `train/grpo.py` (losses). Installed editable into all workers.
-- `workers/trainer/` — GRPO trainer worker (default `cuda:1`). Entry: `workers/trainer/main.py`. Package layout: shared kernels at `src/trainer/` top level (`model.py` = `ModelWrapper` [collate/tokenize_assistant/teacher_forcing/decode 共享核] + `lora.py`)
+- `workers/trainer/` — trainer worker (default `cuda:1`), single entry `workers/trainer/main.py` routed by subcommand: `main.py grpo [...]` / `main.py sft [...]`. Package layout: shared kernels at `src/trainer/` top level (`model.py` = `ModelWrapper` [collate/tokenize_assistant/teacher_forcing/decode 共享核] + `lora.py`); `src/trainer/grpo/` (loop/rollout/logprob/samplers); `src/trainer/sft/` (`model.py` = `SftTrainerModel` full-FT + base-speaker-encoder borrow, `loop.py` = cache→CE loop + rolling ckpt + CustomVoice export). **SFT 从 base ckpt 出发**（HF repo id 可直传，`PhiLia093` 已退役）；GRPO 从管线产出的 custom_voice export 继续。
 - `workers/scorer/` — resident scoring worker (default `cuda:0`): SV + ASR/CER + MOS. Entry: `workers/scorer/main.py`.
 - `workers/preprocess/` — corpus → cache worker (default `cuda:1`, needs the scorer up): filter → enhanced(clearvoice 48k) → codes → embedding over a checksum-guarded task table (`precompute_task_table`; salvage on deterministic regeneration, cascade on real drift); writes `.cache/{lang}/` (`enhanced/*.wav` [the ONLY derived audio — all consumers resample from it on the fly] + `codes/*.npy` + `embedding/*.npy` + `centroid.npy` + `asset.jsonl` + `metrics.json`). Entry: `workers/preprocess/main.py`, stages in `src/preprocess/pipeline.py`. Enhancement = VENDORED MossFormer2_SE_48K (`src/preprocess/clearvoice/`), no `clearvoice` pip dep.
 - Each worker has its own `pyproject.toml` and `.venv`; deps are not unified at the root. Root `.venv` has only torch + ruff.
@@ -17,7 +17,8 @@ uv sync                     # root: installs ruff into .venv
 .venv/bin/ruff check .      # lint (all checks currently pass)
 uv sync                     # inside workers/trainer, workers/scorer or workers/preprocess: worker deps
 workers/scorer/.venv/bin/python workers/scorer/main.py --sv-dir ...  # run scorer (calibration-free; manual, bind-less ZMQ connect to trainer)
-workers/trainer/.venv/bin/python workers/trainer/main.py [args]   # run trainer (binds ZMQ PUSH 5555 / PULL 5556; must be started before or with scorer)
+workers/trainer/.venv/bin/python workers/trainer/main.py grpo [args]   # GRPO (binds ZMQ PUSH 5555 / PULL 5556; must be started before or with scorer)
+workers/trainer/.venv/bin/python workers/trainer/main.py sft --cache-dir .cache/{lang} --speaker-audio ref.wav [args]   # SFT from base ckpt (auto-fetches from HF on first run; full-FT, B1/accum4 fits 16GB at 0.6B)
 workers/preprocess/.venv/bin/python workers/preprocess/main.py --dataset /path/to/{lang} [--limit N]  # corpus -> .cache/{lang} (any resident scorer works — it is calibration-free)
 ```
 
