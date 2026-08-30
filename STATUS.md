@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-08-30（§19 原生 speaker encoder A/B —— 决策 E2V2 维持不变）
+最后更新：2026-08-30（§20 PhiLia 解剖：谱分析 + 过拟合调查 + SFT/GRPO 策略推演——三条路线待拍板）
 
 ## 1. 目标
 
@@ -596,3 +596,50 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 * 原生编码器定位：不采用；至多当"崩坏护栏/交叉监控"，且相对 CAM++ 无明显优势（信号 87% 与 E2V2 冗余、健康组第二意见幅度小）
 * **SFT 条件向量随之定稿（2026-08-30 固化进管线）**：选 medoid **在 E2V2**（唯一听得到通道/质量/韵律差异的空间；原生空间 pairwise 0.976 排名压在窄带里，选 clip 分辨率不足），嵌入**用原生 encoder**（E2V2 192d 进不了 talker slot）——E2V2-medoid 那条 clip 的原生嵌入 vs 原生 centroid 的 cos = 0.9957/0.9951（0.6B/1.7B），数值上是同一向量，选真实 clip 取其 on-manifold + 可听审计 + 与 MD 旧池 medoid 连续（当前增强池 medoid 仍是 `side4_shitang_cyrene_109_f`，mean pairwise 0.8437 / 旧 0.8284）。落地：finalize 写 `medoid` 进 metrics.json（mean-pairwise argmax，空池 assert、n=1 退化为该 clip；mean_pairwise 数值不入册——池内聚度已由 sim 统计承载，无消费者）、`cache.CacheLayout.speaker_ref` 解析 sibling enhanced wav、SFT `--speaker-audio` 变可选（默认 = cache medoid，显式传入仍覆盖）；probe 32 项（medoid 手算参考 + 漂移刷新 + missing-key assert）。同日 `reward/metrics.py` 整体并入 `cache.py` 作 `CacheLayout` 方法（reward_config/load_centroid/speaker_ref + 每名 artifact 路径助手；preprocess `Config` 的 6 个重复 property 换成 `layout` 委托——layout 知识单源化，消费方一律复用）
 * 遗留数据点（不阻塞）：原生编码器跨进程位等（E2V2 同）；`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` 已入 HF cache（可删可留）；torchaudio 无 sox 仅启动警告无害
+
+## 20. PhiLia 解剖：谱分析 + 过拟合调查 + SFT/GRPO 策略推演（2026-08-30）
+
+动机：用户连续追问「漂移这么大是不是过拟合 / 低秩吗 / epoch 降到 1 行不行 / OOD 用非原配女声冻结 subtalker / 全靠 GRPO 拟合 + GT 假装 rollout」。本轮全部用测量回答，暂无代码决策。工件（临时）：`/tmp/opencode/sv_spectrum.py` + `sv_report.json`（267 矩阵 SVD）、`/tmp/opencode/rollout_cer.py` + `rollout_cer.json`（128 rollout 的 ASR CER）、PhiLia 自带 `logging.jsonl`（167 条训练日志）。
+
+### 20.1 谱分析：ΔW（PhiLia − 1.7B-Base）非低秩
+
+- 分母：404 shared 键，267 变化、59 位等（多为 norm），shape 无 mismatch，base_only = `speaker_encoder.*`（base 带原生 encoder、PhiLia 不带——与结构认知一致）
+- **结论：PhiLia 的微调更新是满秩对象**。ΔW r99 中位 919–1939（≈矩阵维度，effectively full-rank）；ΔW e@16 中位仅 4.6–13%（mlp 最扁平 4.6%，cp.lm_head 最高 13.1%）；ΔW stable rank 30–160；σ 谱平坦无主导方向（`layers.14.mlp.down_proj` σ₁=0.0099 → σ₈≈0.0052，e@512 才 51.5%）。W_philia 自身 stable rank 8.6–186、r99 620–1880（预训练权重典型重尾）
+- 含义：**LoRA r=16 无法复现 PhiLia 的 SFT 漂移**（抓 ~5–11% 更新能量，复现需 rank ≈ r99 即 effectively full-rank）——反过来验证官方 SFT 全量 FT 的必然性；**不直接否定 GRPO 的 r=16**（RL 微扰与 SFT 累积漂移不是同类对象，待真实 GRPO run 的曲线裁决：reward 仍涨而 ‖B@A‖_F/‖W‖_F 饱和才是 rank 瓶颈证据）
+
+### 20.2 漂移幅度 = Adam 天花板，不是异常
+
+- 828 步 × lr（cosine 峰 ~4.96e-6 → 2e-6）≈ 每参数累积位移上限 3.2e-3（Adam 每步每参数 ≤ ±lr，m/√v 归一）；实测 maxabs/ceiling 中位 **0.30**、236/267 键 >0.25、mlp gate/up 峰值 **0.83**——梯度方向高度相干（单说话人单域两遍语料，batch 间不抵消，位移 ×steps 线性爬升而非 ×√steps 随机游走）
+- 逐元素 RMS 中位仅 ~3.2e-5：每个分量挪得小，但 Adam 逐元素归一化让 12.6M 分量**各自独立**成高维更新场——「大」是错觉，「散（高秩）」是本质
+- 例外识别：`codec_embedding.weight` maxabs/ceiling = 4882×——非训练漂移，是导出手术把 speaker 向量写进 slot 3000 行的产物
+- TTS 微调漂移大 vs LLM 直觉的成因：初始 CE 3.30 nats（base 对该声音真无知，非 LLM 式近优点微调）+ 数据零多样性（梯度不相消）+ 说话人身份是散布全解码路径的连续细节（slot 向量只是钥匙，talker 全部权重是「钥匙→声学」映射）+ 双 AR 传导（talker 隐状态动 → predictor 输入分布动，PhiLia 里 cp 5 层 + 15 lm_heads 全动）
+
+### 20.3 过拟合三线裁决 + 「续写」真因（用户耳朵纠偏）
+
+- **训练线**：loss 中段平台（后半程 50 步均值仅降 0.012）、token_acc 稳 0.71（epoch 2 见重复数据无冲高 = 无帧级记忆化）、grad_norm 15–25 无塌缩
+- **泛化线**：128 条 novel-text rollout（16 个未见 prompt × 8，scorer ASR 同标定）——叙事组 CER g6=**0.000**、g5=0.004、g15=0.019、g4=0.029，**低于人声语料基线 0.058**（同 ASR 同域）；文本跟随完好
+- **高 CER 组解构**：g8（0.62，拟声「齁噢噢」）、g12/g14（0.26–0.27，绕口令）属 ASR 困难材料；g3（0.62）音长 25.5s vs 文本 ~10s——最初误判「即兴续写」，**用户听后纠偏：是退化生成**——尾句短语复读循环（「就在梦里…你也会回来的，对不对？」×3、prompt 本体重来一次）+ 背诵作者完整训练集的台词（银河猫猫侠 idle 对白；grep 证实全部不在我们 1779 条 cache——作者语料是我们子集的超集）
+- **机制**：裸文本 prompt 无边界 → 无 EOS 决策 → AR 越过文本后落回高先验已背材料 + 短语循环；rollout 契约 pin `repetition_penalty=None`（logprob 重建无状态所需）+ T0.9/top-k50 放大循环固化。g6 等叙事句精确停住（6.3–7.0s）证明「读完就停」的能力在，是**边界判定**问题不是能力损伤
+- **结论**：漂移大 ≠ 过拟合；内容级记忆存在但只在无边界提示下暴露（CE 平台 ≠ 内容没背下，2 epoch 足够背「说了什么」）；对 RL 管线 = runaway/needs_resample 样本来源，对 serving = 必须官方 prompt 模板 + rep_penalty 1.05
+- 音频证据：`probes/native_embedding/rollouts/`（`g{gi}_{k}.wav` 无补零；g3_3/g3_0 25.5s、g6_0 6.3s 对照）
+
+### 20.4 1.7B 全量 SFT 显存账（本机）
+
+- 参数量实测：0.6B = 0.91B/1.83GB；1.7B 系 = 1.92B/3.83GB（bf16）。纯 bf16 训练（torch AdamW 状态继承参数 dtype，无 fp32 master）固定开销 = weights+grads+m+v = 4×参数量×2B：0.6B = **6.77 GiB**，1.7B = **14.31 GiB**
+- **cuda:0（12G）：1.7B 全量 FT 不可能**（固定 14.31 > 可用 ~11.5）；**cuda:1（16G）：B1+grad-accum 可行但薄**（可用 ~15.5 GiB，14.31 + tokenizer/speaker_encoder 驻留 + B1 激活（hidden 2048、T~500 很小）≈ 14.8–15.3，余量 ~1 GiB，碎片化是主要敌人）；**0.6B 宽裕**（余量近半）
+- 存在性证明：PhiLia `logging.jsonl` `memory(GiB)=15.96` @ B4——同配方（纯 bf16 + torch AdamW）在更大卡上跑通；其 bf16 Adam 收敛曲线健康 = 该规模实证可行。ckpt 落盘先 `.to("cpu")` 无 GPU 尖峰
+- 待办：3 分钟探针（加载 1.7B SftTrainerModel → AdamW → 一次 teacher-forcing fwd/bwd @ B1 → 读 `max_memory_allocated`）把算术变测量值；bitsandbytes 未装（8-bit AdamW 可再省 ~6 GiB，连 12G 卡都能跑，属后备）
+- **决策点**：1-epoch A/B 用 0.6B 先探路还是直接 1.7B？
+
+### 20.5 三条悬而未决的路线（全部待拍板，未写码）
+
+1. **epoch 1 A/B**：epoch 2 几乎零收益（loss −0.012）且有内容记忆代价 → 1 epoch 值得试；但 epoch 数与 cosine 绑定（414 步天花板减半，音色特化充足性未知，E2V2 sim 才测得出）；lr 要有意识定——PhiLia 实证峰 ~5e-6 vs 我们继承官方 2e-5（1 epoch 下位移上限 = PhiLia 总漂移 2.6 倍，激进）。跑法：只跑 1-epoch 臂（PhiLia = 2-epoch 臂现成），评估链 = novel-text CER（叙事组）+ t_max/失控率 + 背诵检测器（ASR 转写与语料 n-gram 重叠）+ E2V2 sim + 耳朵
+2. **OOD（非原配女声 + 冻结 subtalker 只调 talker）**：机制一行可行（GRPO 有冻结先例），但 (a) predictor「冻结 ≠ 不受影响」（talker 隐状态移动改变其输入分布），(b) talker 出的 codebook 0 携带韵律 → 代打数据会污染（同女声或可接受），(c) **目标歧义未解**：(i) 跨 vec 迁移给 Cyrene（「vec 无关内容能力」假设未验证）vs (ii) 造辅助音色（干净但产物是另一个声音）；更轻的替代：官方模板 + rep_penalty 先修边界病，base 模型路由 OOD 内容
+3. **GRPO + GT**：「GT 混进 rollout group 假装是其 rollout」机制全通（codes 无辜、scorer 走 enhanced wav 路径、GT 长度 < token_budget；centroid 恰为 GT 池均值 → GT 的 r_sv ≈ sigmoid(0)=0.5，不会碾压 group——标定巧合反而利好稳定），**但「全靠 GRPO 从头拟合」不成立**（advantage 缩水的模仿信号比 CE 弱几个量级 + off-policy 偏差 + 把背诵病搬进 RL）。同意图的干净形式 = **混合目标 `L = L_GRPO + λ·L_CE(GT codes)`**：有正统先例（InstructGPT PPO 混预训练 CE 防漂移 λ≈9.75、RRHF reward 加权 NLL、RAFT/ReST-EM、SLiC-HF），现代 RL 框架的 SFT-anchor 标准开关；我们数据切分白送「CE 锚在语料文本、RL 探索在 pool 文本」的分离；λ 按梯度范数配平起步，背诵检测器盯梢；predictor 冻结与否与此正交
+
+## 21. cache_dir/namespace 解耦：trainer 双字段 + preprocess 免疫（2026-08-30）
+
+- **动因（用户纠偏）**：旧 trainer CLI 把 `--namespace` 当固定根下的"简写"、与 `--cache-dir`（池完整路径）互斥；config 只持有解析后的字符串，表达不了"哪个池"。第一版实现（cache.py 里的互斥 resolver）当场被否——**cache_dir 与 namespace 是正交的**：cache_dir = `.cache` 根**位置**，namespace = 池名，池 = `{cache_dir}/{namespace}`，可独立组合。resolver 已删，cache.py 保持纯 layout。
+- **trainer 侧（解耦落地，用户三轮纠偏后定稿）**：`TrainConfig` / `SftConfig` 持 `cache_dir`（根，默认 `<repo>/.cache`）+ `namespace` 双字段；**`namespace` 无默认必填（`namespace: str` 置于类首，类型即约束）**，无 accessor——`run_grpo`/`run_sft` 调用点直拼 `CacheLayout(Path(cfg.cache_dir) / cfg.namespace)` 一次。CLI：`--namespace` 用 argparse 原生 `required=True`，kwargs 直灌 `SftConfig(**overrides)` / `TrainConfig(**overrides)`（`replace` 桥与 `cfg = cfg or Config()` 默认实例随之删除，存在性不前移——池缺失由 `run_*` 内 layout 加载自然报错）；`--cache-dir` 语义为 cache 根。
+- **preprocess 侧（两轮纠偏后定稿）**：**namespace 不是 preprocess 的概念**——语料是任意路径的输入目录，池名 = `{dataset.name}` 是固有行为，无需字段承载。CLI = `--dataset`（必填）+ `--cache-dir`（根语义，由 `--cache-root` 更名，默认 `<repo>/.cache`）；`run_pipeline(dataset, cache_root, ...)` 内部 `Config(cache_dir=cache_root / dataset.name)`，preprocess `Config` 与全包代码不出现 namespace 字样。
+- **验证**：ruff 全绿；probe_preprocess PASS；config 冒烟 = `SftConfig(namespace="Chinese(PRC)").layout` 解析到真实池 + `reward_config` 0.8709/0.0880、`TrainConfig(cache_dir="/x", namespace=...)` 拼接正确、缺 namespace 双 config assert；CLI 错误路径（缺 `--namespace` / 池不存在）实测报错；preprocess 真实路径冒烟 + `--help`。

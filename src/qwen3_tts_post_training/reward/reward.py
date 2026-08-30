@@ -2,7 +2,9 @@
 
     R = λ_sv·r_sv + λ_wer·r_wer + λ_mos·r_mos   (RAW magnitudes, no std division)
 
-- r_sv  = sigmoid((sim_e2v2 − 0.8585)/0.0966)      (E2V2 speaker sim, unit-normalized)
+- r_sv  = sigmoid((sim_e2v2 − sv_center)/sv_scale)  (sv_center/sv_scale from
+  the pool's metrics.json via cache.CacheLayout.reward_config — the 0.8585/
+  0.0966 playground pair is retired; E2V2 speaker sim, unit-normalized)
 - r_wer = 1 − CER_qwen3asr                          (normalize() + edit-distance CER)
 - r_mos = max(0, 2.5 − mos_utmosv2fold0)            (hinge 护栏, 线性地板: 只挡不驱动)
 - Every term 熄火 (zeroed) when its within-group std drops below its

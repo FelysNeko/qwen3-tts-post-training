@@ -1,13 +1,16 @@
-"""GRPO training loop (Phase 4): one group per optimizer step, end to end.
+"""GRPO training loop: `num_prompts` distinct prompts × `group_size` rollouts
+per step (Fish-Audio S2 layout), one optimizer update per step.
 
-Pipeline per step (B=1, update after each group):
-    prompts → rollout (sample → decode → wav) → scorer → reward_v3 →
-    needs_resample? (skip) → compute_ref/compute_policy → grpo_loss →
-    backward → grad clip → optimizer step → monitor line → ckpt.
+Pipeline per step:
+    prompts → rollout (sample → decode → wav) → scorer (ZMQ PUSH/PULL) →
+    reward_v3 → needs_resample? (skip) → compute_ref/compute_policy →
+    grpo_loss → backward (per-group accumulation, equal group weighting) →
+    grad clip → optimizer step → monitor line → ckpt.
 
 The reference policy is the same weights with LoRA adapters disabled
-(LoraTrainerModel.set_adapter), so only one model lives in VRAM. Ckpts carry the
-LoRA deltas + semantic head + optimizer state so `--resume` continues cleanly.
+(LoraTrainerModel.set_adapter), so only one model lives in VRAM. Ckpts carry
+the LoRA deltas + codec head + optimizer state so `--resume` continues
+cleanly.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import torch
 from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
+from qwen3_tts_post_training.paths import repo_root
 from qwen3_tts_post_training.reward.reward import reward_v3
 from qwen3_tts_post_training.system import (
     current_rss_mb,
@@ -57,6 +61,19 @@ TEXT_POOL = (
 
 @dataclass
 class TrainConfig:
+    # The pool selector — REQUIRED, no default: the pool dir is
+    # {cache_dir}/{namespace}. The CLI enforces --namespace; a programmatic
+    # caller must name its pool explicitly.
+    namespace: str
+
+    # §16: the preprocess cache is the SINGLE source for calibration AND
+    # data — metrics.json (sim stats → RewardConfig) + centroid.npy MUST
+    # come from the same cache dir the training belongs to; an
+    # external-metrics path would allow cross-pool calibration mismatch, so
+    # there is no such flag. cache_dir = cache ROOT location (default
+    # <repo>/.cache).
+    cache_dir: str = str(repo_root() / ".cache")
+
     model_path: str = "/mnt/d/Repository/models/PhiLia093-TTS/"
     device: str = "cuda:1"
     lora_r: int = 16
@@ -76,15 +93,7 @@ class TrainConfig:
 
     temperature: float = 0.9
     top_k: int = 50
-    sampler_impl: str = "hf"  # hf | fast | compiled (PROJECT_STATUS §9)
-
-    # preprocess cache (§16): the SINGLE source for calibration AND data —
-    # metrics.json (sim stats → RewardConfig) + centroid.npy MUST come from
-    # the same cache dir the training belongs to; an external-metrics path
-    # would allow cross-pool calibration mismatch, so there is no such flag.
-    # REQUIRED: the CLI rejects a missing --cache-dir/--namespace; the None
-    # default exists only for the replace() construction — run_* asserts.
-    cache_dir: str | None = None
+    sampler_impl: str = "hf"  # hf | fast | compiled | graphed (PROJECT_STATUS §9)
 
     variant: str = "dr"
     kl_beta: float = 0.001
@@ -135,7 +144,7 @@ def _cleanup_wavs(wav_paths: list[Path]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ckpt (LoRA deltas + semantic head + optimizer) with resume support
+# ckpt (LoRA deltas + codec head + optimizer) with resume support
 # ---------------------------------------------------------------------------
 
 
@@ -183,8 +192,7 @@ def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
 # ---------------------------------------------------------------------------
 
 
-def run_grpo(cfg: TrainConfig | None = None) -> None:
-    cfg = cfg or TrainConfig()
+def run_grpo(cfg: TrainConfig) -> None:
 
     assert Path(cfg.model_path).exists(), (
         f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
@@ -236,12 +244,7 @@ def _train_loop(
         kl_beta=cfg.kl_beta,
         num_code_groups=ttm.talker.config.num_code_groups,
     )
-    assert cfg.cache_dir, (
-        "--cache-dir (or --namespace) is required: metrics.json + centroid.npy "
-        "always come from the SAME cache as the training data — calibration "
-        "from a foreign pool cannot be gated"
-    )
-    layout = CacheLayout(Path(cfg.cache_dir))
+    layout = CacheLayout(Path(cfg.cache_dir) / cfg.namespace)
     reward_cfg = layout.reward_config()
     sv_centroid = torch.as_tensor(
         layout.load_centroid(), dtype=torch.float32, device=cfg.device
@@ -259,11 +262,11 @@ def _train_loop(
         gs = cfg.group_size
         skips: dict[str, int] = {}
 
-        # ---- phase 1: rollout + async push (PUSH/PULL batch pipeline) ----
-        # Zero-thread pipeline: rollout in trainer, scoring in scorer process.
-        # Trainer pushes each group's 8 wavs via ZMQ PUSH (40B path, HWM 1000, non-blocking);
-        # scorer PULLs and scores in parallel while trainer continues rollout.
-        # Stage 1: for gi push; Stage 2: for gi pull. Wall = max(rollouts, scores)+tail.
+        # ---- phase 1: rollout + push (zero-thread ZMQ batch pipeline) ----
+        # Trainer rolls out group by group and PUSHes each group's wavs
+        # (non-blocking, HWM 1000); the scorer drains and scores in parallel
+        # while the trainer continues. Phase 2 drains the PULL side — wall
+        # time ≈ n_rollouts × rollout + last score.
         t_roll0 = time.monotonic()
         pending: list[tuple[dict, int]] = []  # (group, req_id)
         for gi, prompt in enumerate(prompts):

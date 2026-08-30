@@ -1,8 +1,11 @@
-"""Preprocess worker entrypoint — corpus → `.cache/{lang}`.
+"""Preprocess worker entrypoint — corpus → `.cache/{dataset.name}`.
 
 Usage (any resident scorer worker — it is calibration-free):
     workers/preprocess/.venv/bin/python workers/preprocess/main.py \
       --dataset /path/to/corpus/Chinese(PRC)
+
+The corpus wav dir is the input (sibling `{dataset.name}.jsonl` provides
+{name, text}); the pool lands at `{cache-dir}/{dataset.name}`.
 
 Four checksum-guarded stages (see preprocess/pipeline.py): filter →
 enhanced(clearvoice 48k) → codes → embedding. The enhanced 48k output is
@@ -30,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=Path,
         required=True,
-        help="wav dir; sibling {dir.name}.jsonl provides {name, text}",
+        help="corpus wav dir; sibling {dir.name}.jsonl provides {name, text}",
     )
     ap.add_argument(
         "--model-path",
@@ -39,10 +42,10 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument(
-        "--cache-root",
+        "--cache-dir",
         type=Path,
         default=repo_root() / ".cache",
-        help="cache root; artifacts land at {cache-root}/{dataset.name}/",
+        help="cache ROOT location; the pool is {cache-dir}/{dataset.name}",
     )
     ap.add_argument("--min-tokens", type=int, default=2)
     ap.add_argument("--min-seconds", type=float, default=0.1)
@@ -99,7 +102,7 @@ def main() -> None:
     try:
         out = run_pipeline(
             dataset=args.dataset,
-            cache_root=args.cache_root,
+            cache_root=args.cache_dir,
             tokenize_text=tokenize_text,
             speech_tokenizer=speech_tokenizer,
             client=client,

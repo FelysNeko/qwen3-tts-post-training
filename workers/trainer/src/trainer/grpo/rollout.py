@@ -3,7 +3,8 @@
 Rollouts run under the current policy (LoRA adapters enabled). Each group is
 seeded via torch.manual_seed so identical (prompts, seed) reproduce the same
 codes. Wavs go to a per-run tmpfs dir under /dev/shm — the scorer reads them
-by path, and the OS reclaims them when the process exits.
+by path, and the trainer unlinks each group's wavs after scoring (an atexit
+sweep catches leftovers from crashed runs).
 """
 
 from __future__ import annotations

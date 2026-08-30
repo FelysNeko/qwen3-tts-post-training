@@ -3,8 +3,9 @@
 `ModelWrapper` owns ckpt loading, the backend-agnostic forward path
 (`teacher_forcing`) and the optimizer interface (`trainable_parameters`);
 parameter assembly is left to subclasses — `LoraTrainerModel` (GRPO, adapter
-on/off on one weight set) and a future SFT full-FT variant (every param
-unfrozen). Both backends share the full (texts, codes) → loss chain:
+on/off on one weight set) and `SftTrainerModel` (SFT full-FT, every
+generative param unfrozen). Both backends share the full (texts, codes) →
+loss chain:
 
     tokenize_assistant / collate / teacher_forcing
 
@@ -119,8 +120,8 @@ class ModelWrapper:
     ) -> CollateBatch:
         """(texts, codes) → official-layout batch on the model device.
 
-        Shared by BOTH backends (GRPO logprob reconstruction and the future
-        SFT on-the-fly path). Codes are cloned so an inference-mode rollout
+        Shared by BOTH backends (GRPO logprob reconstruction and the SFT
+        training loop). Codes are cloned so an inference-mode rollout
         tensor can enter the policy backward graph; text goes through the
         official trailing-special drop (`[:-5]`).
 

@@ -40,7 +40,7 @@ moves the talker's hidden states (LoRA + codec_head live there) while the
 frozen code predictor conditions on them — so even frozen-weight predictor
 likelihoods shift between policy and reference. An IS ratio / KL limited to
 codebook 0 under-corrects the policy movement and assigns no credit through
-codebooks 1..15. Predictor WEIGHTS stay frozen (MTP γ=0 unchanged); only the
+codebooks 1..15. Predictor WEIGHTS stay frozen at any γ; only the
 training signal coverage changes.
 
 Sampling-consistency (MD §7 缺口 #3, revised after C1v10): logits are divided

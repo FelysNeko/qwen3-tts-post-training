@@ -1,4 +1,5 @@
-"""Corpus → `.cache/{lang}` preprocessing: checksum-checked per-stage caches.
+"""Corpus → `.cache/{dataset.name}` preprocessing: checksum-checked per-stage
+caches.
 
     filter → corpus → enhanced → codes → embedding
 
@@ -101,7 +102,7 @@ PERCENTILES = (1, 5, 25, 50, 75, 95, 99)
 @dataclass(frozen=True)
 class Config:
     corpus_dir: Path
-    cache_dir: Path  # per-corpus dir (.cache/{lang})
+    cache_dir: Path  # pool dir ({cache-dir}/{dataset.name})
     min_seconds: float = 0.1
     min_tokens: int = 2
 

@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-from dataclasses import replace
 
 from trainer.grpo.loop import TrainConfig, run_grpo
 from trainer.sft.loop import SftConfig, run_sft
-
-from qwen3_tts_post_training.paths import repo_root
 
 
 def main() -> None:
@@ -20,11 +17,17 @@ def main() -> None:
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--model-path", type=str)
     shared.add_argument("--device", type=str)
-    shared.add_argument("--cache-dir", type=str)
+    shared.add_argument(
+        "--cache-dir",
+        type=str,
+        help="cache ROOT location (default <repo>/.cache); the pool is "
+        "{cache-dir}/{namespace}",
+    )
     shared.add_argument(
         "--namespace",
         type=str,
-        help="cache selector: <repo>/.cache/{namespace} (e.g. Chinese(PRC))",
+        required=True,
+        help="pool selector under the cache root (e.g. Chinese(PRC))",
     )
     shared.add_argument("--lr", type=float)
     shared.add_argument("--warmup-steps", type=int)
@@ -69,29 +72,17 @@ def main() -> None:
     grpo.add_argument("--scorer-timeout", type=float, default=None)
 
     args = parser.parse_args()
-    # --namespace = --cache-dir 的简写（<repo>/.cache/{namespace}，与
-    # preprocess 的默认 cache-root 对齐）；显式 --cache-dir 与之互斥；
-    # 两者皆缺在此直接拒绝，不溜到 run_* 的 assert
-    if args.namespace is not None:
-        if args.cache_dir is not None:
-            parser.error("--namespace and --cache-dir are mutually exclusive")
-        cache = repo_root() / ".cache" / args.namespace
-        if not cache.is_dir():
-            parser.error(f"cache dir not found: {cache}")
-        args.cache_dir = str(cache)
-    elif args.cache_dir is None:
-        parser.error("--cache-dir (or --namespace) is required")
-    # CLI 覆盖（未给的键 = None → 落回各分支 dataclass 的默认值）
+    # CLI kwargs 直灌（--namespace required=True 保证在场；未给的键 = None
+    # 已过滤 → 落回 dataclass 默认值）
     overrides = {
         key: value
         for key, value in vars(args).items()
-        if key not in ("command", "namespace") and value is not None
+        if key != "command" and value is not None
     }
-
     if args.command == "sft":
-        run_sft(replace(SftConfig(), **overrides))
+        run_sft(SftConfig(**overrides))
     else:
-        run_grpo(replace(TrainConfig(), **overrides))
+        run_grpo(TrainConfig(**overrides))
 
 
 if __name__ == "__main__":

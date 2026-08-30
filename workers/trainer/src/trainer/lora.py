@@ -1,9 +1,10 @@
 """LoRA trainer model (GRPO backend): rsLoRA on the talker MLP + trainable
-semantic head; the reference policy is the SAME weights with adapters disabled
+codec head; the reference policy is the SAME weights with adapters disabled
 (no second model in VRAM).
 
-Design (MD §7 决策 3): rsLoRA r=16, α=64, MLP-only. MTP γ=0 → the code
-predictor (sub-talker) + small_to_mtp_projection stay frozen; only
+Design (MD §7 决策 3): rsLoRA r=16, α=64, MLP-only. The code predictor
+(sub-talker) + small_to_mtp_projection stay FROZEN at any MTP γ — γ only
+re-weights the loss/KL on the packed codebook-1..15 columns; only
 `talker.codec_head` + the LoRA deltas train.
 """
 
@@ -69,7 +70,7 @@ class LoraTrainerModel(ModelWrapper):
     ):
         super().__init__(model_path, device=device)
 
-        # rsLoRA on the talker MLP (gate/up/down), semantic head stays trainable
+        # rsLoRA on the talker MLP (gate/up/down), codec_head stays trainable
         self.lora_modules = self._attach_lora(r=lora_r, alpha=lora_alpha, rsloRA=rsloRA)
         self.codec_head = self.talker.codec_head
         self._freeze_non_trainable()

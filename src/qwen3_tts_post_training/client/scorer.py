@@ -1,7 +1,8 @@
 """Scorer-side ZMQ worker client (mirror of trainer Client).
 
 Trainer binds PUSH/PULL; this worker connects PULL/PUSH.
-Encapsulates the connect block so serve.py has no raw zmq boilerplate.
+Encapsulates the connect block so the scorer entrypoint has no raw zmq
+boilerplate.
 """
 
 from __future__ import annotations

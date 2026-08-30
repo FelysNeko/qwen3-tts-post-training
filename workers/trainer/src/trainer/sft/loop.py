@@ -1,4 +1,4 @@
-"""SFT training loop over the preprocess cache (`.cache/{lang}/`).
+"""SFT training loop over the preprocess cache (`.cache/{namespace}/`).
 
 Posture: SFT ALWAYS starts from a base ckpt (0.6B/1.7B — the finetuned
 PhiLia093 ckpt is retired) and `export_custom_voice` turns the result into a
@@ -47,6 +47,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 from qwen3_tts_post_training.cache import CacheLayout
+from qwen3_tts_post_training.paths import repo_root
 from qwen3_tts_post_training.system import gpu_allocated_mb, peak_rss_mb
 from trainer.sft.model import (
     SftTrainerModel,
@@ -58,6 +59,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SftConfig:
+    # The pool selector — REQUIRED, no default: the pool dir is
+    # {cache_dir}/{namespace}. The CLI enforces --namespace; a programmatic
+    # caller must name its pool explicitly.
+    namespace: str
+
     # SFT starts ONLY from a base ckpt (asserted after load: base models
     # ship the in-model speaker encoder, custom_voice ckpts carry none) —
     # the finetuned PhiLia093 ckpt is retired; GRPO continues from
@@ -65,11 +71,8 @@ class SftConfig:
     model_path: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     device: str = "cuda:1"
 
-    # .cache/{lang}/ — REQUIRED. The None default exists only because the
-    # CLI bridge constructs a default instance first (replace()); the CLI
-    # rejects a missing flag and run_* asserts for direct-construction
-    # callers — no code path may consume cfg.cache_dir == None.
-    cache_dir: str | None = None
+    # cache_dir = the cache ROOT location (default <repo>/.cache).
+    cache_dir: str = str(repo_root() / ".cache")
     # Reference wav → speaker embedding. None (default) = the cache's
     # metrics.json `medoid` clip (pool ERes2NetV2 medoid, STATUS §19.4);
     # an explicit path overrides.
@@ -224,11 +227,9 @@ def _assert_model_available(model_path: str) -> None:
         )
 
 
-def run_sft(cfg: SftConfig | None = None) -> None:
-    cfg = cfg or SftConfig()
+def run_sft(cfg: SftConfig) -> None:
     _assert_model_available(cfg.model_path)
-    assert cfg.cache_dir, "--cache-dir is required (a .cache/{lang}/ preprocess output)"
-    layout = CacheLayout(Path(cfg.cache_dir))
+    layout = CacheLayout(Path(cfg.cache_dir) / cfg.namespace)
     if cfg.speaker_audio is None:
         cfg.speaker_audio = str(layout.speaker_ref())
         logger.info(f"speaker audio: {cfg.speaker_audio} (cache medoid)")
