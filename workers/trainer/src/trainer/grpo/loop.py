@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import resource
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +28,13 @@ from qwen3_tts_post_training.reward.metrics import (
     reward_config_from_metrics,
 )
 from qwen3_tts_post_training.reward.reward import reward_v3
-from qwen3_tts_post_training.train.grpo import GRPOConfig, grpo_loss, needs_resample
+from qwen3_tts_post_training.system import (
+    current_rss_mb,
+    gpu_allocated_mb,
+    gpu_reserved_mb,
+    peak_rss_mb,
+)
+from trainer.grpo.grpo import GRPOConfig, grpo_loss, needs_resample
 from trainer.grpo.logprob import LogProbComputer
 from trainer.grpo.rollout import rollout_group
 from trainer.grpo.samplers.base import Sampler
@@ -104,15 +109,6 @@ def _load_text_pool(cfg: TrainConfig) -> list[str]:
     if cfg.text_pool_path is None:
         return list(cfg.text_pool)
     return [line.strip() for line in Path(cfg.text_pool_path).read_text().splitlines()]
-
-
-def _current_rss_mb() -> int:
-    """Current resident set size of this process (MB), from /proc."""
-    try:
-        with open("/proc/self/statm") as f:
-            return int(f.read().split()[1]) * 4096 // 2**20
-    except OSError:
-        return -1
 
 
 def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
@@ -450,10 +446,10 @@ def _train_loop(
             "t_score": round(t_score, 2),
             "t_train": round(t_train, 2),
             "t_opt": round(t_opt, 2),
-            "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
-            "rss_cur_mb": _current_rss_mb(),
-            "gpu_alloc_mb": round(torch.cuda.memory_allocated(cfg.device) / 2**20, 1),
-            "gpu_reserved_mb": round(torch.cuda.memory_reserved(cfg.device) / 2**20, 1),
+            "rss_mb": peak_rss_mb(),
+            "rss_cur_mb": current_rss_mb(),
+            "gpu_alloc_mb": gpu_allocated_mb(cfg.device),
+            "gpu_reserved_mb": gpu_reserved_mb(cfg.device),
             "dur_s": round(time.monotonic() - t0, 2),
         }
         line = json.dumps(monitor, ensure_ascii=False)

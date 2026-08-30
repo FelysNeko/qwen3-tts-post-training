@@ -87,14 +87,14 @@ GRPO 超参（`TrainConfig` / `GRPOConfig` / `RewardConfig`，与 MD §七 表�
 
 ```sh
 # 下载完成后
-workers/trainer/.venv/bin/python workers/trainer/main.py \
+workers/trainer/.venv/bin/python workers/trainer/main.py grpo \
   --model-path /mnt/d/Repository/models/PhiLia093-TTS/ \
   --text-pool-path /home/felys/workspace/playground/cyrene_sft_chs_pool.txt \
   --num-steps N --seed 0
 ```
 
 - trainer 默认 `cuda:1`（5070Ti），scorer 默认 `cuda:0`（4070S）。
-- 环境变量：`Q3TTS_ROOT`（repo 根）、`Q3TTS_PLAYGROUND`（SV 资产目录，默认 repo 兄弟 playground）。
+- 无 `Q3TTS_*` 环境变量（曾在此声称的 `Q3TTS_ROOT`/`Q3TTS_PLAYGROUND` 系陈旧信息，2026-08-27 核实不存在）。
 - 校验：`uv sync`（root）→ `.venv/bin/ruff check .`。
 
 ## 7. 未完成事项（源自 SV_REWARD_FINDINGS.md §六/§七/§八，按优先级）
@@ -123,7 +123,7 @@ workers/trainer/.venv/bin/python workers/trainer/main.py \
 - [ ] **instruct 数据构建 + swift 模板 user 轮 patch**（§六，已定方向，GRPO 后做）；GRPO 训练期间禁用 instruct（本轮实验提供声学佐证，见 §10 附）。
 - [ ] **`build_sv_reward.py` 的 `--min-sim` / 说话人过滤参数**（§六）：26 条半语音仍在池。
 - [ ] **playground.ipynb 分布图重跑**（§六，现指旧池）。
-- [ ] **assets/ 物理迁移**（§八 迁移清单）：SV 池 npy/json、testzip 166 对、bake-off json 仍留在 playground，经 `Q3TTS_PLAYGROUND` 引用；`normalize()/cer()` 已迁入 core lib `reward/text.py`。
+- [ ] **assets/ 物理迁移**（§八 迁移清单）：SV 池 npy/json、testzip 166 对、bake-off json 仍留在 playground（repo 兄弟目录，无环境变量机制——`Q3TTS_*` 已确认不存在）；`normalize()/cer()` 已迁入 core lib `reward/text.py`。
 - [ ] **gvr.py 全量验证脚本本体**未迁入（scorer 常驻服务已就绪，打分调度逻辑等价，但 GVR 入口脚本未搬）。
 
 ## 8. 与设计文档的差异/发现（已核对实现）
@@ -348,7 +348,7 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 * `trainer bind PUSH 5555 + PULL 5556`（`client.py:38`），`scorer connect` 两个 `PULL/PUSH`（`serve.py:45`），`pyzmq 27.2` 双 `worker` 独 `venv`，`JSON` 单帧，`HWM 1000 LINGER 0`，`64 wav 2.5KB` 远不堵。
 * **零线程批量**：`loop.py:228` `for gi 8 push (send_score 8 wav)` 非阻塞（`scorer T=1` 即算）→ `for gi 8 pull (recv_score Poller 600s)` 排水；`ZMQ` 缓冲即 `rollout ∥ score`，`wall = 8*rollout + last_score`（`204s→173s` 省 `30s`），保序单 `scorer` 无需 `id` 排序。
 * **删档**：`scorer read-only never unlink`，`trainer recv 后 _cleanup_wavs` 删 `8 wav + rmdir`（`loop.py:117`），`B8` 峰 `64 wav 46MB → 0` 收敛。
-* **双起**：无 `Popen`，`manual` 分别 `terminal` 起：`workers/scorer/.venv/bin/python main.py --sv-dir ...` 后 `workers/trainer/.venv/bin/python main.py`；`ZMQ` 自动重连，无序亦可。
+* **双起**：无 `Popen`，`manual` 分别 `terminal` 起：`workers/scorer/.venv/bin/python workers/scorer/main.py --sv-dir ...` 后 `workers/trainer/.venv/bin/python workers/trainer/main.py grpo ...`；`ZMQ` 自动重连，无序亦可。
 
 **验证**：`dummy scorer` `3×8 wav` `push 3 → pull 3` 保序 `id` 对齐 `PASS`（`pyzmq` 27.2），`graphed/fast` 仍 `B8 512` 安全。
 
@@ -545,3 +545,23 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - `speaker_vec [1024]`（自带 encoder）、trainable 906M；B1 两步 loss 2.49→2.83（sem 1.08→1.46，值域健康）、grad_norm 27-49、lr warmup 2e-6→4e-6
 - 导出产物：custom_voice + `spk_id {cyrene: 3000}`、talker.* 前缀 403 张量、row3000 norm 10.44 vs base 0.015（未训练随机行被烘焙覆盖）
 - **L4 decode sanity**：导出目录直接 `Qwen3TTSModel.from_pretrained` → `generate_custom_voice(speaker='cyrene', language='Auto')` → 4.16s/finite/peak 0.87（~20 字句长合理）
+
+## 18. 入口收敛 + 日志系统 + 系统指标收敛（2026-08-29）
+
+### 18.1 trainer 单入口（`main.py grpo|sft`）
+
+- `sft_main.py` 已删，路由 = `main.py` 子命令（`dest="command", required=True`）。argparse 风格（用户定稿）：共享参数（model-path/device/dtype/lr/warmup-steps/weight-decay/grad-clip/seed/out-dir/ckpt-every + `--resume`）声明一次挂 `shared = argparse.ArgumentParser(add_help=False)`，经 `parents=[shared]` 装到两个子命令——**必须挂子解析器**：直接挂根解析器的话共享参数只能写在子命令之前（`main.py sft --lr x` 会 unrecognized）；子命令特有参数裸 `add_argument`，无 help 字符串
+- CLI→Config 合并 = `dataclasses.replace(SftConfig()/TrainConfig(), **overrides)`，`overrides` = `vars(args)` 里非 None 键（None = 未给 → 落回各分支 dataclass 默认；两边 model_path/lr 默认不同必须经 None 回落保留；`is not None` 判断使 `--seed 0` 等 falsy 值正确穿透）。实测双分支覆盖 + 回落全过
+
+### 18.2 日志系统（print → logging）
+
+- 全仓 33 处 print → 模块级 `logger = logging.getLogger(__name__)`；三个入口 `main()` 加 `logging.basicConfig(level=INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")`（不配 handler 则 INFO 全静默——lastResort 只放 WARNING+）
+- 消息纪律（用户要求）：**日志里无 `[tag]` 前缀、无 JSON**——来源由 `%(name)s` 承担；GRPO 4 处 skip/guard（scorer send/recv 失败、no_trainable_group、all_losses_nonfinite）= `warning` 级人话行；per-step monitor 行 = `step N | M groups, K skipped | loss ... (policy ..., kl ...) | grad ... lr ... | R ... | r_sv ... | sim ... | Ds` 一行
+- **文件格式不动**：`monitor.jsonl`（grpo/sft）与 asset.jsonl 写入保持 JSON 原文（pipeline.py 两处 `print(..., file=...)` 是写文件不是日志，未转换）；`flush=True` 参数随 print 消失（StreamHandler 每条自动 flush）
+- 零改动区：tqdm 4 循环（无 print 在循环体内）、vendored 三棵树
+
+### 18.3 sys.path hack 清除 + 核心库瘦身
+
+- **模块解析本就不靠 hack**：三个 worker 的 pyproject 都是 `uv_build` 后端 + `module-name` 配置，`uv sync` 默认把项目自身 editable 装进自己的 .venv（实测 `import scorer/preprocess/trainer` 直指 `src/`，无 path 介入）；scorer/preprocess 入口的两行 `sys.path.insert` 是历史残留，已删（连带仅为其存在的 `import sys`/`Path` 导入）。`[project.scripts]` 未加——bin 壳与解析无关，AGENTS 命令惯例统一 `.venv/bin/python workers/xxx/main.py`
+- **`src/qwen3_tts_post_training/system.py`**（新）：`peak_rss_mb()`（getrusage ru_maxrss）/`current_rss_mb()`（/proc/self/statm，OSError → -1）/`gpu_allocated_mb(device)`/`gpu_reserved_mb(device)`（torch 分配器视角，round 1 位）——数值语义与原内联表达式逐字节一致；调用点收敛：grpo/sft monitor + scorer `ScoreResponse.rss_mb`，三个文件的 `import resource` 全清
+- **`train/grpo.py` → `workers/trainer/src/trainer/grpo/grpo.py`**（`git mv`，唯一消费方 loop.py）：核心库瘦身为真正三方共享的 `reward/` + `client/` + `system.py`

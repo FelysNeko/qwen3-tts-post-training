@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import resource
 import signal
 
 from scorer.multi_object import Scorers
 
 from qwen3_tts_post_training.client.protocol import ScoreResponse
 from qwen3_tts_post_training.client.scorer import Client
+from qwen3_tts_post_training.system import peak_rss_mb
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def main() -> None:
         if req is None:
             continue
         results, timing = scorers.score(req.items, req.fields)
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+        rss = peak_rss_mb()
         logger.info(f"req {req.id}: n={len(req.items)} timing={timing}")
         resp = ScoreResponse(id=req.id, results=results, timing=timing, rss_mb=rss)
         worker.send_response(resp)

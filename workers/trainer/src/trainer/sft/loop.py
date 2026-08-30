@@ -37,7 +37,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import resource
 import shutil
 import time
 from dataclasses import dataclass
@@ -48,6 +47,7 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+from qwen3_tts_post_training.system import gpu_allocated_mb, peak_rss_mb
 from trainer.sft.model import (
     SftTrainerModel,
     extract_speaker_vec,
@@ -343,11 +343,8 @@ def run_sft(cfg: SftConfig | None = None) -> None:
                         "grad_norm": round(grad_norm.item(), 4),
                         "lr": f"{lr_t:.2e}",
                         "dur_s": round(time.monotonic() - t0, 2),
-                        "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                        // 1024,
-                        "gpu_alloc_mb": round(
-                            torch.cuda.memory_allocated(cfg.device) / 2**20, 1
-                        ),
+                        "rss_mb": peak_rss_mb(),
+                        "gpu_alloc_mb": gpu_allocated_mb(cfg.device),
                     },
                     ensure_ascii=False,
                 )
