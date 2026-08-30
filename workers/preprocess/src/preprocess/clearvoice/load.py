@@ -7,11 +7,14 @@ checkpoint_dir, no chdir sandbox, no symlink bridge).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import torch
 
 CLEARVOICE_HF_REPO = "alibabasglab/MossFormer2_SE_48K"
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_clearvoice() -> Path:
@@ -19,9 +22,9 @@ def ensure_clearvoice() -> Path:
     `last_best_checkpoint` + the ckpt file."""
     from huggingface_hub import snapshot_download
 
-    print(f"[fetch] fetching ClearVoice ckpt via HF ({CLEARVOICE_HF_REPO})")
+    logger.info(f"fetching ClearVoice ckpt via HF ({CLEARVOICE_HF_REPO})")
     snapshot = Path(snapshot_download(repo_id=CLEARVOICE_HF_REPO))
-    print(f"[fetch] ClearVoice ckpt ready: {snapshot}")
+    logger.info(f"ClearVoice ckpt ready: {snapshot}")
     return snapshot
 
 

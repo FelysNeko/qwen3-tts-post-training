@@ -4,6 +4,7 @@ run (and lazy-loaded). Calibration-free: similarities are the caller's job."""
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from qwen3_tts_post_training.client.protocol import (
     ScoreResult,
     Timing,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Scorers:
@@ -29,7 +32,7 @@ class Scorers:
 
             t0 = time.time()
             self._sv = SVScorer(Path(self.args.sv_dir), self.args.device)
-            print(f"[load] sv {time.time() - t0:.1f}s")
+            logger.info(f"sv loaded in {time.time() - t0:.1f}s")
         return self._sv
 
     @property
@@ -41,7 +44,7 @@ class Scorers:
             self._asr = ASRScorer(
                 self.args.asr_model, self.args.device, self.args.asr_batch
             )
-            print(f"[load] asr {time.time() - t0:.1f}s")
+            logger.info(f"asr loaded in {time.time() - t0:.1f}s")
         return self._asr
 
     @property
@@ -57,7 +60,7 @@ class Scorers:
                 device=self.args.device,
                 gpu_mel=self.args.gpu_mel,
             )
-            print(f"[load] mos {time.time() - t0:.1f}s")
+            logger.info(f"mos loaded in {time.time() - t0:.1f}s")
         return self._mos
 
     def score(

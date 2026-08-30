@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from dataclasses import replace
 
 from trainer.grpo.loop import TrainConfig, run_grpo
@@ -10,6 +11,10 @@ from trainer.sft.loop import SftConfig, run_sft
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--model-path", type=str)
     shared.add_argument("--device", type=str)

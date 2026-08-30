@@ -14,12 +14,12 @@ salvaged when the checksum reproduces.
 from __future__ import annotations
 
 import argparse
-import sys
+import logging
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
 from preprocess.pipeline import run_pipeline
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -62,6 +62,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     args = parse_args()
     assert args.dataset.is_dir(), f"dataset wav dir not found: {args.dataset}"
     assert Path(args.model_path).exists(), (
@@ -73,7 +77,7 @@ def main() -> None:
 
     from qwen3_tts_post_training.client.trainer import Client
 
-    print(f"[preprocess] dataset={args.dataset} device={args.device}")
+    logger.info(f"dataset={args.dataset} device={args.device}")
     wrapper = Qwen3TTSModel.from_pretrained(
         args.model_path,
         device_map=args.device,
@@ -107,7 +111,7 @@ def main() -> None:
         )
     finally:
         client.close()
-    print(f"[preprocess] done: {out}")
+    logger.info(f"done: {out}")
 
 
 if __name__ == "__main__":

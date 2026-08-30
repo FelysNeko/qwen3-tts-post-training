@@ -35,6 +35,7 @@ model.safetensors) and the reference-audio speaker embedding baked into
 from __future__ import annotations
 
 import json
+import logging
 import random
 import resource
 import shutil
@@ -52,6 +53,8 @@ from trainer.sft.model import (
     extract_speaker_vec,
     load_base_speaker_encoder,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -152,7 +155,7 @@ def _load_ckpt(cfg: SftConfig, model: SftTrainerModel, optimizer) -> int:
     for name, p in live.items():
         p.data.copy_(saved[name].to(cfg.device))
     optimizer.load_state_dict(state["optimizer"])
-    print(f"[resume] restored pos {state['pos']} from {path}")
+    logger.info(f"resumed at pos {state['pos']} from {path}")
     return state["pos"] + 1
 
 
@@ -229,7 +232,7 @@ def export_custom_voice(
     embedding = state_dict["talker.model.codec_embedding.weight"]
     embedding[slot] = speaker_vec.detach().to("cpu").to(embedding.dtype)
     save_file(state_dict, out / "model.safetensors", metadata={"format": "pt"})
-    print(f"[export] speaker {cfg.export_name!r} @ slot {slot} → {out}")
+    logger.info(f"exported speaker {cfg.export_name!r} @ slot {slot} → {out}")
     return out
 
 
@@ -281,19 +284,10 @@ def run_sft(cfg: SftConfig | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     monitor_f = (out / "monitor.jsonl").open("a")
 
-    print(
-        json.dumps(
-            {
-                "clips": len(data),
-                "n_batches": n_batches,
-                "epochs": cfg.epochs,
-                "total_pos": total_pos,
-                "speaker_vec": list(speaker_vec.shape),
-                "trainable_params": sum(p.numel() for p in model.trainable_parameters),
-            },
-            ensure_ascii=False,
-        ),
-        flush=True,
+    logger.info(
+        f"training {len(data)} clips: {n_batches} batches/epoch × {cfg.epochs} epochs"
+        f" = {total_pos} steps | speaker vec {tuple(speaker_vec.shape)} |"
+        f" {sum(p.numel() for p in model.trainable_parameters)} trainable params"
     )
 
     for epoch in range(cfg.epochs):
@@ -335,18 +329,17 @@ def run_sft(cfg: SftConfig | None = None) -> None:
             optimizer.zero_grad(set_to_none=True)
 
             if step % cfg.log_every == 0:
+                loss_v = None if loss is None else round(loss.item(), 4)
+                loss_sem_v = None if loss_sem is None else round(loss_sem.item(), 4)
+                loss_sub_v = None if loss_sub is None else round(loss_sub.item(), 4)
                 line = json.dumps(
                     {
                         "step": step,
                         "epoch": epoch,
                         "pos": pos,
-                        "loss": None if loss is None else round(loss.item(), 4),
-                        "loss_sem": (
-                            None if loss_sem is None else round(loss_sem.item(), 4)
-                        ),
-                        "loss_sub": (
-                            None if loss_sub is None else round(loss_sub.item(), 4)
-                        ),
+                        "loss": loss_v,
+                        "loss_sem": loss_sem_v,
+                        "loss_sub": loss_sub_v,
                         "grad_norm": round(grad_norm.item(), 4),
                         "lr": f"{lr_t:.2e}",
                         "dur_s": round(time.monotonic() - t0, 2),
@@ -358,7 +351,12 @@ def run_sft(cfg: SftConfig | None = None) -> None:
                     },
                     ensure_ascii=False,
                 )
-                print(line, flush=True)
+                logger.info(
+                    f"step {step} epoch {epoch} loss {loss_v}"
+                    f" (sem {loss_sem_v} sub {loss_sub_v})"
+                    f" grad {round(grad_norm.item(), 4)} lr {lr_t:.2e}"
+                    f" dur {round(time.monotonic() - t0, 2)}s"
+                )
                 monitor_f.write(line + "\n")
                 monitor_f.flush()
             if step % cfg.ckpt_every == 0:

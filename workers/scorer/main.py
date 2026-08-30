@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import resource
 import signal
-import sys
-from pathlib import Path
-
-# Ensure src layout works when invoked as `python main.py`
-sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from scorer.multi_object import Scorers
 
 from qwen3_tts_post_training.client.protocol import ScoreResponse
 from qwen3_tts_post_training.client.scorer import Client
 
+logger = logging.getLogger(__name__)
+
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument(
@@ -47,33 +49,33 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    print(f"[scorer] pid={os.getpid()} device={args.device}")
-    print(f"[scorer] push {args.push_endpoint} pull {args.pull_endpoint}")
+    logger.info(f"pid={os.getpid()} device={args.device}")
+    logger.info(f"push {args.push_endpoint} pull {args.pull_endpoint}")
     scorers = Scorers(args)
     worker = Client(args.push_endpoint, args.pull_endpoint)
 
     stop = {"flag": False}
 
     def _handle_sig(signum, _frame):
-        print(f"[scorer] signal {signum}, exiting")
+        logger.info(f"signal {signum}, exiting")
         stop["flag"] = True
 
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
 
-    print("[scorer] connected, waiting for requests")
+    logger.info("connected, waiting for requests")
     while not stop["flag"]:
         req = worker.recv_request(timeout_ms=500)
         if req is None:
             continue
         results, timing = scorers.score(req.items, req.fields)
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
-        print(f"[scorer] req {req.id}: n={len(req.items)} timing={timing}")
+        logger.info(f"req {req.id}: n={len(req.items)} timing={timing}")
         resp = ScoreResponse(id=req.id, results=results, timing=timing, rss_mb=rss)
         worker.send_response(resp)
 
     worker.close()
-    print("[scorer] exiting")
+    logger.info("exiting")
 
 
 if __name__ == "__main__":

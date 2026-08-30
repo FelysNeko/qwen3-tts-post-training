@@ -13,6 +13,7 @@ LoRA deltas + semantic head + optimizer state so `--resume` continues cleanly.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import resource
 import time
@@ -33,6 +34,8 @@ from trainer.grpo.logprob import LogProbComputer
 from trainer.grpo.rollout import rollout_group
 from trainer.grpo.samplers.base import Sampler
 from trainer.lora import LoraTrainerModel
+
+logger = logging.getLogger(__name__)
 
 # mirrors rollout_group's pinned subtalker sampling trio (do_sample@T=0.9/top_k=50)
 SUBTALKER_TEMPERATURE = 0.9
@@ -176,7 +179,7 @@ def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
         m.lora_b.data.copy_(sd["b"])
     ttm.codec_head.weight.data.copy_(state["codec_head"])
     optimizer.load_state_dict(state["optimizer"])
-    print(f"[resume] restored step {step} from {_ckpt_path(out, step)}")
+    logger.info(f"resumed at step {step} from {_ckpt_path(out, step)}")
     return step + 1
 
 
@@ -298,13 +301,7 @@ def _train_loop(
                     fields={ScoreField.EMBEDDING, ScoreField.CER, ScoreField.MOS},
                 )
             except Exception as e:  # noqa: BLE001
-                print(
-                    json.dumps(
-                        {"step": step, "skip": "scorer_send_failure", "reason": str(e)},
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
-                )
+                logger.warning(f"step {step}: scorer send failed ({e}) — group skipped")
                 _cleanup_wavs(g["wavs"])
                 skips["scorer_item"] = skips.get("scorer_item", 0) + 1
                 continue
@@ -320,13 +317,7 @@ def _train_loop(
                 try:
                     results = scorer.recv_score(rid, timeout=scorer.timeout_s)
                 except (TimeoutError, RuntimeError) as e:
-                    print(
-                        json.dumps(
-                            {"step": step, "skip": "scorer_failure", "reason": str(e)},
-                            ensure_ascii=False,
-                        ),
-                        flush=True,
-                    )
+                    logger.warning(f"step {step}: scorer failed ({e}) — group skipped")
                     _cleanup_wavs(g["wavs"])
                     skips["scorer_item"] = skips.get("scorer_item", 0) + 1
                     continue
@@ -367,12 +358,7 @@ def _train_loop(
             trainable.append(g)
 
         if not trainable:
-            print(
-                json.dumps(
-                    {"step": step, "skip": "no_trainable_group", "skips": skips}
-                ),
-                flush=True,
-            )
+            logger.warning(f"step {step}: no trainable group — skipped")
             continue
 
         # ---- phase 3: train — gradient accumulation, one group per pass ----
@@ -407,12 +393,7 @@ def _train_loop(
         t_train = time.monotonic() - t_train0
 
         if not trained:
-            print(
-                json.dumps(
-                    {"step": step, "skip": "all_losses_nonfinite", "skips": skips}
-                ),
-                flush=True,
-            )
+            logger.warning(f"step {step}: all losses non-finite — skipped")
             continue
 
         # ---- phase 4: update ----
@@ -476,7 +457,16 @@ def _train_loop(
             "dur_s": round(time.monotonic() - t0, 2),
         }
         line = json.dumps(monitor, ensure_ascii=False)
-        print(line)
+        logger.info(
+            f"step {step} | {len(trained)} groups, {sum(skips.values())} skipped"
+            f" | loss {monitor['loss']} (policy {monitor['policy_loss']},"
+            f" kl {monitor['kl']}) | grad {monitor['grad_norm']} lr {monitor['lr']}"
+            f" | R {monitor['mean_R']} adv_std {monitor['adv_std']}"
+            f" t_max {monitor['t_max']} | r_sv {monitor['r_sv_mean']}"
+            f" r_wer {monitor['r_wer_mean']} r_mos {monitor['r_mos_mean']}"
+            f" | sim {monitor['sim_mean']} cer {monitor['cer_mean']}"
+            f" mos {monitor['mos_mean']} | {monitor['dur_s']}s"
+        )
         if monitor_f is not None:
             monitor_f.write(line + "\n")
             monitor_f.flush()

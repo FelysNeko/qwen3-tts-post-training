@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -88,6 +89,8 @@ from qwen3_tts_post_training.client.protocol import (
     ScoreResult,
 )
 from qwen3_tts_post_training.client.trainer import Client
+
+logger = logging.getLogger(__name__)
 
 CLEARVOICE_SR = 48000
 
@@ -436,8 +439,8 @@ def prune_foreign(cache: Cache, directory: Path, suffix: str) -> tuple[str, ...]
     for name in foreign_names:
         (directory / f"{name}{suffix}").unlink()
     if foreign_names:
-        print(
-            f"[prune] {directory.name}: removed {len(foreign_names)} foreign artifacts"
+        logger.info(
+            f"prune {directory.name}: removed {len(foreign_names)} foreign artifacts"
         )
     return foreign_names
 
@@ -458,9 +461,8 @@ def apply_embedding_layer(
     pipelining was measured at ZERO benefit (STATUS.md §16.8)."""
     config = cache.config
     todo = [row for row in table if not row.embedding]
-    print(
-        f"[embed] {len(cache.corpus_entries) - len(todo)} cached clips, "
-        f"{len(todo)} to process"
+    logger.info(
+        f"{len(cache.corpus_entries) - len(todo)} cached clips, {len(todo)} to process"
     )
     if not todo:
         return table
@@ -493,7 +495,7 @@ def apply_embedding_layer(
             ):
                 # bit-rot salvage: the row describes disk again
                 updated[row.name] = replace(row, embedding=True)
-    print(f"[embed] done in {time.monotonic() - start:.1f}s")
+    logger.info(f"embedding done in {time.monotonic() - start:.1f}s")
     return tuple(updated.get(row.name, row) for row in table)
 
 
@@ -551,7 +553,7 @@ def collect_corpus_metrics(
     config = cache.config
     entries_by_name = {entry.name: entry for entry in cache.corpus_entries}
     todo = [row for row in table if not row.enhanced]
-    print(f"[text] {len(todo)} clips to score")
+    logger.info(f"{len(todo)} clips to score")
     if not todo:
         return {}
 
@@ -586,7 +588,7 @@ def collect_corpus_metrics(
                 )
             # a scored batch is durable — an interrupted run resumes after it
             asset_file.flush()
-    print(f"[text] done in {time.monotonic() - start:.1f}s")
+    logger.info(f"text scoring done in {time.monotonic() - start:.1f}s")
     return text_results
 
 
@@ -682,7 +684,7 @@ def finalize(
     }
     with open(config.metrics_json, "w", encoding="utf-8") as file:
         json.dump(metrics, file, ensure_ascii=False, indent=2)
-    print(f"[metrics] written: {config.metrics_json}")
+    logger.info(f"metrics written: {config.metrics_json}")
 
 
 def sync(

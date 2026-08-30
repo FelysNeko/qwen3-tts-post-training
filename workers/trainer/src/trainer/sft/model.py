@@ -19,6 +19,7 @@ from.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import librosa
@@ -26,6 +27,8 @@ import soundfile as sf
 import torch
 
 from trainer.model import ModelWrapper
+
+logger = logging.getLogger(__name__)
 
 
 class SftTrainerModel(ModelWrapper):
@@ -67,7 +70,7 @@ def load_base_speaker_encoder(model: ModelWrapper, base_model_path: str) -> None
         from huggingface_hub import hf_hub_download
 
         weights_path = Path(hf_hub_download(base_model_path, "model.safetensors"))
-        print(f"[speaker-encoder] fetched base weights: {weights_path}")
+        logger.info(f"fetched base speaker-encoder weights: {weights_path}")
 
     tensors: dict[str, torch.Tensor] = {}
     with safe_open(weights_path, framework="pt", device="cpu") as file:
@@ -83,7 +86,9 @@ def load_base_speaker_encoder(model: ModelWrapper, base_model_path: str) -> None
     for p in encoder.parameters():
         p.requires_grad_(False)
     model.model.speaker_encoder = encoder
-    print(f"[speaker-encoder] loaded {len(tensors)} tensors from {base_model_path!r}")
+    logger.info(
+        f"speaker encoder: {len(tensors)} tensors loaded from {base_model_path!r}"
+    )
 
 
 def extract_speaker_vec(model: ModelWrapper, audio_path: str | Path) -> torch.Tensor:
