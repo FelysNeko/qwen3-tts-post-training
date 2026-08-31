@@ -69,6 +69,13 @@ def main() -> None:
         if req is None:
             continue
         results, timing = scorers.score(req.items, req.fields)
+        # the scorer is stateless between requests: release cached blocks so
+        # the allocator doesn't hoard VRAM (GPU-PV shares one Windows video
+        # memory manager — scorer bloat starves the trainer on the other GPU)
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
         rss = peak_rss_mb()
         logger.info(f"req {req.id}: n={len(req.items)} timing={timing}")
         resp = ScoreResponse(id=req.id, results=results, timing=timing, rss_mb=rss)

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
@@ -35,7 +36,14 @@ from qwen3_tts_post_training.system import (
     gpu_reserved_mb,
     peak_rss_mb,
 )
-from trainer.grpo.grpo import GRPOConfig, grpo_loss, needs_resample
+from trainer.grpo.grpo import (
+    GRPOConfig,
+    GRPOMetrics,
+    column_weights,
+    group_advantage,
+    grpo_loss,
+    needs_resample,
+)
 from trainer.grpo.logprob import LogProbComputer
 from trainer.grpo.rollout import rollout_group
 from trainer.grpo.samplers.base import Sampler
@@ -97,6 +105,7 @@ class TrainConfig:
 
     variant: str = "dr"
     kl_beta: float = 0.001
+    logprob_micro: int = 0  # policy/ref micro-batch (0 = full group of 8 in one pass); splits the teacher-forcing activation peak so B8 fits 16G-class cards
     lr: float = 1e-5
     warmup_steps: int = 10  # linear LR ramp: tames the Adam first-step sign
     # jolt (all params move ±lr at once; observed as KL 586 on step 1, fish3)
@@ -363,31 +372,97 @@ def _train_loop(
         # (peak activation memory stays at single-group level; each group
         # contributes 1/len(trainable) to the update, equal group weighting)
         t_train0 = time.monotonic()
+        micro = cfg.logprob_micro or None
         optimizer.zero_grad(set_to_none=True)
         trained: list[tuple[torch.Tensor, object, dict]] = []
         for g in trainable:
+            n_tr = len(trainable)
             ref = lpc.compute_ref(
                 [g["prompt"]] * gs,
                 g["codes"],
                 cfg.temperature,
                 subtalker_temperature=SUBTALKER_TEMPERATURE,
+                micro=micro,
             )
-            pol = lpc.compute_policy(
-                [g["prompt"]] * gs,
-                g["codes"],
-                cfg.temperature,
-                subtalker_temperature=SUBTALKER_TEMPERATURE,
-            )
-            loss, metrics = grpo_loss(
-                pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo
-            )
-            if not torch.isfinite(loss):
-                # non-finite loss (e.g. a sampled token falling out of the
-                # teacher-forcing top-k) backprops NaN grads — drop the group
-                skips["nonfinite_loss"] = skips.get("nonfinite_loss", 0) + 1
+            if micro is None:
+                pol = lpc.compute_policy(
+                    [g["prompt"]] * gs,
+                    g["codes"],
+                    cfg.temperature,
+                    subtalker_temperature=SUBTALKER_TEMPERATURE,
+                )
+                loss, metrics = grpo_loss(
+                    pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo
+                )
+                if not torch.isfinite(loss):
+                    # non-finite loss (e.g. a sampled token falling out of the
+                    # teacher-forcing top-k) backprops NaN grads — drop the group
+                    skips["nonfinite_loss"] = skips.get("nonfinite_loss", 0) + 1
+                    continue
+                (loss / n_tr).backward()
+                trained.append((loss.detach(), metrics, g))
                 continue
-            (loss / len(trainable)).backward()
-            trained.append((loss, metrics, g))
+
+            # micro-batch path: the policy graph is backwarded PER CHUNK so at
+            # most `micro` sequences' activations ever coexist. Exact
+            # recombination: per-token terms are row-independent and the loss
+            # is a weighted token mean, so full = Σ_c loss_c·(W_c/W_total);
+            # the group advantage baseline is computed ONCE on all gs rows —
+            # never per chunk (that would change the Dr.GRPO baseline).
+            A, gmean, gstd = group_advantage(
+                g["R"], algo.variant, group_ids, algo.std_eps
+            )
+            W_total = (ref.mask * column_weights(ref.mask, algo)).sum().clamp_min(1e-12)
+            W_used = ref.log_probs.new_zeros(())
+            loss_acc = ref.log_probs.new_zeros(())
+            pol_acc = ref.log_probs.new_zeros(())
+            kl_acc: list[torch.Tensor] = []
+            for i in range(0, gs, micro):
+                sl = slice(i, i + micro)
+                pol_c = lpc.compute_policy(
+                    [g["prompt"]] * micro,
+                    g["codes"][sl],
+                    cfg.temperature,
+                    subtalker_temperature=SUBTALKER_TEMPERATURE,
+                )
+                width = ref.log_probs.shape[1]
+                pad = width - pol_c.log_probs.shape[1]
+                lp_c = F.pad(pol_c.log_probs, (0, pad)) if pad else pol_c.log_probs
+                mk_c = F.pad(pol_c.mask, (0, pad)) if pad else pol_c.mask
+                loss_c, met_c = grpo_loss(
+                    lp_c,
+                    ref.log_probs[sl],
+                    A[sl],
+                    mk_c,
+                    group_ids[sl],
+                    algo,
+                    advantage=A[sl],
+                )
+                if not torch.isfinite(loss_c):
+                    # one non-finite chunk drops only that chunk (earlier
+                    # chunks are already backwarded and cannot be undone);
+                    # remaining chunks renormalize over W_used below
+                    skips["nonfinite_loss"] = skips.get("nonfinite_loss", 0) + 1
+                    continue
+                W_used = W_used + met_c.weight_mass
+                loss_acc = loss_acc + loss_c.detach() * met_c.weight_mass
+                pol_acc = pol_acc + met_c.policy_loss.detach() * met_c.weight_mass
+                if met_c.kl is not None:
+                    kl_acc.append(met_c.kl * met_c.weight_mass)
+                # equal group weighting across the step: each chunk carries
+                # its share of the group's 1/n_tr contribution
+                (loss_c * met_c.weight_mass / W_total / n_tr).backward()
+            if W_used.item() == 0.0:
+                continue  # every chunk non-finite — the group contributed no grads
+            metrics = GRPOMetrics(
+                loss_acc / W_used,
+                pol_acc / W_used,
+                torch.stack(kl_acc).sum() / W_used if kl_acc else None,
+                A,
+                gmean,
+                gstd,
+            )
+            trained.append((loss_acc.detach() / W_used, metrics, g))
         t_train = time.monotonic() - t_train0
 
         if not trained:

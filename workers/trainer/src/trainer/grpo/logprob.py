@@ -124,11 +124,33 @@ class LogProbComputer:
         codes: list[torch.Tensor],
         temperature: float = 0.9,
         subtalker_temperature: float = 0.9,
+        micro: int | None = None,
     ) -> LogProbResult:
-        """Reference (adapter OFF) log-probs — frozen base forward, no grads."""
+        """Reference (adapter OFF) log-probs — frozen base forward, no grads.
+
+        `micro` splits the batch into inference chunks (transient activation
+        peak = one chunk) and re-pads the packed rows to a common width.
+        Exact per-sequence equality in exact arithmetic: right padding +
+        causal attention make valid-position logits independent of the batch
+        shape; only bf16 kernel reassociation differs (~1e-3)."""
         self.ttm.set_adapter(False)
         try:
-            return self._forward(texts, codes, temperature, subtalker_temperature)
+            if micro is None or micro >= len(texts):
+                return self._forward(texts, codes, temperature, subtalker_temperature)
+            results = [
+                self._forward(texts[i : i + micro], codes[i : i + micro],
+                              temperature, subtalker_temperature)
+                for i in range(0, len(texts), micro)
+            ]
+            width = max(r.log_probs.shape[1] for r in results)
+            log_probs = torch.cat(
+                [F.pad(r.log_probs, (0, width - r.log_probs.shape[1])) for r in results]
+            )
+            mask = torch.cat(
+                [F.pad(r.mask, (0, width - r.mask.shape[1])) for r in results]
+            )
+            lengths = torch.cat([r.lengths for r in results])
+            return LogProbResult(log_probs, mask, lengths)
         finally:
             self.ttm.set_adapter(True)
 

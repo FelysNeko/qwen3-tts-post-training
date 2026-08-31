@@ -54,7 +54,7 @@ class GRPOConfig:
             )
 
 
-def _column_weights(
+def column_weights(
     mask: torch.Tensor,
     cfg: GRPOConfig,
 ) -> torch.Tensor:
@@ -86,6 +86,7 @@ class GRPOMetrics(NamedTuple):
     group_std: torch.Tensor
     rho: torch.Tensor | None = None
     clamped: torch.Tensor | None = None
+    weight_mass: torch.Tensor | None = None  # Σ(mask·col_w): micro-batch chunk recombination (loop.py)
 
 
 def _segment_mean_std(
@@ -162,7 +163,7 @@ def _clipped_loss(
     mask: torch.Tensor,
     cfg: GRPOConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    col_w = _column_weights(mask, cfg)
+    col_w = column_weights(mask, cfg)
     w = mask * col_w
     log_ratio = log_probs - ref_log_probs
     # guard inf*0=NaN (see kl_divergence): zero-weighted columns whose exp
@@ -176,7 +177,7 @@ def _clipped_loss(
     adv = advantage.unsqueeze(-1)
     loss_t = -(torch.minimum(rho * adv, clamped * adv))  # [B, T]
     loss = (loss_t * w).sum() / w.sum().clamp_min(1e-12)
-    return loss, {"rho": torch.exp(log_ratio), "clamped": clamped}
+    return loss, {"rho": torch.exp(log_ratio), "clamped": clamped, "weight_mass": w.sum()}
 
 
 def _gspo_loss(
@@ -189,7 +190,7 @@ def _gspo_loss(
     log_ratio = log_probs - ref_log_probs
     seq_ratio = torch.exp((log_ratio * mask).sum(-1))  # [B]
     loss = -(seq_ratio * advantage).mean()
-    return loss, {"seq_ratio": seq_ratio}
+    return loss, {"seq_ratio": seq_ratio, "weight_mass": loss.new_tensor(log_probs.shape[0])}
 
 
 def grpo_loss(
@@ -199,6 +200,7 @@ def grpo_loss(
     mask: torch.Tensor,
     group_ids: torch.Tensor | None = None,
     cfg: GRPOConfig | None = None,
+    advantage: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, GRPOMetrics]:
     """One optimizer-step GRPO loss.
 
@@ -211,6 +213,11 @@ def grpo_loss(
         rewards: [B] composed reward R (see reward.reward_v3), one per sample.
         mask: [B, T] 1 on valid code slots, 0 on pad/prompt.
         group_ids: optional [B] group index per sample (default: one group).
+        advantage: optional precomputed [B] advantage — skips the internal
+            `group_advantage` call. REQUIRED for micro-batch decomposition:
+            the group baseline (gmean over all N rows) must come from the
+            FULL group, never from a chunk slice; the loop computes it once
+            via `group_advantage` and passes row slices here.
 
     MTP γ (`cfg.subtalker_weight`): weight on packed columns of codebooks
     1..Q-1. History: MD §四 pinned γ=0 ("v1 不提取 15 码本 logprob") when only
@@ -223,8 +230,12 @@ def grpo_loss(
     """
     cfg = cfg or GRPOConfig()
 
-    A, gmean, gstd = group_advantage(rewards, cfg.variant, group_ids, cfg.std_eps)
-    col_w = _column_weights(mask, cfg)
+    if advantage is None:
+        A, gmean, gstd = group_advantage(rewards, cfg.variant, group_ids, cfg.std_eps)
+    else:
+        A = advantage
+        gmean = gstd = torch.zeros((), device=A.device)
+    col_w = column_weights(mask, cfg)
 
     if cfg.variant == VARIANT_GSPO:
         policy_loss, info = _gspo_loss(log_probs, ref_log_probs, A, mask, cfg)
@@ -250,6 +261,7 @@ def grpo_loss(
         gstd,
         rho=info.get("rho"),
         clamped=info.get("clamped"),
+        weight_mass=info.get("weight_mass"),
     )
 
 
