@@ -2,11 +2,15 @@
 
 `SftTrainerModel` is the `ModelWrapper` subclass the shared-kernel docstring
 anticipates: every generative parameter stays unfrozen (the whole talker —
-layers, embeddings, text_projection, codec_head AND the code predictor /
-MTP heads, unlike GRPO which freezes the predictor), while the environment
-(`speech_tokenizer`, never in the teacher-forcing graph) and the conditioning
-extractor (`speaker_encoder`, whose output enters training detached) stay
-frozen.
+layers, the codec embedding tables, text_projection, codec_head AND the code
+predictor / MTP heads, unlike GRPO which freezes the predictor), while the
+environment (`speech_tokenizer`, never in the teacher-forcing graph) and the
+conditioning extractor (`speaker_encoder`, whose output enters training
+detached) stay frozen. The ONE deliberate exception is
+`talker.model.text_embedding` (311M, Qwen2-lineage text vocab): frozen
+UNCONDITIONALLY, mirroring the official voice-SFT recipe — official
+0.6B-Base → official CustomVoice moves it by 0.005% (bf16 noise) while every
+other block drifts 0.8-1.6%.
 
 Speaker conditioning: ONE user-specified reference audio →
 `extract_speaker_vec` → [hidden] vector broadcast into embedding slot 6 for
@@ -28,10 +32,27 @@ from trainer.model import ModelWrapper
 
 
 class SftTrainerModel(ModelWrapper):
+    """Component-freeze ablation: `freeze` is a composable set of frozen
+    components — `{"subtalker"}` (code predictor weight-frozen, its CE still
+    backprops through past_hidden into the talker) and `{"talker"}` (talker
+    backbone + codec_head frozen) form the symmetric pair: text_projection,
+    the shared ingress feeding BOTH stacks, trains in both arms so the pair
+    differs by exactly one variable — which generative stack learns.
+    `{"text"}` composes onto either arm (e.g. `{"talker", "text"}` = the
+    strict predictor-only variant).
+
+    Unconditional (not part of `freeze`): `talker.model.text_embedding` is
+    always frozen — the official recipe never trains it (official
+    Base→CustomVoice drift 0.005% vs 0.8-1.6% everywhere else), it is the
+    largest sparse-update victim under Adam (rare-token rows sign-step as
+    fast as common ones), and freezing it saves 311M×3 bf16 optimizer bytes.
+    """
+
     def __init__(
         self,
         model_path: str,
         device: str = "cuda:1",
+        freeze: list[str] | None = None,
     ):
         super().__init__(model_path, device=device)
         # speech_tokenizer is a plain wrapper (not an nn.Module) — its weights
@@ -39,6 +60,25 @@ class SftTrainerModel(ModelWrapper):
         if self.model.speaker_encoder is not None:
             for p in self.model.speaker_encoder.parameters():
                 p.requires_grad_(False)
+
+        # official-aligned invariant (no CLI switch): voice SFT never touches
+        # the text vocab embedding
+        for p in self.talker.model.text_embedding.parameters():
+            p.requires_grad_(False)
+
+        if freeze is not None:
+            if "subtalker" in freeze:
+                for p in self.talker.code_predictor.parameters():
+                    p.requires_grad_(False)
+            if "talker" in freeze:
+                for p in self.talker.model.parameters():
+                    p.requires_grad_(False)
+                for p in self.talker.codec_head.parameters():
+                    p.requires_grad_(False)
+
+            if "text" in freeze:
+                for p in self.talker.text_projection.parameters():
+                    p.requires_grad_(False)
 
 
 def extract_speaker_vec(model: ModelWrapper, audio_path: str | Path) -> torch.Tensor:

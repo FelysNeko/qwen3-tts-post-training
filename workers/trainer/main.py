@@ -44,6 +44,10 @@ def main() -> None:
     sft = subparsers.add_parser("sft", parents=[shared])
     sft.add_argument("--speaker-audio", default=None)
     sft.add_argument("--limit", type=int, default=None)
+    sft.add_argument(
+        "--freeze", nargs="+", default=None, help="frozen components: subtalker talker text"
+    )
+    sft.add_argument("--sub-weight", type=float, default=None)
     sft.add_argument("--batch-size", type=int, default=None)
     sft.add_argument("--grad-accum", type=int, default=None)
     sft.add_argument("--epochs", type=int, default=None)

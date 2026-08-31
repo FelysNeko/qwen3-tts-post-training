@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-08-30（§20 PhiLia 解剖：谱分析 + 过拟合调查 + SFT/GRPO 策略推演——三条路线待拍板）
+最后更新：2026-08-31（§24 8-take 重评估 + Adam 尺度不变性证伪 sub_weight + embedding 考古 + text_embedding 冻结定案）
 
 ## 1. 目标
 
@@ -643,3 +643,134 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **trainer 侧（解耦落地，用户三轮纠偏后定稿）**：`TrainConfig` / `SftConfig` 持 `cache_dir`（根，默认 `<repo>/.cache`）+ `namespace` 双字段；**`namespace` 无默认必填（`namespace: str` 置于类首，类型即约束）**，无 accessor——`run_grpo`/`run_sft` 调用点直拼 `CacheLayout(Path(cfg.cache_dir) / cfg.namespace)` 一次。CLI：`--namespace` 用 argparse 原生 `required=True`，kwargs 直灌 `SftConfig(**overrides)` / `TrainConfig(**overrides)`（`replace` 桥与 `cfg = cfg or Config()` 默认实例随之删除，存在性不前移——池缺失由 `run_*` 内 layout 加载自然报错）；`--cache-dir` 语义为 cache 根。
 - **preprocess 侧（两轮纠偏后定稿）**：**namespace 不是 preprocess 的概念**——语料是任意路径的输入目录，池名 = `{dataset.name}` 是固有行为，无需字段承载。CLI = `--dataset`（必填）+ `--cache-dir`（根语义，由 `--cache-root` 更名，默认 `<repo>/.cache`）；`run_pipeline(dataset, cache_root, ...)` 内部 `Config(cache_dir=cache_root / dataset.name)`，preprocess `Config` 与全包代码不出现 namespace 字样。
 - **验证**：ruff 全绿；probe_preprocess PASS；config 冒烟 = `SftConfig(namespace="Chinese(PRC)").layout` 解析到真实池 + `reward_config` 0.8709/0.0880、`TrainConfig(cache_dir="/x", namespace=...)` 拼接正确、缺 namespace 双 config assert；CLI 错误路径（缺 `--namespace` / 池不存在）实测报错；preprocess 真实路径冒烟 + `--help`。
+
+## 22. 全链路首跑、评估体系与消融定案（2026-08-31）
+
+当天主线：SFT→GRPO 全链路跑通并四轮评估 → sub_weight 剂量实验 → 组件冻结消融（两轮设计）→ MOS 跨进程事故与协议修复 → runs/ 清理 → GRPO 池重构 810。两次死机（WSL2 dxg 幽灵显存累积，`wsl --shutdown` 唯一清法；驱动 616.56 + 内核 6.18.40.1）均非代码问题。
+
+### 22.1 全链路首跑
+
+- **SFT-1ep**（`runs/sft_v1/export`，cyrene @ slot 3000）：B4/accum1、lr 5e-6、warmup 20、wd 0.01，0.3s/步，loss 2.50→2.08（sem 1.09→0.81）。配方为用户拍板（1 epoch 来自 §20.5-1 的推演，峰值 lr 5e-6 对齐 PhiLia 实证）。
+- **GRPO v5**（100 步，graphed，8×8=64 rollout/步，lr 1e-6，budget 448）：KL p50 0.0086（单步尖峰即恢复）、r_sv 0.583→0.596、无 runaway。**micro-batch**（`--logprob-micro 4`：logprob 分块 + 逐组切片 backward，advantage 全组算一次再切）16G 显存下跑通；数学等价 probe PASS（W 精确相等、loss 差 0.1%、grad 差 1%），完整 diff 存 `probes/microbatch.patch` + `probes/microbatch_design.md`。
+- **操作协议入 AGENTS.md**：新实验必须先重启 scorer（fresh socket）等 `connected` 再起 trainer——scorer 跨 trainer 重启存活会产生 stale 响应（"scorer id mismatch"组静默跳过）。robustness try/except 按用户裁定 revert（scorer 读不到 wav 裸崩为已知边界），`empty_cache` 保留。
+- **设备教训**：nvidia-smi 枚举与 CUDA 运行时索引**相反**（cuda:0=4070S 12G、cuda:1=5070Ti 16G），定位设备只信 CUDA。
+
+### 22.2 评估体系与四轮结果（12 in-sample / 8 OOD / 5 极 OOD / 4×8 稳定性）
+
+| 集 | SFT-0.3 | GRPO | 结论 |
+|---|---|---|---|
+| in-sample 12 | 0.8761/8.54%/2.766* | **0.8937**/6.51%/2.822* | GRPO 三指标全胜（*MOS 为修正前列，见 §22.3） |
+| OOD-mild 8 | 0.7910/5.05% | 0.8149/6.12% | sim 泛化 +0.024，CER 微亏，MOS 平 |
+| 极 OOD 5 | 0.8763/28.49% | 0.8731/26.72% | 增益归零 = 训练分布收窄 |
+| 稳定性 4×8 | dur std 13.6s | **0.9s** | GRPO 消灭 runaway 尾巴（15×）；sim std 0.0385→0.0177 |
+
+配套：SFT-2ep 消融（dur std 减半至 6.3s 但仍有 ~70s 残余跑飞；GRPO 对 2ep 仍全面胜）→「欠拟合 EOS」假设部分成立但不改变 GRPO 价值。产物全在 `runs/eval/`（结构化分区 + README 索引/对照表）。
+
+### 22.3 MOS 跨进程不可比事故（协议修复）
+
+用户质疑 SFT-0.3 基线「不可能差这么多」→ 复测（同代码路径重生成 + 逐字节 wav 对比）揪出：**sim/CER 12/12 逐位一致，MOS 12/12 全部漂移（−0.31~+0.24）**——wav 完全相同而分数变化 = scorer 进程重启的 GPU kernel 非确定性（AGENTS 已载的 within-lifetime-only 位稳定）。当天反复死机重启导致各臂 MOS 分属 4 个 scorer 进程，**此前所有跨进程 MOS 对照无效**。修复：全部臂的存量 wav 在单 scorer 进程统一重打（`runs/eval/mos/rescore_mos.json` = **权威 MOS**）。修正后排位：FRZ-TALK 3.085 > SFT-0.1 2.895 > FRZ-SUB 2.863 > GRPO 2.822 > SFT-0.3 2.787（GRPO 的 MOS 实为微亏，它买的是 sim/CER）。
+
+### 22.4 sub_weight 剂量实验：0.3→0.1 近砍半 CER
+
+用户拍板「更简单：常量 0.1，不做 decay 不冻结」→ `SftConfig.sub_weight` + `--sub-weight`（约 3 行，loss = sem + w·sub）。结果（sw01，全量 FT）：in-sample **0.8795/4.75%/2.895**（CER 8.54→4.75%，sim/MOS 同涨）；hard **24.9%** 同时好于 SFT-0.3（28.5%）与 GRPO（26.7%）。剂量-效应干净：CER FRZ(2.2) < 0.1(4.8) < GRPO(6.5) < 0.3(8.5)——subtalker 训练信号越强文本跟随越差。decay（线性 0.3→0）已设计未实施，是剂量曲线的自然延伸。
+
+### 22.5 组件冻结消融（第一版，后被重构）
+
+`--freeze sub|talker`（v1）：FRZ-SUB（只训 talker 侧 764.2M）0.8831/2.18%/2.852；FRZ-TALK（predictor-only 141.6M）0.8576/2.15%/3.085、hard sim 崩至 0.7594 而 MOS 2.471 双集第一——**音色/文本=talker、声学质量=predictor 的二分**首次显形，与 GRPO 冻结 predictor 的姿态自洽；Fish S2 §4.3 对照（同 Dr.GRPO/γ·fast/rsLoRA-MLP-only/Schulman KL/异步打分；异于我们多 DAPO clip、predictor 冻结、他们 ASR 置信度惩罚）已讲解归档。
+
+### 22.6 对称消融重构（用户三轮纠偏后定稿）
+
+用户连续纠偏：frz 逻辑补集写法 → 「为什么不训练 text_projection（混淆变量！）」→ **亲手重写** `SftTrainerModel` 为可组合集合 API：`freeze: list[str] ⊆ {subtalker, talker, text}`，text_projection（共享入口，codebook embedding 不经它）**双臂均训**，唯一变量 = 哪个生成栈学习。落地修复两处 `parameters()` 生成器直接调 `requires_grad_` 的 AttributeError（用户原稿 bug）；CLI `nargs="+"` 空格分隔（用户否决逗号 lambda + 防呆校验，均已从简）；冒烟 5 配置 PASS（905.8 / 764.2 / 147.9 / 141.6 / 757.9M）。**新 `{"talker"}` 臂**（sft_frz_talkhead，从 base）：in-sample 0.8660/**1.77%**/3.090、hard 0.8109/**18.4%**/2.230——**CER 双集全场最佳**（超过 GRPO），MOS 与 predictor-only 持平（text_projection 对 MOS 中性），sim 代价 hard 放大（0.858 vs 0.811）。三线证据（旧消融/剂量曲线/对称对）收敛：**talker 侧承载音色，predictor 侧承载声学质量+文本跟随**。
+
+### 22.7 runs/ 清理 + 文档
+
+- eval/ 分区：`insample/{sft_vs_grpo,frz,talker}`、`hard/*`、`ood8/`、`stability/`、`verify/`、`mos/`（权威）、`logs/` + README（口径、对照表、清理记录）。
+- 清理 34.4G→15G：grpo_v1-v4 整删、**grpo_v5 全部 ckpt 含 latest 删除（最终 GRPO 策略已无 ckpt，复评需重训 ~2h）**、现役 SFT 臂 latest.pt 删（不可 --resume，重训 ~4min）、sft_ep2/sft_frz_talk 的 export 暂留（用户指示）。数字结论全在 eval/ 报告，无信息损失。
+- 根 README 补 Setup + Basic usage（四步 CLI，对照三 worker 实际 argparse）。
+
+### 22.8 GRPO 池重构：100 → 800 训练 + 10 留出
+
+用户发现 v5 池仅 100 条（8×100 步 = 每条平均 ~8 次访问）。澄清：RL 复用 prompt 合法（每次访问都是当时策略下的全新 rollout，复用的是 prompt 不是 rollout）；但池多样性是真泛化轴（§22.2 极 OOD 归零佐证）。新池：源 `../delta-me13/corpora/sft/cyrene/chs.jsonl`（279 对话 → 1647 assistant 回复）拆行 + 去纯标点 + 去 SFT 整段重复（1542）→ 1557 去重（与旧池构建数字一致，管线保真）→ `MIN_LEN=10` 过滤 → 1371 → **最长前 810**（用户拍板，弃随机方案）→ 800 训练 `probes/grpo.txt`（21/31/119 字）+ **10 留出 `probes/insample.txt`**（22/30/48），种子 20260831。**协议升级：留出集从未入训——in-domain 泛化与池内记忆首次可分离测量**（旧"in-sample"实为从训练池抽样，被污染）。
+
+### 22.9 未决 / 下一步
+
+1. **扩池 GRPO 重跑**（v6）：`--text-pool-path probes/grpo.txt`，验证打 `probes/insample.txt`——检验 OOD 泛化是否随池多样性改善（需先重训 GRPO ~2h）。
+2. **decay**（0.3→0 线性）已设计未实施；剂量曲线指向 predictor 干扰可进一步压低。
+3. CE 锚混合目标（§20.5-3：`L = L_GRPO + λ·L_CE(GT)`）待拍板。
+4. FRZ 系数字的 MOS 均以 `mos/rescore_mos.json` 为准；新臂评估必须与参照臂同 scorer 进程打分。
+
+## 23. 分工四臂 v2：GRPO 基座与 OOD teaching 路线定标（2026-08-31）
+
+用户重做四臂对称消融（决策导向：选 GRPO 基座 + 为「非本人 OOD 音频 teaching forcing 教特殊场景」路线定方向）。旧臂 export 已被清理，本轮全从 base 重训。**评估协议升级：insample = `probes/insample.txt` 8 条从未入训的留出文本（池内记忆与泛化首次分离）；hard = `probes/hard.txt` 8 条（4 拟声 + 4 绕口令）；64 wav 同一 scorer 进程打分**。完整报告 = `runs/abl2_eval/report.md`。
+
+### 23.1 设置与主结果
+
+- 四臂（base ckpt、lr 5e-6、1ep、B4/accum1、warmup 20、同 seed 0）：`base`（全量 905.8M，sub 0.3）/ `sw002`（全量，sub 0.02）/ `subfrz`（冻 code_predictor，764.2M）/ `talkfrz`（冻 talker.model+codec_head，147.9M）；text_projection 双冻结臂均训（唯一变量 = 哪个生成栈学习）。
+- 主表（mean）：insample sim/CER/MOS/dur → base **0.8686**/2.74/2.869/8.1s；sw002 0.8531/3.23/2.949/7.2s；subfrz 0.8626/4.19/**3.101**/6.9s；talkfrz 0.8423/**1.78**/2.833/6.8s。hard → base 0.7748/19.2/2.327；sw002 0.7913/27.5/2.252；subfrz 0.7915/17.4/**2.361**；talkfrz 0.7451/**12.3**/2.212。
+
+### 23.2 分工定案（v1 消融强化版）
+
+1. **文本跟随 + 极端文本鲁棒性 = predictor 侧**：talkfrz 全胜——hard 剪 runaway（每臂恰 1 条 77-79s，臂间无差）后 CER **9.1%** vs 其余 19-31%；拟声组 21.7% vs 29-40%；绕口令组 2.9% vs 6-15%。
+2. **音色 = talker 侧**：talkfrz 双集 sim 垫底且 hard 崩至 0.745——冻 talker 后音色只剩 slot 向量 + text_projection 间接通路。
+3. **MOS = predictor 健康度**：subfrz（predictor 零接触）双集第一；talkfrz（predictor 被单域 CE 重训）垫底。
+4. **语速（风格代理）被全参微调拉长**：全量臂 7.25-8.11s vs 冻结臂 6.8s（同文本同种子）。sub_weight 剂量 0.3→0.02 对 CER **非单调**（hard 19.2→27.5 反升）——§22.4 的"越小越好"外推不成立（n=8，弱结论）。
+5. 训练末态 sem：base/sw002/subfrz ≈ 0.81，talkfrz 1.064（sem 头冻在 codec_head，只能间接拖动）。
+
+### 23.3 两个决策
+
+- **GRPO 基座 → subfrz 型 export**：GRPO 可训练面（talker MLP r=16）要求基座 talker 已充分适配（talkfrz 的 talker 是 base 原重，r=16 补不回全秩漂移，§20.1）；GRPO 冻结面（predictor）应交最健康者（subfrz 零接触、MOS 第一）。备选 = base 臂（官方全参路线，insample CER 第二）。
+- **OOD teaching-forcing → 两段式**：第一段 subfrz 型适配 talker（sim/MOS 双高），第二段冻 talker 只训 predictor(+text_projection) 吃 OOD 教学——音色由已适配的冻结尾保护。talkfrz 臂即该路线彩排：predictor 训练交付全部极端文本收益，hard-sim 0.745 的崩塌是"冻了 talker 但 talker 没适配过"的反面教材。
+
+### 23.4 环境与杂项
+
+- 旧 scorer 的 `--sv-dir /tmp/opencode/sv` 目录已不存在；核实 `ensure_sv_ckpt` 语义 = 目录缺失自动走 modelscope fetch，原命令可安全重启。SFT/评估生成全程不依赖 scorer，fresh scorer 只需在打分前 connected。
+- 本轮 eval 进程 `c.close()` 后挂住不退出（DONE 已打、report 已写），kill -9 收尾；下次脚本在 close 后加显式 `sys.exit`/context 处理。
+- `runs/abl2_*/latest.pt`（全参臂 ~7.4G×3）待用户处置；export 各 ~1.8-2.4G 保留。
+
+## 24. 8-take 重评估 + sub_weight 证伪 + embedding 考古 + text_embedding 冻结定案（2026-08-31）
+
+### 24.1 8-take 重评估（部分完成，scorer 队列被用户取消）
+
+- **512 wav 已全部生成**（4 臂 × [8 insample + 4 hard 绕口令 + 4 ood 拟声] × 8 take；graphed B8、T0.9/topk50、seed 1234+i 组内共享流、budget 1024；`runs/abl2_eval8/{臂}/{集}/{prompt:02d}_{take}.wav`）。CER/MOS 未打：runaway 长剪（77-80s，顶满 budget）上 ASR+MOS ~30 min/组（怪物组实测 asr 875s + mos 878s），用户裁定取消。
+- **Runaway 率 = 本轮最硬发现**（dur≥60s）：ood 集 talkfrz **15/32（47%）** > sw002 11/32 > base 5/32 > **subfrz 2/32**；insample/hard 四臂均 ≤2。**EOS 判定随 predictor 训练劣化**（非单调：0.02 比 0.3 更差）。runaway 是 prompt 特异的（ood p0「齁噢快停下」p3「咕咕噜」为重灾区，绕口令几乎安全），且全部顶满 token_budget。
+- **SV-only 全量打分**（`runs/abl2_eval8/sv_report.json/md`）：健康 take 的 sim 四臂同档（insample 0.84-0.88、std 全部 ~0.03——稳定性无差）；**runaway take 的 sim 崩至 0.30-0.46**（voice 随胡言乱语漂走，健康 0.84+，双峰）。§23.2 的「talkfrz hard sim 崩塌」实为 runaway 伪影——单 take 评估抽中什么全凭运气。
+- 增量落盘教训：分数只在组完成后可见，中间态不可存——后续评估脚本逐组 flush + `os._exit(0)` 防 zmq 挂。
+
+### 24.2 sub_weight 旋钮证伪：Adam 尺度不变性
+
+- 用户问「为什么 sw002（w=0.02）和 base（w=0.3）没区别」→ 权重漂移实测：predictor 层 rel-L2 **0.39% vs 0.38%**——15 倍 loss 权重差，漂移零差。
+- **机制**：predictor 参数只从 `w·g_sub` 拿梯度，Adam 更新 = `lr·m/√v` 对常数缩放不变——**loss 缩放类旋钮被优化器原样吞掉**。freeze 有效是因为断梯度（`requires_grad=False`），无量可归一。talker 侧混合梯度 `g_sem + w·g_sub` 中 g_sem 主导 + grad-clip 再归一，w 同样失效（三臂 0.21-0.23%）。
+- **w=0 决定性实验**（abl2_sw000，用户设计以防代码 bug）：predictor 86 键中 **71 键（5 层 + 15 lm_head + norms）漂移 <0.001% 真零**——旋钮机械上正确；15 张 codec_embedding 表漂移 0.05-0.30% 源自 **sem 路径共享**（`modeling_qwen3_tts.py:1988`：ref 码 1-15 的输入嵌入就是 predictor 的表，sem loss 经 talker 输入路径训练它们，与 sub_weight 无关）。
+- **§22.4 剂量曲线（0.3→0.1 CER 近砍半）就此作废**：既然 w=0.02 ≡ w=0.3，0.1 亦然；当时 n=12 单 take 评估，差距 = 单 take 噪声 + run 间方差。若真要调 predictor 学习量，正确旋钮 = 按参数组分 lr（Adam 更新随 lr 线性缩放）；GRPO 的 γ 同为 loss 缩放，不变性警告适用（好在 GRPO 的 predictor 本就冻结）。
+
+### 24.3 embedding 拓扑（17 表 3 组，345.8M = 38% 参数）
+
+| 组 | 键 | 形状 | 参数 |
+|---|---|---|---|
+| ① text_embedding | `talker.model.text_embedding.weight` | (151936, 2048) | 311.2M |
+| ② talker 主 codec 表 | `talker.model.codec_embedding.weight` | (3072, 1024) | 3.1M |
+| ③ predictor 15 表 | `code_predictor.model.codec_embedding.{0..14}` | 各 (2048, 1024) | 31.5M |
+
+- ③ 是**共享表**：predictor 输入 + talker 输入路径（teacher forcing 的 ref 码嵌入）双用——sem/sub 两条 loss 都到得了。② row 3000 = 导出手术烤 speaker 向量处（官方同款）。text_projection（6.3M）与 codec_head（3.1M）是投影/输出头，不是查表。词表 151936 = **Qwen2 系词表**（Qwen2.5/Qwen3 沿用），TTS 仓库不附带 tokenizer；权重级同源性本地不可验证（ASR 对照无效——两边各自训过，rel-L2 1.135）。
+- 1.7B 账本：text_embedding 同为 311.2M（词表/维度共享设计），③ 翻倍至 63M，embedding 合计 380.4M（19.7%）——**冻 embedding 为 1.7B 全参 SFT 省 2.28 GiB Adam 状态**（14.31 → ~12 GiB 地板，§20.4 的 16G 卡账本重算入口）。
+
+### 24.4 官方配方考古（0.6B-Base → 官方 CustomVoice 权重漂移）
+
+| 组件 | 官方漂移 | 裁决 |
+|---|---|---|
+| **① text_embedding** | **0.005%** | **官方冻结**（bf16 噪声级）——用户直觉实锤 |
+| ② 主表（9 烤入行外，3063 行） | 1.395% | 训练 |
+| ② 主表 9 行 | norm 9.6-10.2 | 烤 speaker 向量（官方 9 内置音色，行 2861-2878 + 3010-3066；我们的 slot 3000 恰好不在其内） |
+| ③ 15 共享表 | 0.69-2.01%（mean 1.45%） | 训练 |
+| talker 层 / codec_head / text_projection / predictor 层 | 0.8-1.6% | 全训（**官方 SFT 不冻 predictor**） |
+
+官方 = 全参 FT 减 text_embedding；漂移尺度 ~1.5%（lr 2e-5 多 epoch）vs 我们 ~0.2%（5e-6 1ep），同族不同强度。
+
+### 24.5 定案：SFT 无条件冻结 text_embedding
+
+- `SftTrainerModel.__init__` 硬编码 `talker.model.text_embedding` 的 `requires_grad_(False)`——**无 CLI 开关**（用户裁定：信官方，不值得暴露旋钮）。docstring 记录官方漂移依据 + Adam 稀疏行论证（罕见 token 行在 Adam 下与常用行同速 sign-step）+ 显存红利（311M×3 bf16 ≈ 1.87G）。
+- 冒烟 5 配置 PASS：None **594.6M** / {subtalker} 453.0M / {talker} 147.9M / {talker,text} 141.6M / {subtalker,text} 446.8M；断言 text_embedding 永不出现在 trainable。ruff 全绿。
+- **旧臂语义注记**：旧 `{"talker"}` 臂因 `talker.model.parameters()` 意外已含 ① 冻结（147.9M 从未含它），而 subfrz/全量臂在训 ①——新不变量使所有配置一致，此后重训臂与 §22/§23 数字严格可比性以「① 冻结」为新基线。GRPO 不受影响（LoRA 目标本不含 embedding）。
+- 未做（用户裁定不跑训练）：官方对齐臂重训对照、健康 take 的 CER/MOS 补打（fast 脚本骨架在 `/tmp/opencode/eval8_fast.py`，跳 dur≥60s）、`runs/abl2_*/latest.pt`（~22G）待处置。
+- **公开脚本比对（2026-08-31 续）**：`QwenLM/Qwen3-TTS` `finetuning/sft_12hz.py` 全脚本无一处 `requires_grad_(False)`，`AdamW(qwen3tts.model.parameters())` 全量入优化器，text_embedding 在前向图中活跃——**公开脚本会训练 text_embedding，与官方 CV 产物（0.005%）矛盾 → 官方内部配方 ≠ 公开脚本**（内部多一步冻结或由另一管线产出）。我们的无条件冻结 = 对齐官方**产物**，非复刻公开脚本。附带核实：`"spk_id": {name: 3000}` 硬编码 slot 3000（官方 CV 的 9 槽来自另一多音色管线）；`loss = outputs.loss + 0.3 * sub_talker_loss` 即我们继承的 0.3 常数——在 Adam 下同被尺度不变性吞掉（§24.2 对官方自己同样成立）；speaker_encoder 未冻结但 `.detach()` 切梯度 → `grad=None` → AdamW 跳过（意外安全）；§15/§17 记录的 double-shift 与隐态选位问题原样在。
+- **旧训练的 text_embedding 漂移解剖（2026-08-31 续）**：聚合 rel-L2 全训练臂 0.0201-0.0202%（sft_v1/abl2_base/sw002/sw000 逐位同档——sem 路径唯一驱动，sub 项贡献为零，Adam 不变性第四次实证；talkfrz 0.0000% 结构冻结）。行级（sft_v1）：151,936 行中仅 **4,262 行**漂移 >1e-4，与语料唯一 token 行（4,289）99.2% 重合，未用行 0.00% 位不动——「梯度只到过语料用过的行」。行相对漂移 median 0.09%（max 7.26%，某罕见 token），绝对值 ~37% Adam 天花板（方向部分相干）。即：训 text_embedding 的实际效果 = **领域剧本词表的隐空间重写**，147k 无关行零风险也无零收益。

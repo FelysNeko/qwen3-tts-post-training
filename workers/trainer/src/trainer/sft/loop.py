@@ -78,6 +78,8 @@ class SftConfig:
     # an explicit path overrides.
     speaker_audio: str | None = None
     limit: int | None = None  # debug cap on dataset rows
+    freeze: list[str] | None = None  # ⊆ {subtalker, talker, text}; None = 全训
+    sub_weight: float = 0.3  # subtalker CE weight in loss = sem + w * sub
 
     batch_size: int = 2
     grad_accum: int = 4  # effective batch = batch_size * grad_accum (official)
@@ -235,7 +237,7 @@ def run_sft(cfg: SftConfig) -> None:
         logger.info(f"speaker audio: {cfg.speaker_audio} (cache medoid)")
 
     torch.manual_seed(cfg.seed)
-    model = SftTrainerModel(cfg.model_path, device=cfg.device)
+    model = SftTrainerModel(cfg.model_path, device=cfg.device, freeze=cfg.freeze)
     assert model.model.speaker_encoder is not None, (
         f"{cfg.model_path} has no in-model speaker_encoder — SFT starts ONLY "
         "from a base ckpt (tts_model_type == 'base'); custom_voice ckpts "
@@ -285,7 +287,7 @@ def run_sft(cfg: SftConfig) -> None:
                 tf.sub_talker_logits.float().flatten(0, 1),
                 tf.talker_codec_ids[:, 1:].flatten(),
             )
-            loss = loss_sem + 0.3 * loss_sub
+            loss = loss_sem + cfg.sub_weight * loss_sub
             if torch.isfinite(loss):
                 (loss / cfg.grad_accum).backward()
             else:
