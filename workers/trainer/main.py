@@ -20,14 +20,19 @@ def main() -> None:
     shared.add_argument(
         "--cache-dir",
         type=str,
-        help="cache ROOT location (default <repo>/.cache); the pool is "
-        "{cache-dir}/{namespace}",
+        help="cache ROOT location (default <repo>/.cache); pools are "
+        "{cache-dir}/{namespace} with namespace mirroring the corpus "
+        "hierarchy, e.g. Cyrene/Chinese(PRC)",
     )
     shared.add_argument(
-        "--namespace",
-        type=str,
+        "--namespaces",
+        nargs="+",
         required=True,
-        help="pool selector under the cache root (e.g. Chinese(PRC))",
+        help="pool selector(s) under the cache root, e.g. "
+        "Cyrene/Chinese(PRC); each namespace string IS its speaker name "
+        "(export spk_id, GRPO sampling); sft takes K namespaces (K=1 = "
+        "single-speaker), grpo takes exactly one for now (asserted in "
+        "run_grpo; the list form is the future multi-speaker interface)",
     )
     shared.add_argument("--lr", type=float)
     shared.add_argument("--warmup-steps", type=int)
@@ -42,22 +47,25 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sft = subparsers.add_parser("sft", parents=[shared])
-    sft.add_argument("--speaker-audio", default=None)
-    sft.add_argument("--limit", type=int, default=None)
     sft.add_argument(
-        "--freeze", nargs="+", default=None, help="frozen components: subtalker talker text"
+        "--per-pool-cap",
+        type=int,
+        default=None,
+        help="balanced head-slice per pool (train-side only; on a single "
+        "pool this doubles as the debug limit)",
+    )
+    sft.add_argument(
+        "--freeze", nargs="+", default=None, help="frozen components: subtalker talker text embedding blocks"
     )
     sft.add_argument("--sub-weight", type=float, default=None)
     sft.add_argument("--batch-size", type=int, default=None)
     sft.add_argument("--grad-accum", type=int, default=None)
     sft.add_argument("--epochs", type=int, default=None)
     sft.add_argument("--log-every", type=int, default=None)
-    sft.add_argument("--export-name", default=None)
 
     grpo = subparsers.add_parser("grpo", parents=[shared])
     grpo.add_argument("--lora-r", type=int, default=None)
     grpo.add_argument("--lora-alpha", type=float, default=None)
-    grpo.add_argument("--speaker", default=None)
     grpo.add_argument("--num-prompts", type=int, default=None)
     grpo.add_argument("--group-size", type=int, default=None)
     grpo.add_argument("--token-budget", type=int, default=None)
@@ -77,8 +85,8 @@ def main() -> None:
     grpo.add_argument("--scorer-timeout", type=float, default=None)
 
     args = parser.parse_args()
-    # CLI kwargs 直灌（--namespace required=True 保证在场；未给的键 = None
-    # 已过滤 → 落回 dataclass 默认值）
+    # CLI kwargs 直灌（未给的键 = None 已过滤 → 落回 dataclass 默认值）；
+    # pool/speaker 选择器的存在性校验在 run_grpo/run_sft 内部 fail-loud
     overrides = {
         key: value
         for key, value in vars(args).items()

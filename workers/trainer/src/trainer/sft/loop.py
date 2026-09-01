@@ -9,6 +9,11 @@ the codes are precomputed by the preprocess worker, so a training step is
 purely `collate → teacher_forcing → CE` on the shared kernels
 (`ModelWrapper.collate` / `ModelWrapper.teacher_forcing`).
 
+Multi-speaker (`--namespaces`): K pools mix per batch — per-pool medoid vecs
+stack to [b, hidden] into slot 6 (single-speaker = the K=1 broadcast case)
+and `export_custom_voice` bakes one row per voice (slots 3000, 3001, ...),
+so the GRPO worker can sample any exported speaker by name.
+
 Loss (the single-shift pairing `teacher_forcing` was built for — the official
 `sft_12hz.py` double-shifts both the labels (`inputs_embeds[:, :-1]` +
 `labels[:, 1:]` through the internal HF CE) and the sub-talker hidden
@@ -39,6 +44,7 @@ import logging
 import random
 import shutil
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,7 +52,7 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
-from qwen3_tts_post_training.cache import CacheLayout
+from qwen3_tts_post_training.cache import CacheLayout, load_multi_sft_dataset
 from qwen3_tts_post_training.paths import repo_root
 from qwen3_tts_post_training.system import gpu_allocated_mb, peak_rss_mb
 from trainer.sft.model import (
@@ -59,10 +65,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SftConfig:
-    # The pool selector — REQUIRED, no default: the pool dir is
-    # {cache_dir}/{namespace}. The CLI enforces --namespace; a programmatic
-    # caller must name its pool explicitly.
-    namespace: str
+    # Pool selector(s): dirs are {cache_dir}/{namespace}, namespace
+    # mirroring the corpus hierarchy. The NAMESPACE STRING is the speaker
+    # name everywhere (export spk_id, GRPO sampling) — no separate
+    # speaker-naming configuration. One namespace = single-speaker (the
+    # K=1 case of the same path); K namespaces mix per batch.
+    #
+    # Speaker vecs are extracted from each pool's medoid
+    # (`CacheLayout.speaker_ref`) and travel ONLY through slot 6
+    # ([b, hidden] per batch); mixed batches mean identity cannot bake
+    # into shared weights.
+    namespaces: list[str]
+    # Balanced head-slice per pool (train-side only; metrics/medoid stay
+    # full-pool). None = use every clip of every pool.
+    per_pool_cap: int | None = None
 
     # SFT starts ONLY from a base ckpt (asserted after load: base models
     # ship the in-model speaker encoder, custom_voice ckpts carry none) —
@@ -73,11 +89,6 @@ class SftConfig:
 
     # cache_dir = the cache ROOT location (default <repo>/.cache).
     cache_dir: str = str(repo_root() / ".cache")
-    # Reference wav → speaker embedding. None (default) = the cache's
-    # metrics.json `medoid` clip (pool ERes2NetV2 medoid, STATUS §19.4);
-    # an explicit path overrides.
-    speaker_audio: str | None = None
-    limit: int | None = None  # debug cap on dataset rows
     freeze: list[str] | None = None  # ⊆ {subtalker, talker, text}; None = 全训
     sub_weight: float = 0.3  # subtalker CE weight in loss = sem + w * sub
 
@@ -94,8 +105,6 @@ class SftConfig:
     ckpt_every: int = 50  # optimizer steps between rolling-ckpt writes
     log_every: int = 10
     resume: bool = False
-
-    export_name: str = "cyrene"  # spk_id entry written by export_custom_voice
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +164,11 @@ _EXPORT_COPY_FILES = (
 def export_custom_voice(
     cfg: SftConfig,
     model: SftTrainerModel,
-    speaker_vec: torch.Tensor,
+    speakers: list[tuple[str, torch.Tensor]],
 ) -> Path:
-    """Bake the reference-audio speaker into a drop-in CustomVoice ckpt dir.
+    """Bake the reference-audio speaker(s) into a drop-in CustomVoice ckpt
+    dir. `speakers` = [(spk_id_name, speaker_vec)] — one entry per voice;
+    slots allocate max+1 (3000, 3001, ...), reusing a name's existing slot.
 
     The original model.safetensors holds ONLY `talker.*` tensors, so the
     export filters the state_dict the same way (speech_tokenizer and
@@ -190,13 +201,13 @@ def export_custom_voice(
     config["tts_model_type"] = "custom_voice"
     talker_config = config.get("talker_config", {})
     spk_id: dict = talker_config.get("spk_id", {})
-    if cfg.export_name in spk_id:
-        slot = spk_id[cfg.export_name]
-    else:
-        slot = max(spk_id.values(), default=2999) + 1
-    spk_id[cfg.export_name] = slot
+    for name, _ in speakers:
+        slot = spk_id[name] if name in spk_id else max(spk_id.values(), default=2999) + 1
+        spk_id[name] = slot
     talker_config["spk_id"] = spk_id
-    talker_config.setdefault("spk_is_dialect", {})[cfg.export_name] = False
+    spk_dialect = talker_config.setdefault("spk_is_dialect", {})
+    for name, _ in speakers:
+        spk_dialect[name] = False
     config["talker_config"] = talker_config
     config_path.write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -208,9 +219,13 @@ def export_custom_voice(
         if k.startswith("talker.")
     }
     embedding = state_dict["talker.model.codec_embedding.weight"]
-    embedding[slot] = speaker_vec.detach().to("cpu").to(embedding.dtype)
+    baked = []
+    for name, vec in speakers:
+        slot = spk_id[name]
+        embedding[slot] = vec.detach().to("cpu").to(embedding.dtype)
+        baked.append(f"{name!r}@{slot}")
     save_file(state_dict, out / "model.safetensors", metadata={"format": "pt"})
-    logger.info(f"exported speaker {cfg.export_name!r} @ slot {slot} → {out}")
+    logger.info(f"exported speakers [{', '.join(baked)}] → {out}")
     return out
 
 
@@ -231,10 +246,9 @@ def _assert_model_available(model_path: str) -> None:
 
 def run_sft(cfg: SftConfig) -> None:
     _assert_model_available(cfg.model_path)
-    layout = CacheLayout(Path(cfg.cache_dir) / cfg.namespace)
-    if cfg.speaker_audio is None:
-        cfg.speaker_audio = str(layout.speaker_ref())
-        logger.info(f"speaker audio: {cfg.speaker_audio} (cache medoid)")
+    assert cfg.namespaces, "sft requires --namespaces"
+    layouts = [CacheLayout(Path(cfg.cache_dir) / ns) for ns in cfg.namespaces]
+    speaker_names = list(cfg.namespaces)
 
     torch.manual_seed(cfg.seed)
     model = SftTrainerModel(cfg.model_path, device=cfg.device, freeze=cfg.freeze)
@@ -243,10 +257,16 @@ def run_sft(cfg: SftConfig) -> None:
         "from a base ckpt (tts_model_type == 'base'); custom_voice ckpts "
         "carry none (continue GRPO from those, not SFT)"
     )
-    speaker_vec = extract_speaker_vec(model, cfg.speaker_audio)
     model.model.train()
 
-    data = layout.load_sft_dataset(limit=cfg.limit)
+    speaker_vecs = torch.stack(
+        [extract_speaker_vec(model, lay.speaker_ref()) for lay in layouts]
+    )
+    data = load_multi_sft_dataset(layouts, per_pool_cap=cfg.per_pool_cap)
+    counts = Counter(tag for _, _, tag in data)
+    logger.info(
+        "pools: " + ", ".join(f"{n}={counts[i]}" for i, n in enumerate(speaker_names))
+    )
     assert data, "empty dataset"
     batch_size = cfg.batch_size
     n_batches = (len(data) + batch_size - 1) // batch_size
@@ -263,7 +283,7 @@ def run_sft(cfg: SftConfig) -> None:
 
     logger.info(
         f"training {len(data)} clips: {n_batches} batches/epoch × {cfg.epochs} epochs"
-        f" = {total_pos} steps | speaker vec {tuple(speaker_vec.shape)} |"
+        f" = {total_pos} steps | speaker vecs {tuple(speaker_vecs.shape)} |"
         f" {sum(p.numel() for p in model.trainable_parameters)} trainable params"
     )
 
@@ -277,7 +297,9 @@ def run_sft(cfg: SftConfig) -> None:
             t0 = time.monotonic()
             idx = order[bi * batch_size : (bi + 1) * batch_size]
             batch = model.collate([data[i][0] for i in idx], [data[i][1] for i in idx])
-            tf = model.teacher_forcing(batch, speaker_vec)
+            tf = model.teacher_forcing(
+                batch, speaker_vecs[[data[i][2] for i in idx]]
+            )
             loss_sem = F.cross_entropy(
                 tf.talker_logits.float().flatten(0, 1),
                 batch.codec_0_labels[:, 1:].flatten(),
@@ -338,4 +360,6 @@ def run_sft(cfg: SftConfig) -> None:
 
     _save_ckpt(cfg, model, optimizer, total_pos)
     monitor_f.close()
-    export_custom_voice(cfg, model, speaker_vec)
+    export_custom_voice(
+        cfg, model, list(zip(speaker_names, speaker_vecs, strict=True))
+    )

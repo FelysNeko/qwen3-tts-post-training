@@ -69,10 +69,12 @@ TEXT_POOL = (
 
 @dataclass
 class TrainConfig:
-    # The pool selector — REQUIRED, no default: the pool dir is
-    # {cache_dir}/{namespace}. The CLI enforces --namespace; a programmatic
-    # caller must name its pool explicitly.
-    namespace: str
+    # The pool selector(s) — pool dirs are {cache_dir}/{namespace},
+    # namespace mirroring the corpus hierarchy. EXACTLY ONE for now
+    # (asserted in run_grpo); the list form is the future multi-speaker
+    # GRPO interface. The namespace string IS the speaker name (SFT export
+    # spk_id) — `speaker` left None falls back to it.
+    namespaces: list[str]
 
     # §16: the preprocess cache is the SINGLE source for calibration AND
     # data — metrics.json (sim stats → RewardConfig) + centroid.npy MUST
@@ -86,7 +88,6 @@ class TrainConfig:
     device: str = "cuda:1"
     lora_r: int = 16
     lora_alpha: float = 64
-    speaker: str = "cyrene"
 
     text_pool: tuple[str, ...] = TEXT_POOL
     text_pool_path: str | None = None  # if set, overrides text_pool (one line each)
@@ -203,6 +204,14 @@ def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
 
 def run_grpo(cfg: TrainConfig) -> None:
 
+    assert len(cfg.namespaces) == 1 and cfg.namespaces[0], (
+        "grpo takes exactly one --namespaces entry for now (multi-speaker "
+        "GRPO is future work)"
+    )
+    namespace = cfg.namespaces[0]
+    # the namespace string IS the speaker (no separate speaker config)
+    speaker = namespace
+
     assert Path(cfg.model_path).exists(), (
         f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
     )
@@ -216,11 +225,11 @@ def run_grpo(cfg: TrainConfig) -> None:
     sampler = Sampler.build(
         ttm,
         impl=cfg.sampler_impl,
-        speaker=cfg.speaker,
+        speaker=speaker,
         batch_size=cfg.group_size,
         lmax=cfg.token_budget_infer,
     )
-    lpc = LogProbComputer(ttm, speaker=cfg.speaker)
+    lpc = LogProbComputer(ttm, speaker=speaker)
     scorer = Client(
         push_endpoint=cfg.scorer_push_endpoint,
         pull_endpoint=cfg.scorer_pull_endpoint,
@@ -253,7 +262,7 @@ def _train_loop(
         kl_beta=cfg.kl_beta,
         num_code_groups=ttm.talker.config.num_code_groups,
     )
-    layout = CacheLayout(Path(cfg.cache_dir) / cfg.namespace)
+    layout = CacheLayout(Path(cfg.cache_dir) / cfg.namespaces[0])
     reward_cfg = layout.reward_config()
     sv_centroid = torch.as_tensor(
         layout.load_centroid(), dtype=torch.float32, device=cfg.device

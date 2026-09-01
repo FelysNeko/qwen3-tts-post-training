@@ -1,11 +1,13 @@
-"""Preprocess worker entrypoint — corpus → `.cache/{dataset.name}`.
+"""Preprocess worker entrypoint — corpus → `.cache/{namespace}`.
 
 Usage (any resident scorer worker — it is calibration-free):
     workers/preprocess/.venv/bin/python workers/preprocess/main.py \
-      --dataset /path/to/corpus/Chinese(PRC)
+      --corpus-dir /path/to/corpus --namespace Cyrene/Chinese(PRC)
 
-The corpus wav dir is the input (sibling `{dataset.name}.jsonl` provides
-{name, text}); the pool lands at `{cache-dir}/{dataset.name}`.
+The corpus wav dir is `{corpus-dir}/{namespace}` (the namespace mirrors the
+corpus hierarchy and IS the speaker name downstream); its sibling
+`{corpus-dir}/{namespace}.jsonl` provides {name, text}. The pool lands at
+`{cache-dir}/{namespace}`.
 
 Four checksum-guarded stages (see preprocess/pipeline.py): filter →
 enhanced(clearvoice 48k) → codes → embedding. The enhanced 48k output is
@@ -20,6 +22,7 @@ import argparse
 import logging
 from pathlib import Path
 
+import torch
 from preprocess.pipeline import run_pipeline
 
 from qwen3_tts_post_training.paths import repo_root
@@ -28,40 +31,53 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--dataset",
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--corpus-dir",
         type=Path,
         required=True,
-        help="corpus wav dir; sibling {dir.name}.jsonl provides {name, text}",
+        help="a dirctory that contains sub-dir like Cyrene/Chinese(PRC)",
     )
-    ap.add_argument(
+    parser.add_argument(
+        "--namespace",
+        type=Path,
+        required=True,
+        help="must in format like Cyrene/Chinese(PRC), and Cyrene/Chinese(PRC).jsonl must exist",
+    )
+    parser.add_argument(
         "--model-path",
-        default="/mnt/d/Repository/models/PhiLia093-TTS/",
+        default="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         help="Qwen3-TTS ckpt (processor for filtering, speech_tokenizer for codes)",
     )
-    ap.add_argument("--device", default="cuda:1")
-    ap.add_argument(
+    parser.add_argument("--device", default="cuda:1")
+    parser.add_argument(
         "--cache-dir",
         type=Path,
         default=repo_root() / ".cache",
-        help="cache ROOT location; the pool is {cache-dir}/{dataset.name}",
+        help="cache ROOT location; the pool is {cache-dir}/{namespace}",
     )
-    ap.add_argument("--min-tokens", type=int, default=2)
-    ap.add_argument("--min-seconds", type=float, default=0.1)
-    ap.add_argument("--batch", type=int, default=16, help="scoring chunk size")
-    ap.add_argument(
+    parser.add_argument("--min-tokens", type=int, default=2)
+    parser.add_argument("--min-seconds", type=float, default=0.1)
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="shuffle the pool order (seeded — reproducible); SFT "
+        "--per-pool-cap head slices then sample uniformly instead of "
+        "taking the chapter-ordered corpus head",
+    )
+    parser.add_argument("--batch", type=int, default=16, help="scoring chunk size")
+    parser.add_argument(
         "--push-endpoint",
         default="tcp://127.0.0.1:5555",
         help="ZMQ PUSH bind (scorer PULL-connects here)",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--pull-endpoint",
         default="tcp://127.0.0.1:5556",
         help="ZMQ PULL bind (scorer PUSH-connects here)",
     )
-    ap.add_argument("--timeout", type=float, default=600.0, help="scorer timeout s")
-    return ap.parse_args()
+    parser.add_argument("--timeout", type=float, default=600.0, help="scorer timeout s")
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -70,17 +86,17 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = parse_args()
-    assert args.dataset.is_dir(), f"dataset wav dir not found: {args.dataset}"
-    assert Path(args.model_path).exists(), (
-        f"TTS ckpt not found at {args.model_path!r} — pass --model-path"
+    dataset = args.corpus_dir / args.namespace
+    assert dataset.is_dir(), f"corpus wav dir not found: {dataset}"
+    assert (args.corpus_dir / f"{args.namespace}.jsonl").exists(), (
+        f"transcript jsonl not found: {args.corpus_dir / f'{args.namespace}.jsonl'}"
     )
 
-    import torch
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
     from qwen3_tts_post_training.client.trainer import Client
 
-    logger.info(f"dataset={args.dataset} device={args.device}")
+    logger.info(f"using dataset: {dataset}")
     wrapper = Qwen3TTSModel.from_pretrained(
         args.model_path,
         device_map=args.device,
@@ -90,7 +106,7 @@ def main() -> None:
     processor = wrapper.processor
     speech_tokenizer = wrapper.model.speech_tokenizer
 
-    def tokenize_text(text: str) -> int:
+    def token_counter(text: str) -> int:
         ids = processor(text=text)["input_ids"]
         return len(ids[0]) if ids and isinstance(ids[0], list) else len(ids)
 
@@ -101,9 +117,10 @@ def main() -> None:
     )
     try:
         out = run_pipeline(
-            dataset=args.dataset,
+            dataset=dataset,
+            namespace=args.namespace,
             cache_root=args.cache_dir,
-            tokenize_text=tokenize_text,
+            tokenize_text=token_counter,
             speech_tokenizer=speech_tokenizer,
             client=client,
             device=args.device,
@@ -111,6 +128,7 @@ def main() -> None:
             min_tokens=args.min_tokens,
             min_seconds=args.min_seconds,
             batch=args.batch,
+            random_order=args.random,
         )
     finally:
         client.close()

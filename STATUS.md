@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-08-31（§24 8-take 重评估 + Adam 尺度不变性证伪 sub_weight + embedding 考古 + text_embedding 冻结定案）
+最后更新：2026-09-01（§38 preprocess --random 落地 + 七池乱序重跑，多说话人 SFT 就绪）
 
 ## 1. 目标
 
@@ -774,3 +774,124 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - 未做（用户裁定不跑训练）：官方对齐臂重训对照、健康 take 的 CER/MOS 补打（fast 脚本骨架在 `/tmp/opencode/eval8_fast.py`，跳 dur≥60s）、`runs/abl2_*/latest.pt`（~22G）待处置。
 - **公开脚本比对（2026-08-31 续）**：`QwenLM/Qwen3-TTS` `finetuning/sft_12hz.py` 全脚本无一处 `requires_grad_(False)`，`AdamW(qwen3tts.model.parameters())` 全量入优化器，text_embedding 在前向图中活跃——**公开脚本会训练 text_embedding，与官方 CV 产物（0.005%）矛盾 → 官方内部配方 ≠ 公开脚本**（内部多一步冻结或由另一管线产出）。我们的无条件冻结 = 对齐官方**产物**，非复刻公开脚本。附带核实：`"spk_id": {name: 3000}` 硬编码 slot 3000（官方 CV 的 9 槽来自另一多音色管线）；`loss = outputs.loss + 0.3 * sub_talker_loss` 即我们继承的 0.3 常数——在 Adam 下同被尺度不变性吞掉（§24.2 对官方自己同样成立）；speaker_encoder 未冻结但 `.detach()` 切梯度 → `grad=None` → AdamW 跳过（意外安全）；§15/§17 记录的 double-shift 与隐态选位问题原样在。
 - **旧训练的 text_embedding 漂移解剖（2026-08-31 续）**：聚合 rel-L2 全训练臂 0.0201-0.0202%（sft_v1/abl2_base/sw002/sw000 逐位同档——sem 路径唯一驱动，sub 项贡献为零，Adam 不变性第四次实证；talkfrz 0.0000% 结构冻结）。行级（sft_v1）：151,936 行中仅 **4,262 行**漂移 >1e-4，与语料唯一 token 行（4,289）99.2% 重合，未用行 0.00% 位不动——「梯度只到过语料用过的行」。行相对漂移 median 0.09%（max 7.26%，某罕见 token），绝对值 ~37% Adam 天花板（方向部分相干）。即：训 text_embedding 的实际效果 = **领域剧本词表的隐空间重写**，147k 无关行零风险也无零收益。
+
+### 24.6 官方 CV×Base 全量普查 + SVD 谱（402 共享键逐键 + 266 变更矩阵 svdvals；`probes/official_cv_census/report.json`）
+
+- **普查：官方除 text_embedding 外无其他刻意冻结**。逐位冻结的 106 键 = 全部 RMSNorm 权重（104 层内 norm + 2 final norm）——**我们的 abl2_base 同样位冻结 130 键、交集 106**：同一批 norm 在两个独立训练里都不动 → **涌现性位冻结**（RMSNorm 梯度 < bf16 ulp，lr 2e-5 官方也不例外），非刻意设计。① text_embedding 的"0.005%"实为**管线手术**：仅 3 行被点编辑（151671-151673 = `<tts_pad>`/`<tts_text_bos>`/`<tts_text_eod>`，max-abs 9e-4），训练零接触。speaker_encoder 76 键整体不随 CV 发布（§17.1 已知）。
+- **SVD：官方 ΔW 非低秩，§20.1 结论获官方产物级再证**。变更矩阵 svdvals：talker_layers r99 med 777（485-906）、e@16 med 21.8%、srank 38；pred_layers r99 820 / e@16 13.8%；pred_heads r99 769 / e@16 18.7%；codec_pred_tables r99 732 / e@16 27.2%；codec_head r99 844 / e@16 12.2%；codec_main（剔 9 烤入行）r99 880 / e@16 14.5%。最结构化的是 text_projection（e@16 38.5%、srank 24.6）——文本入口方向最相干。
+- **我们 abl2_base 同框**：更弥散（talker_layers r99 931、e@16 仅 8.4%、srank 61）——小漂移区（5e-6×445 步）的 ΔW 比官方（2e-5 多 epoch，漂移 6-10 倍大）更接近随机方向。**LoRA r=16 的能量捕获上限 = e@16：官方 ~12-27%、我们 ~8.4%**——「voice SFT 是满秩对象，r=16 复现不了」从 PhiLia 单例升级为双例（官方产品 + 我们的 run），且给出本机配方下的定量界。
+
+## 25. abl3:新基线(text_embedding 冻结)四臂重训 + 预算受控 8-take 全量评估（2026-08-31）
+
+- **归档**:abl2 全系(五臂 + 两代评估 + 512 wav)→ `runs/archive/abl2_20260831/`。
+- **重训**:四臂(同 §23 recipe/seed)在 §24.5 新不变量下,trainable 冒烟 147.9/453.0/594.6/594.6M ✓,exports = `runs/abl3_*/export`。
+- **评估协议升级**:`token_budget = 311`(**= max cur_len 61 + 250**,prompt 计入预算;音频硬上限 ~20s,runaway 撞墙不再产生 79s 怪物)→ 生成 4 分钟、512 剪单 scorer 全量打分 12 分钟零超时。`hit_cap` = 贴预算墙。报告 = `runs/abl3_eval8/report.md` + 逐 take `report.json`。
+- **主表**(mean±std):复现——MOS subfrz 双集第一(2.982/2.382)、sim base/subfrz 领先 talkfrz 垫底(hard 0.711)、EOS 免疫 subfrz(cap 0/0/12%)vs talkfrz(5/12/**50%**)。**修正**——insample CER 四臂 2.80-3.17%(std 2.6-5.6pp)全在噪声内,§22.6 的 talkfrz CER 优势为单 take 抽奖;sw002≈base 再证。GRPO 基座推荐不变:**subfrz 型**。
+- **事故**:双 scorer 在线(§24 会话僵尸未清 + 新起一只)→ PUSH 分流 + recv 挂死 30 min,WSL 重启清场后单 scorer 重打、作废中间 report。**新增硬规则:起 scorer 前必须 `pgrep -fc scorer/main[.]py` 计数 = 0,启动后断言 = 1**。
+
+## 26. blocks-vs-tables 归因:bothfrz / embfrz(2026-08-31)
+
+- **新增 `--freeze embedding`**(`sft/model.py` + main.py help):冻主 codec 表 `talker.model.codec_embedding` + predictor 15 表 `code_predictor.model.codec_embedding`(text_embedding 本就无条件冻);冒烟对账 560.0M 可训 + 34.6M 表 = 594.6M ✓。
+- **两臂**(配方/评估 = §25 同款):`bothfrz` = `--freeze talker subtalker`(仅 text_projection 6.3M 可训)、`embfrz` = `--freeze embedding`(560M 可训)。
+- **embfrz ≈ base 全指标噪声内** → 1ep@5e-6 下 codec 表(34.6M)惰性,学习由 stack 承担;**"微调威力源自 embedding"假设证伪**(限定:短训练口径)。
+- **bothfrz = 意外主角**:仅入口投影可训即 **MOS/CER 全场第一 + ood cap 12%**,但 **sim 崩塌**(hard 0.660)= 换声。text_projection = 全模型最高杠杆 6.3M;UTMOS/ASR 身份盲,**sim 必须留在 reward**(r_v3 已含)。报告:`runs/abl4_eval8/report.md`。
+
+## 27. embonly 补做:归因矩阵闭合(2026-09-01)
+
+- §26 bothfrz 系误冻(`talker.model.parameters()` 连主表、`code_predictor.parameters()` 连 15 表)——实际仅 text_projection 6.3M 可训。补做正确版 `--freeze blocks`(新增组件):双 stack(layers+norm)+ codec_head + predictor lm_head 冻,可训 = proj+双表 40,897,536(冒烟对账 ✓;首版漏冻 lm_head,复烟抓出)。
+- **embonly ≈ bothfrz 全指标**(sim 0.778/0.664/0.770,MOS 3.32/3.09/2.66):加 34.6M 可训表行为零变化 → §26 结论升级为**双向证伪**;**音色锚定在 stack**(训 stack 臂 sim≥0.87,不训臂塌 0.66-0.78);换声漂移由 text_projection 单独产生。报告见 `runs/abl4_eval8/report.md` 修正节。
+
+## 28. 阶段结论汇总：分工消融 + blocks-vs-tables 归因（2026-09-01 定稿）
+
+> §22-§27 的蒸馏版，实验数据详见各节与 `runs/abl{2,3,4}_eval8/report*.md`。
+
+**A. GRPO 基座与训练面**
+1. **基座选 subfrz 型**（冻 predictor，只训 talker）：MOS 双集第一（2.982/2.382）、EOS 免疫唯一（ood cap 12% vs base 47%/talkfrz 50%）、sim 保持 0.85+。talkfrz 型 EOS 最差，永不入选（§25）。
+2. **CER 排序须 8-take**：insample 四臂 2.80-3.17%（take 级 std 2.6-5.6pp），单 take 的"talkfrz CER 最佳"是抽奖（§23→§25 修正）。
+3. **sub_weight 旋钮 = 死旋钮**：Adam 二阶归一使 loss 标量缩放不改变 predictor 纯梯度参数的步长（w=0.02 vs 0.3 漂移 0.39% vs 0.38%）；w=0 决定性实验证旋钮机械正确（71/86 键真零，15 张 predictor 表经 sem 路径共享照训）。§22.4 剂量曲线作废（§24.2）。
+4. **线性 warmup 必须保留**、Dr.GRPO 无 std 除法、reward 必含 sim（§26/§27 的身份盲指标教训）。
+
+**B. embedding 考古与冻结不变量**
+5. **SFT 无条件冻 `talker.model.text_embedding`**（官方对齐：官方 CV vs Base 漂移 0.005% = 仅 3 行手工编辑 tts_pad/tts_text_bos/tts_text_eod@151671-3；Qwen2 词表血统）；无 CLI 开关（§24.5）。
+6. 官方 CV 真实配方：codec 表/层/头全训（1.0-1.6%），9 内置音色烤入行 2861-2878+3010-3066（slot 3000 不冲突），speaker_encoder 不随 CV 发布，106 个 RMSNorm 位冻结=涌现；公开 `sft_12hz.py` 无任何冻结 ≠ 官方内部配方（§24.4/24.6）。
+7. 旧训练的 text_embedding 漂移 = 4,262 行（语料 99.2% token），rare 行 Adam sign-step 同速——稀疏更新危害的实锤，也是冻它的理由（§24.5）。
+
+**C. blocks-vs-tables 归因（四点矩阵，§25-§27）**
+8. **codec 表双向惰性**：冻掉（embfrz≈base）无损失；可训但 stack 冻（embonly 40.9M）也救不了。1ep@5e-6 口径。
+9. **音色锚定在 transformer stack**：训 stack 臂 sim ≥0.87；不训臂塌 0.66-0.78，与其余可训什么无关。
+10. **text_projection（6.3M）= 全模型最高杠杆小块**：单独可训即产生全部换声漂移 + MOS 3.3/CER 2-4% 的身份盲"全场第一"。GRPO reward 摘 sim = 给策略留换声捷径。
+11. SVD 备忘：官方 ΔW 非低秩（r99 777-935，e@16 12-27%），我们更弥散 → LoRA r=16 的捕获上限 = e@16（§24.6）。
+
+**D. 评估与运维协议**
+12. **评估 token_budget 必须计入 prompt cur_len**（311 = max 61 + 250）：runaway 从 79s 灾难降级为 20s 可计量事件（hit_cap），打分 1.5h 超时 → 12 分钟；hit_cap = 更灵敏的 EOS 失败探测（§25）。
+13. 撞墙 take 的 CER/MOS 是截断污染，严肃比较用健康 take 口径（§25）。
+14. **scorer 单实例硬规则**：起前 `pgrep -fc` = 0、起后 = 1；双实例（僵尸未清）→ PUSH 分流 recv 挂死（§25 事故）；诊断工具一律 `uvx`（py-spy），不直装 venv。
+
+## 29. 多说话人 SFT 支持（2026-09-01）
+
+- **CLI**：`main.py sft --namespaces {a} {b} ... [--per-pool-cap N] [--export-names ...]`（`--namespace` 的 required 移入 main.py 断言：grpo/单人 sft 必须、多臂忽略；`--speaker-audio/--limit` 在多臂模式拒绝）。
+- **实现**：`cache.load_multi_sft_dataset`（(text, codes, speaker_tag) 三元组 + per-pool 头部均衡切片，只影响训练、metrics/medoid 仍全池）；`run_sft` 单/多统一 `[b, hidden]` slot-6 路径（单人 = K=1 广播，`teacher_forcing` 零改动）；`export_custom_voice` 多音色（spk_id 3000/3001/... 逐个烤入行），GRPO 可按名字采样任意导出音色。
+- **冒烟 5/5**（`/tmp/opencode/smoke_multi.py`，合成双池）：broadcast ≡ [b,hidden] 全同行（逐行跟随各自 vec）、双池训练 + 导出 spk_id/烤入行逐位等于重提取 vec、单人回归 cyrene@3000、多音色 export 经 ModelWrapper 加载成功；CLI 端到端另验。
+- **运维**：`/tmp` 是 12G tmpfs——冒烟/实验的 `latest.pt`（全量 FT ≈1.2G/个）会塞满它（今日实录）；大产物一律写 repo 盘。
+
+## 30. cache 架构:namespace 贯通 + speaker ≡ namespace(2026-09-01)
+
+- **层级化**:cache 从平铺 `.cache/{lang}/` 升级为镜像 corpus 层级的 `.cache/{speaker}/{lang}/`;preprocess CLI = `--corpus-dir /path/to/corpus --namespace Cyrene/Chinese(PRC)`(wav 目录 = `{corpus-dir}/{namespace}`,manifest = 同名 `.jsonl`——`Config.manifest` 原逻辑天然兼容);pool 落盘 `cache_root / namespace`(pipeline.run_pipeline 新增 namespace 参数,替换拍扁层级的 `dataset.name`)。
+- **speaker ≡ namespace(硬规则)**:namespace 字符串就是 speaker 名,贯通 preprocess 池 → SFT 导出 spk_id → GRPO 采样;**删除全部手动口子**——`--speaker-audio`、`--export-name(s)`、SFT `--namespace`/`--limit`、GRPO `--speaker`(TrainConfig.speaker 字段一并删,`speaker = namespace`)。CLI 统一:两者都走 shared `--namespaces`(sft K 个,K=1 即单人;grpo 恰好 1 个,run_grpo assert,列表形态留给未来多角色 GRPO)。
+- **SFT 代码简化**:run_sft 删单人/多臂分支(统一 K 池路径,单人 = K=1);`--limit` 语义被 `--per-pool-cap` 覆盖(单池 cap = 旧 limit);`--sub-weight` 保留(§24.2 的漏梯度验证实验待跑,用户拍板)。
+- **迁移**:`.cache/Chinese(PRC)` → `.cache/Cyrene/Chinese(PRC)`(纯 mv,零重算);旧 export(sft_v1/abl3_*)spk_id 仍是 "cyrene"——GRPO 续训它们需显式提供 namespace 对齐的 export,新导出全部带 namespace 名。
+- **验证**:冒烟 5/5(重跑,断言改 namespace 名)+ CLI 端到端(K=1 `--namespaces poolA` → `poolA@3000`)+ ruff;tmpfs 教训沿用(大 ckpt 一律写 repo 盘 runs/)。
+
+## 31. preprocess 增量验证:cyrene/Chinese(PRC) +30(2026-09-01)
+
+- **架构首验**:新层级 corpus(`delta-me13/corpora/tts/{speaker}/{lang}`)+ `--corpus-dir/--namespace` 路径式 CLI 全通;存量池随 speaker≡namespace 改名 `.cache/cyrene/Chinese(PRC)`(小写,跟磁盘)。
+- **增量路径**:语料 1855 = 池 1779 + 76 新名;实际处理 **30**(checksum 守卫:1779 缓存全跳过,零重算——salvage 路径按设计工作);终态 1809 行。
+- **filter 拦截 46**:44 条纯省略号/点(min_tokens 拦)+ **2 条 0 秒空 wav**(`chapter4_77_cyrene_128`-adjacent 批次,`翻开吧,永恒的一页。`/`逃不掉哦~` 有文本无音频——**语料导出损坏,待用户侧修**)。
+- **产物抽检**:codes [T,16]/emb (192,)/enhanced wav/逐行 sim-cer-mos 全部就位;metrics 重建 sim 0.8701±0.0900(旧 0.8709±0.0880,+30 clip 的自然漂移)、medoid `side4_shitang_cyrene_109_f`。
+- **⚠️ 数据构成发现(待拍板)**:池内按名字后缀含**非 cyrene 说话人**——wangxi 195 条(sim 0.864,接近 cyrene 的 0.871)、zuozhe 20 条(0.897);cyrene 变体 cyrenely 21 条 sim 0.797(明显另一个人声?)。非 cyrene ≈ 215/1809 ≈ 12%——单说话人 SFT 的身份汤问题,选择:保留 / 按后缀过滤 / 未来按说话人拆池(多说话人 SFT 的现成素材)。**旧池(1779)同样含此构成,非本次回归**。
+
+## 32. aglaea/Chinese(PRC) 首池建成(2026-09-01)
+
+- **第二个说话人池**:corpus `delta-me13/corpora/tts/aglaea/Chinese(PRC)`(954 wav+jsonl,双向零差)→ 池 928 行 = 954 − 25(≤4字,min_tokens)− 1(0.04s 音效 stub,min_seconds);全程 8.5 分钟(enhancement+embedding+scoring)。
+- **首份 aglaea 标定**:sim 0.8791±0.0939(p50 0.905)、cer 0.0608、**mos 3.103**(cyrene 是 2.60——aglaea 音频质量评分显著更高);medoid `archive_aglaea_12`;centroid.npy 就位。
+- **构成**:aglaea 906 + `aglaeahy` 10(变体)+ `Ev_archive_vo_avatar_*` 12(系统语音)——**零跨角色污染**(对照 cyrene 的 wangxi 215 条)。
+- **多说话人 SFT 前置条件已齐**:cyrene/Chinese(PRC) 1809 + aglaea/Chinese(PRC) 928,`sft --namespaces "cyrene/Chinese(PRC)" "aglaea/Chinese(PRC)"` 即可跑;第三角色待数据。
+
+## 33. hysilens / hyacine 首池建成(2026-09-01)
+
+- **语料体检**:两家各 4 语言完美对齐;本批只跑 **Chinese(PRC)**(用户指定,其余 3 语言语料在位未处理)。
+- **hysilens/Chinese(PRC)**:432 → 池 413(拦 19);sim 0.8824±0.0887、cer 0.0361、mos 2.757;medoid `chapter4_58_hysilens_102`。**构成:hysilens 358 + helektra 50(12%,另一说话人/变体,同 wangxi 模式,待拍板)+ 系统 5**。
+- **hyacine/Chinese(PRC)**:797 → 池 781(拦 16);sim 0.8463±0.0965、cer 0.0647、mos 2.626;medoid `archive_hyacine_4`。构成:hyacine 762 + hyacinetitan 10(泰坦形态变体)+ 系统 9,零污染。
+- **四池格局**:cyrene 1809 / aglaea 928 / hysilens 413 / hyacine 781 —— 多说话人 SFT 材料齐;`--per-pool-cap` 建议压到 400(hysilens 最小池)。
+
+## 34. castorice/Chinese(PRC) 首池建成(2026-09-01)
+
+- 1627 语料 → 池 **1556**(拦 71:短文本 + 1 条坏音频);sim 0.8709±0.1191(p50 0.909)、cer 0.066、mos 2.620;medoid `chapter4_26_castorice_200`。
+- 构成:castorice 1519 + `castoricehy` 15 + `castoricetitan` 12(泰坦形态)+ 系统 10——零跨角色污染。
+- **事故复盘**:打分阶段遇系统级死机(load 10.6,非重启);scorer 陪葬 → 原 preprocess 卡 recv 600s 超时循环,杀掉重启后 **checksum 守卫按完整链 salvage**(432 条已完整,1124 条从打分续),全程仅 ~10 分钟重建——幂等设计的实战验证。
+- **五池格局**:cyrene 1809 / castorice 1556 / aglaea 928 / hyacine 781 / hysilens 413;多说话人 SFT 用 `--per-pool-cap 400`。
+
+## 35. cipher/Chinese(PRC) 首池建成(2026-09-01)
+
+- 683 语料 → 池 **661**(拦 22);sim 0.8389±0.1377、cer 0.0989、mos 2.617;medoid `chapter4_32_cipher_182`。
+- 构成:cipher 600 + `shaocipher` 49(变体,同 hy/titan 模式)+ 系统 12——零跨角色污染。
+- **六池格局**:cyrene 1809 / castorice 1556 / aglaea 928 / hyacine 781 / cipher 661 / hysilens 413;`--per-pool-cap 400`。注意 cipher 的 sim std(0.138)与 cer(0.099)是六池最高,内部分散度偏大。
+
+## 36. cipher 重剪枝:shaocipher 移除(2026-09-01)
+
+- 用户从语料移除 49 条 shaocipher → 重跑 preprocess:**管线自动剪枝**(sync 对账 manifest,0 条重处理,秒级完成);池 661 → **612**(= 629 语料 − 17 filter),shaocipher 残留 0,构成 cipher 600 + 系统 12。
+- metrics 全池重建:sim 0.8455±0.1323、cer 0.0930、mos 2.638,medoid 不变(`chapter4_32_cipher_182`)。
+- 运维教训追加:**scorer 的 launch 与 verify 禁止写在同一条命令里**——setsid 段的裸 `scorer/main.py` 字符串会被 verify 的 pgrep 自匹配,报出幽灵 count=2(ps 实证只有一只);双实例断言必须用独立命令 + `pgrep -af` 人工过目。
+
+## 37. cerydra/Chinese(PRC) 首池建成——七池集齐(2026-09-01)
+
+- 385 语料 → 池 **374**(拦 11);构成 cerydra 374 含系统 11(抽样后缀普查零污染)。
+- 七池格局:cyrene 1809 / castorice 1556 / aglaea 928 / hyacine 781 / cipher 612 / hysilens 413 / cerydra 374;多说话人 SFT `--per-pool-cap 370` 对齐最小池。
+
+## 38. preprocess `--random` + 七池乱序重跑(2026-09-01)
+
+- **新 flag**:`preprocess --random`——`Config.random_order` → `Cache.load` 在 manifest 解析后以 `random.Random(0)` 定种乱序 `corpus_entries`(同语料同序,可复现);asset/任务表/metrics 全部顺序无关,行为不变。
+- **动机**:SFT `--per-pool-cap` 头部切片从"章节有序的语料头"变成均匀抽样。
+- **七池重跑**:全部 salvage(0 to process,每池 ~10s),乱序生效、内容逐行对齐无损。
+- **顺带**:cyrene 语料被用户清了 3 条(1855→1852,坏 wav 清理),池同步 1809→**1806**。
+- 运维:多池批量 = 单 setsid bash 顺序循环 + 单 scorer(全绿零事故)。

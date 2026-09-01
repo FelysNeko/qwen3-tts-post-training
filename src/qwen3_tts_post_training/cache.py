@@ -114,3 +114,27 @@ class CacheLayout:
         if limit is not None:
             data = data[:limit]
         return data
+
+
+def load_multi_sft_dataset(
+    layouts: list[CacheLayout], per_pool_cap: int | None = None
+) -> list[tuple[str, torch.Tensor, int]]:
+    """Multi-speaker SFT dataset: `(text, codes, speaker_tag)` triples — each
+    pool's `load_sft_dataset` rows tagged with the pool's index into
+    `layouts` (the tag indexes the per-pool speaker vectors the trainer
+    extracts from each pool's medoid, `CacheLayout.speaker_ref`). Speaker
+    identity travels ONLY through that vector (slot 6 at train time, the
+    baked export row at inference) — the model cannot bake one voice into
+    shared weights when batches mix speakers.
+
+    `per_pool_cap` head-slices every pool to equal counts (balanced batches:
+    an unbalanced pool would let the majority speaker dominate the shared
+    weights). Train-side only — the pools' metrics/medoid stay computed over
+    the FULL pools; the head slice is deterministic (asset.jsonl order)."""
+    data: list[tuple[str, torch.Tensor, int]] = []
+    for tag, layout in enumerate(layouts):
+        rows = layout.load_sft_dataset()
+        if per_pool_cap is not None:
+            rows = rows[:per_pool_cap]
+        data.extend((text, codes, tag) for text, codes in rows)
+    return data

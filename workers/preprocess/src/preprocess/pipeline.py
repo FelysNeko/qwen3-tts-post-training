@@ -1,5 +1,8 @@
-"""Corpus → `.cache/{dataset.name}` preprocessing: checksum-checked per-stage
-caches.
+"""Corpus → `.cache/{namespace}` preprocessing: checksum-checked per-stage
+caches. `namespace` is a corpus-mirroring relative path (`Speaker/Lang`,
+e.g. `Cyrene/Chinese(PRC)`) and doubles as the SPEAKER name everywhere
+downstream (SFT export spk_id, GRPO sampling) — there is no separate
+speaker-naming configuration.
 
     filter → corpus → enhanced → codes → embedding
 
@@ -71,6 +74,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -102,9 +106,13 @@ PERCENTILES = (1, 5, 25, 50, 75, 95, 99)
 @dataclass(frozen=True)
 class Config:
     corpus_dir: Path
-    cache_dir: Path  # pool dir ({cache-dir}/{dataset.name})
+    cache_dir: Path  # pool dir ({cache-dir}/{namespace}, namespace-mirroring)
     min_seconds: float = 0.1
     min_tokens: int = 2
+    # --random: shuffle the pool order (seeded 0 — same corpus → same order,
+    # reproducible). The SFT worker's per-pool head slice then samples
+    # uniformly instead of taking the chapter-ordered corpus head.
+    random_order: bool = False
 
     @property
     def manifest(self) -> Path:
@@ -208,6 +216,10 @@ class Cache:
     def load(cls, config: Config, token_counter: Callable) -> Cache:
         with open(config.manifest, encoding="utf-8") as file:
             corpus_entries = [CorpusEntry.model_validate_json(line) for line in file]
+        if config.random_order:
+            # seeded (0): deterministic order per corpus, so salvage/reruns
+            # and the SFT head slices stay reproducible
+            random.Random(0).shuffle(corpus_entries)
 
         wav_stems = [wav.stem for wav in config.corpus_dir.glob("*.wav")]
 
@@ -505,7 +517,8 @@ def post_apply_embedding_layer(
         return np.load(config.layout.centroid_npy)
 
     assert cache.corpus_entries, "no clips survived filtering — nothing to embed"
-    # manifest order keeps the float64 summation deterministic
+    # manifest order (or the seeded --random shuffle of it) keeps the
+    # float64 summation deterministic
     norms = np.stack([name_to_norms[entry.name] for entry in cache.corpus_entries])
     centroid = norms.mean(axis=0)
     centroid /= np.linalg.norm(centroid)
@@ -596,7 +609,8 @@ def finalize(
     sv_center/sv_scale, cer reflects domain ASR performance, mos stats are
     recorded for a future gate decision — tau stays 2.5)."""
     config = cache.config
-    # manifest order keeps the float64 summation deterministic
+    # manifest order (or the seeded --random shuffle of it) keeps the
+    # float64 summation deterministic
     norms = np.stack([name_to_norms[entry.name] for entry in cache.corpus_entries])
     sims = norms @ centroid
 
@@ -706,6 +720,7 @@ def sync(
 
 def run_pipeline(
     dataset: Path,
+    namespace: Path,
     cache_root: Path,
     tokenize_text,
     speech_tokenizer,
@@ -715,12 +730,14 @@ def run_pipeline(
     min_tokens: int,
     min_seconds: float,
     batch: int,
+    random_order: bool = False,
 ) -> Path:
     config = Config(
         corpus_dir=dataset,
-        cache_dir=cache_root / dataset.name,
+        cache_dir=cache_root / namespace,
         min_tokens=min_tokens,
         min_seconds=min_seconds,
+        random_order=random_order,
     )
     cache = Cache.load(config, token_counter=tokenize_text)
     sync(
