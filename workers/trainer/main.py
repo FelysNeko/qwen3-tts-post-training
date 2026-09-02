@@ -58,6 +58,7 @@ def main() -> None:
         "--freeze", nargs="+", default=None, help="frozen components: subtalker talker text embedding blocks"
     )
     sft.add_argument("--sub-weight", type=float, default=None)
+    sft.add_argument("--grad-checkpoint", action="store_true")
     sft.add_argument("--batch-size", type=int, default=None)
     sft.add_argument("--grad-accum", type=int, default=None)
     sft.add_argument("--epochs", type=int, default=None)

@@ -90,6 +90,9 @@ class SftConfig:
     # cache_dir = the cache ROOT location (default <repo>/.cache).
     cache_dir: str = str(repo_root() / ".cache")
     freeze: list[str] | None = None  # ⊆ {subtalker, talker, text}; None = 全训
+    # recompute activations (both stacks) — 1.7B full-FT on a 16GB card
+    # OOMs at the first optimizer step without it; ~30% step-time cost
+    grad_checkpoint: bool = False
     sub_weight: float = 0.3  # subtalker CE weight in loss = sem + w * sub
 
     batch_size: int = 2
@@ -200,14 +203,18 @@ def export_custom_voice(
     # a from-base SFT produces a custom_voice speaker ckpt (official surgery)
     config["tts_model_type"] = "custom_voice"
     talker_config = config.get("talker_config", {})
+    # spk-table keys are stored LOWERCASE (official convention) — every
+    # consumer (samplers) lowercases before lookup; the namespace string
+    # stays the speaker name everywhere else.
     spk_id: dict = talker_config.get("spk_id", {})
     for name, _ in speakers:
-        slot = spk_id[name] if name in spk_id else max(spk_id.values(), default=2999) + 1
-        spk_id[name] = slot
+        key = name.lower()
+        slot = spk_id[key] if key in spk_id else max(spk_id.values(), default=2999) + 1
+        spk_id[key] = slot
     talker_config["spk_id"] = spk_id
     spk_dialect = talker_config.setdefault("spk_is_dialect", {})
     for name, _ in speakers:
-        spk_dialect[name] = False
+        spk_dialect[name.lower()] = False
     config["talker_config"] = talker_config
     config_path.write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -221,7 +228,7 @@ def export_custom_voice(
     embedding = state_dict["talker.model.codec_embedding.weight"]
     baked = []
     for name, vec in speakers:
-        slot = spk_id[name]
+        slot = spk_id[name.lower()]
         embedding[slot] = vec.detach().to("cpu").to(embedding.dtype)
         baked.append(f"{name!r}@{slot}")
     save_file(state_dict, out / "model.safetensors", metadata={"format": "pt"})
@@ -252,6 +259,8 @@ def run_sft(cfg: SftConfig) -> None:
 
     torch.manual_seed(cfg.seed)
     model = SftTrainerModel(cfg.model_path, device=cfg.device, freeze=cfg.freeze)
+    if cfg.grad_checkpoint:
+        model.enable_grad_checkpoint()
     assert model.model.speaker_encoder is not None, (
         f"{cfg.model_path} has no in-model speaker_encoder — SFT starts ONLY "
         "from a base ckpt (tts_model_type == 'base'); custom_voice ckpts "
@@ -271,8 +280,16 @@ def run_sft(cfg: SftConfig) -> None:
     batch_size = cfg.batch_size
     n_batches = (len(data) + batch_size - 1) // batch_size
 
+    # fused kernel, deliberately hardcoded like flash-attention-2 above:
+    # Adam's foreach step materializes a ~param-sized transient — 1.7B
+    # full-FT OOMs inside it on a 16GB card even WITH grad checkpointing
+    # (states 13.5GB + transient ≈ 3GB). Math is identical; only the
+    # kernel path differs.
     optimizer = torch.optim.AdamW(
-        model.trainable_parameters, lr=cfg.lr, weight_decay=cfg.weight_decay
+        model.trainable_parameters,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        fused=True,
     )
     start_pos = _load_ckpt(cfg, model, optimizer) if cfg.resume else 0
     total_pos = cfg.epochs * n_batches

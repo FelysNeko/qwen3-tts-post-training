@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-01（§38 preprocess --random 落地 + 七池乱序重跑，多说话人 SFT 就绪）
+最后更新：2026-09-02（§40 修订：AdamW fused 强制化，1.7B 只需 --grad-checkpoint）
 
 ## 1. 目标
 
@@ -895,3 +895,25 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **七池重跑**:全部 salvage(0 to process,每池 ~10s),乱序生效、内容逐行对齐无损。
 - **顺带**:cyrene 语料被用户清了 3 条(1855→1852,坏 wav 清理),池同步 1809→**1806**。
 - 运维:多池批量 = 单 setsid bash 顺序循环 + 单 scorer(全绿零事故)。
+
+## 39. 多说话人漂移归因实验:无 multi-only 漂移 + 七音色分离通过(2026-09-01)
+
+- **三臂**(全量 FT,唯一冻结 = 无条件 text_embedding;lr 5e-6、B4/accum1、warmup 20、wd 0.01、seed 0;`--per-pool-cap 370` 乱序切片,单人臂与 multi 的 cyrene 子集同 370 条):
+  A `single370-1ep`(93 步)/ B `single370-6ep`(558 步,步数对照)/ C `multi7×370-1ep`(648 步,7 池混合)+ REF = abl3_base(445 步)。
+- **普查(per-key 加权 rel-L2 vs base)**:所有组件步数成比例,C 全部落在单人臂带内 → **没有任何 multi-only 漂移**;多人混合在权重层面不产生单人所没有的漂移谱。text_embedding 全臂 0.00000(bit 冻结验证)。
+- **方法论坑(重要)**:第一轮普查的"主表 0.77 vs 0.41 multi-only"是**伪影**——`codec_embedding` rows ≥3000 是 export 烘焙的音色槽(C 烘 7 个 vs 单人 1 个),不是训练漂移。census 必须排除槽位行;修正后主表非槽位漂移 C=0.00157 ≈ 步数插值(B 0.00246 / REF 0.00125),"单人臂饱和到同一张表"同样是槽位伪影(非槽位 pairwise 仅 0.001-0.002)。
+- **身份分离矩阵(112 wav = 7 音色 × 4 prompt × 4 take,graphed,T=0.9/top-k50,seed 1234+i)**:7×7 sim 矩阵**全对角占优**,diag 0.824-0.893,margin(diag−最优 offdiag)+0.04(hyacine,与该池 corpus sim 最低一致)~+0.16(cerydra);per-voice CER 0.024-0.041 全部健康。
+- **结论**:多人 SFT 可用,身份走 slot-6/烘焙槽机制如设计;多人 GRPO 基座**无需因"多人冲突"新增冻结**——§26-28 单人归因(subfrz 型)直接沿用。
+- **根因修复**:`export_custom_voice` 的 spk 表键统一小写(官方约定;sampler 查表 `.lower()`);三个 export 的 config.json 已磁盘手术同步。
+
+## 40. 1.7B 本地全量 FT:可行(--grad-checkpoint --adam-fused)(2026-09-02)
+
+- **问题**:1.7B(`Qwen3-TTS-12Hz-1.7B-Base`,已在 HF 缓存)全量 FT(唯一冻结 = text_embedding,1.61B 可训)在 16GB 5070Ti 上 B1/accum4 是否可行。
+- **直接答案:裸跑不行**——第一个 `optimizer.step()` 即 OOM(14.93/15.89GiB)。真凶不是激活:**bf16 AdamW 状态 w 3.9 + g 3.2 + m+v 6.4 = 13.5GB**,foreach step 还要瞬态物化 ~3GB;grad checkpointing 单开无效(激活本来就不是大头,15.07GB 仍 OOM 在 step)。
+- **修法(两个新旗标,均默认关)**:`--grad-checkpoint`(双 stack 重算激活,`use_reentrant=False`)压激活 + `--adam-fused`(fused kernel,无大瞬态,数学同)压 step 瞬态。组合后 **峰值 13.98GB,~1.9GB 余量**,12 条 cyrene smoke 端到端通过(训+导出,@3000,3.6GB safetensors)。
+- **速度**:1.7B B1 ~1.3s/批(5070Ti)→ 2590 条全量 1ep ≈ 14 分钟;hidden=2048(0.6B 的两倍),speaker vecs (1, 2048)。
+- **顺带修复**:§39 小写修复漏了 export 的第二处 `spk_id[name]` 查表(重导出 KeyError)——补 `name.lower()`。
+
+### §40 修订(同日):fused 强制化
+
+- `--adam-fused` 开关移除,AdamW `fused=True` 硬编码(SftConfig 无字段、无 CLI)——与 flash-attention-2 同一待遇:数学恒等,只换 kernel 路径,没有理由留开关。1.7B 所需旗标只剩 `--grad-checkpoint`。
