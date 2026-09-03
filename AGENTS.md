@@ -24,6 +24,8 @@ workers/trainer/.venv/bin/python workers/trainer/main.py sft --namespaces {a} {b
 workers/preprocess/.venv/bin/python workers/preprocess/main.py --corpus-dir /path/to/corpus --namespace {speaker}/{lang}  # {corpus-dir}/{namespace}/ wavs + sibling {namespace}.jsonl -> .cache/{namespace} (namespace mirrors the corpus hierarchy AND is the speaker name; any resident scorer works — it is calibration-free)
 ```
 
+- **GRPO 阶段锚点(STATUS §43)**:基座 = `runs/b_ep1`(w50-B ep1:lr1e-5/B8/warmup50/1ep/seed0;七音色 @3000-3006 小写键;官方栈部署已验证)。**文本池避免 100+ 字长句**(1e-5 长文本 CER 退化 23-31%,5e-6 系 0-10%;短中句正常)。评测基建:`probes/general.json`(8 类)、`probes/w100_rollout.py`/`w100_score.py`(双 GPU 双进程 + 断点续;预算 long=1024/其余=384;seed=1234+全局序号,4 take 共享)。已实测:B8≥B4(纯 CER 杠杆)、warmup 50≈100、身份只看 lr。
+
 - Ruff is the only check. `[tool.ruff] extend-exclude` skips vendored trees (`workers/scorer/src/scorer/speakerlab`, `workers/scorer/src/scorer/utmos`, `workers/preprocess/src/preprocess/clearvoice`) from BOTH lint and format — do not "fix" style there. (An earlier `[tool.ruff.lint.per-file-ignores]` setup only guarded lint; `ruff format` ignored it and reformatted the vendored files once — restored from git.)
 - torch comes from the `pytorch-cu128` uv index; flash-attn is a pinned cu12 wheel in the root pyproject. Python must be 3.12 (`.python-version`).
 

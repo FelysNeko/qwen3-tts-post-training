@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-02（§42 终裁：用户听感定基座 = runs/b_ep1，GRPO 就绪）
+最后更新：2026-09-03（§43：GRPO 前置收束——w100 定案（无害无用，维持 50）、B8=纯 CER 杠杆、新 8 类评测集+预算协议、1e-5 长文本退化、基座=runs/b_ep1）
 
 ## 1. 目标
 
@@ -966,3 +966,21 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - 用户 A/B 试听(ep1 vs ep2 同句官方栈合成):**ep1 效果最好**——耳朵为最终裁判,推翻指标侧的 ep2 推荐(MOS +0.072 属听感不可闻差异;ep1 本就 CER 占优)。
 - **GRPO 基座:`runs/b_ep1`**(bit 校验 = export_ep1,七音色 @3000-3006);`runs/b_ep2` 保留作对照。
 - 教训:小 MOS 差(≪0.1)不可作为基座选择依据;epoch 曲线 "ep2 峰" 对 UTMOS 成立,对人耳不成立。
+
+### §42 补(2026-09-03):warmup 100 四臂(w100)否决 + long 类新发现
+
+- w100 四臂训完(各 24-28 min)+ 8 类评测(3584 wav,双 GPU rollout 35 min + 双 scorer):CER 与 w50 共享 6 类持平(±0.5pp)。~~margin 全线变薄~~ **[更正]该对比 w50 侧未滤类别、系假象;同权重严格对照(b_ep1 新旧评测)margin 完全一致(+0.122/+0.121)**——**warmup 100 无害但无用(CER 平、margin 平、sim 平),维持 50,两配方等效(b_ep1−B′ 配对全零差)**。
+- **long 类(1024 预算)首测暴露:1e-5 臂长文本 CER 退化**(普通长句 7-30% vs 5e-6 系 0-10%)——w50 时代无长文本评测故未见于 §42;GRPO 若用长句池需注意 b_ep1(1e-5)的长程稳定性风险。
+- 新基准:5e-6 系 long CER 0-10%,全员 long_0/1(NSFW 文学)CER 偏高 = ASR 内容驱动。
+- 数据:runs/hp17b_w100_eval_report.md + runs/hp17b_w100_{arm}_eval/;脚本 probes/w100_rollout.py / probes/w100_score.py(双 GPU 双进程,断点续)。
+- B4/B8 配对差分(同 seed 同 take,n≈900/代):**B8 一致降 CER 0.3-1.4pp(88-91% take 占优),MOS/sim/margin 全零差**——等效 batch 是纯 CER 杠杆,身份只看 lr;B8 ≥ B4,b_ep1 的选择已占优。
+
+## 43. GRPO 前置收束:w100 复检定案 + 新评测集 + b_ep1 复测(2026-09-03)
+
+- **w100(warmup 100)四臂**:训完(24-28 min/臂)+ 8 类评测(3584 wav,双 GPU rollout 35 min + 双 scorer)。**裁决:warmup 100 无害但无用**——CER 平、margin 平、sim 平,与 w50 等效(b_ep1−B′ 同 seed 配对全零差,n=896);维持 50,无切换动机。**[更正记录]早先"margin 全线变薄"系分析 bug(w50 侧未滤类别);同权重严格对照 margin +0.122/+0.121 完全一致。**
+- **B4 vs B8 配对差分**(同 seed 同句同 take,两代一致):**等效 batch = 纯 CER 杠杆**——B8 一致降 CER 0.3-1.4pp(88-91% take 占优),MOS/sim/margin 全零差;**身份只看 lr,batch 不参与**。
+- **新评测集**:`probes/general.json` 8 类 × 4 句(coding 移除;新增 short + long,long 含 2 条 NSFW 文学)。**预算协议:long=1024 / 其余=384**(171 字 ≈ 625 tokens,311/384 必顶墙);seed=1234+全局序号,4 take 共享;hit_cap 公式按各自 budget。脚本:`probes/w100_rollout.py`(双 GPU 双进程,arm 规格 `name` 或 `name=export路径`,断点续)+ `probes/w100_score.py`(双 scorer 条目半切,report_h0/h1 与 w50 同构)。
+- **1e-5 系长文本退化(新发现)**:long_2(普通文本!)CER A′/B′/b_ep1 = 23-31% vs C′/D′(5e-6)0-10%——30-45s 长生成的韵律漂移,w50 时代无长文本评测故未暴露。NSFW 两条全员 CER 偏高 = ASR 内容驱动,预期内。short 类是地板效应区(UTMOS 亚秒失真 + "滚。"单字抽奖),不入选型依据。
+- **b_ep1 新集复测**(896 wav,`runs/b_ep1_eval/`):ALL CER 10.22%/去ood 5.02%,margin 与旧代一致(hyacine +0.071/cerydra +0.187),long_2 30.9% ——**退化坐实但短中句一切正常**。
+- **GRPO 基座定案:`runs/b_ep1`**(custom_voice 七音色 @3000-3006,官方栈部署已验证)。底料形态 = 实测最优:std_sim 0.0343 全场最高、死组 2/196 最少、rollout 质量中等(天花板效应最小)。**风险旗标:GRPO 文本池避免 100+ 字长句**(1e-5 长程漂移;若必须练长文本,届时评估 5e-6 系基座换身份 margin)。
+- 运维教训(本次新增):pkill 模式自匹配自杀(`pkill -f x.py` 匹配自身 shell)→ 用 `[x]` 括号断匹配;scorer 必须先于 score 客户端且逐个 verify connected;`CacheLayout` 构造需 `Path` 非 str;大清扫后 ext4.vhdx 需 Windows 侧 Optimize-VHD 才归还宿主(121G 已释放未压缩)。
