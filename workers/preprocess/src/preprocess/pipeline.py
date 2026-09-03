@@ -393,7 +393,9 @@ def apply_codes_layer(
 
     updated: dict[str, TaskRow] = {}
     for row in tqdm(todo, desc="codes"):
-        codes = extract_codes(speech_tokenizer, config.layout.enhanced_dir / f"{row.name}.wav")
+        codes = extract_codes(
+            speech_tokenizer, config.layout.enhanced_dir / f"{row.name}.wav"
+        )
         codes_path = config.layout.codes_dir / f"{row.name}.npy"
         np.save(codes_path, codes)
 

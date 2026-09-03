@@ -138,8 +138,12 @@ class LogProbComputer:
             if micro is None or micro >= len(texts):
                 return self._forward(texts, codes, temperature, subtalker_temperature)
             results = [
-                self._forward(texts[i : i + micro], codes[i : i + micro],
-                              temperature, subtalker_temperature)
+                self._forward(
+                    texts[i : i + micro],
+                    codes[i : i + micro],
+                    temperature,
+                    subtalker_temperature,
+                )
                 for i in range(0, len(texts), micro)
             ]
             width = max(r.log_probs.shape[1] for r in results)

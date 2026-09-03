@@ -86,7 +86,9 @@ class GRPOMetrics(NamedTuple):
     group_std: torch.Tensor
     rho: torch.Tensor | None = None
     clamped: torch.Tensor | None = None
-    weight_mass: torch.Tensor | None = None  # Σ(mask·col_w): micro-batch chunk recombination (loop.py)
+    weight_mass: torch.Tensor | None = (
+        None  # Σ(mask·col_w): micro-batch chunk recombination (loop.py)
+    )
 
 
 def _segment_mean_std(
@@ -177,7 +179,11 @@ def _clipped_loss(
     adv = advantage.unsqueeze(-1)
     loss_t = -(torch.minimum(rho * adv, clamped * adv))  # [B, T]
     loss = (loss_t * w).sum() / w.sum().clamp_min(1e-12)
-    return loss, {"rho": torch.exp(log_ratio), "clamped": clamped, "weight_mass": w.sum()}
+    return loss, {
+        "rho": torch.exp(log_ratio),
+        "clamped": clamped,
+        "weight_mass": w.sum(),
+    }
 
 
 def _gspo_loss(
@@ -190,7 +196,10 @@ def _gspo_loss(
     log_ratio = log_probs - ref_log_probs
     seq_ratio = torch.exp((log_ratio * mask).sum(-1))  # [B]
     loss = -(seq_ratio * advantage).mean()
-    return loss, {"seq_ratio": seq_ratio, "weight_mass": loss.new_tensor(log_probs.shape[0])}
+    return loss, {
+        "seq_ratio": seq_ratio,
+        "weight_mass": loss.new_tensor(log_probs.shape[0]),
+    }
 
 
 def grpo_loss(

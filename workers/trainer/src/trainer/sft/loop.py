@@ -314,9 +314,7 @@ def run_sft(cfg: SftConfig) -> None:
             t0 = time.monotonic()
             idx = order[bi * batch_size : (bi + 1) * batch_size]
             batch = model.collate([data[i][0] for i in idx], [data[i][1] for i in idx])
-            tf = model.teacher_forcing(
-                batch, speaker_vecs[[data[i][2] for i in idx]]
-            )
+            tf = model.teacher_forcing(batch, speaker_vecs[[data[i][2] for i in idx]])
             loss_sem = F.cross_entropy(
                 tf.talker_logits.float().flatten(0, 1),
                 batch.codec_0_labels[:, 1:].flatten(),
@@ -377,6 +375,4 @@ def run_sft(cfg: SftConfig) -> None:
 
     _save_ckpt(cfg, model, optimizer, total_pos)
     monitor_f.close()
-    export_custom_voice(
-        cfg, model, list(zip(speaker_names, speaker_vecs, strict=True))
-    )
+    export_custom_voice(cfg, model, list(zip(speaker_names, speaker_vecs, strict=True)))

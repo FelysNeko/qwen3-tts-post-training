@@ -55,7 +55,10 @@ def main() -> None:
         "pool this doubles as the debug limit)",
     )
     sft.add_argument(
-        "--freeze", nargs="+", default=None, help="frozen components: subtalker talker text embedding blocks"
+        "--freeze",
+        nargs="+",
+        default=None,
+        help="frozen components: subtalker talker text embedding blocks",
     )
     sft.add_argument("--sub-weight", type=float, default=None)
     sft.add_argument("--grad-checkpoint", action="store_true")

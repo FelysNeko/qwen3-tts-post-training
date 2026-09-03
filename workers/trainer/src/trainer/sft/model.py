@@ -39,7 +39,14 @@ class SftTrainerModel(ModelWrapper):
     the shared ingress feeding BOTH stacks, trains in both arms so the pair
     differs by exactly one variable — which generative stack learns.
     `{"text"}` composes onto either arm (e.g. `{"talker", "text"}` = the
-    strict predictor-only variant).
+    strict predictor-only variant). `{"embedding"}` freezes BOTH codec-table
+    groups — the talker's main table AND the predictor's 15 MTP tables
+    (`{"subtalker"}` already takes the latter with its weights) — leaving the
+    transformer stacks + heads as the only trainees (the tables-vs-blocks
+    attribution probe). `{"blocks"}` is its complement: both transformer
+    stacks (layers + final norm) and codec_head frozen, so ONLY the two audio
+    table groups + text_projection train (40.9M) — the "adaptation lives in
+    embedding space, not transformer weights" probe.
 
     Unconditional (not part of `freeze`): `talker.model.text_embedding` is
     always frozen — the official recipe never trains it (official
@@ -76,9 +83,20 @@ class SftTrainerModel(ModelWrapper):
                 for p in self.talker.codec_head.parameters():
                     p.requires_grad_(False)
 
-            if "text" in freeze:
-                for p in self.talker.text_projection.parameters():
-                    p.requires_grad_(False)
+    def enable_grad_checkpoint(self) -> None:
+        """Recompute-activations mode for memory-tight full-FT: 1.7B bf16
+        AdamW states (w+g+m+v ≈ 13.5GB) leave ~2GB of a 16GB card for
+        activations, which B1 long clips exceed. Checkpointing both
+        transformer stacks cuts activation memory several-fold at a
+        ~30% step-time cost. Training-only — sampling runs on a separate
+        ModelWrapper and never enables this."""
+        for sub in (
+            self.talker.model,
+            self.talker.code_predictor.model,
+        ):
+            sub.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
 
 def extract_speaker_vec(model: ModelWrapper, audio_path: str | Path) -> torch.Tensor:

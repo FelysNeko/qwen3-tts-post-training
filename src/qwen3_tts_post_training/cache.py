@@ -106,8 +106,7 @@ class CacheLayout:
         for row in rows:
             codes_path = self.codes_dir / f"{row['name']}.npy"
             assert codes_path.exists(), (
-                f"missing codes for {row['name']!r} — run the preprocess "
-                "pipeline first"
+                f"missing codes for {row['name']!r} — run the preprocess pipeline first"
             )
             codes = torch.from_numpy(np.load(codes_path)).long()
             data.append((row["text"], codes))

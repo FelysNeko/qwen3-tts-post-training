@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-02（§40 修订：AdamW fused 强制化，1.7B 只需 --grad-checkpoint）
+最后更新：2026-09-02（§42 终裁：用户听感定基座 = runs/b_ep1，GRPO 就绪）
 
 ## 1. 目标
 
@@ -917,3 +917,52 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 ### §40 修订(同日):fused 强制化
 
 - `--adam-fused` 开关移除,AdamW `fused=True` 硬编码(SftConfig 无字段、无 CLI)——与 flash-attention-2 同一待遇:数学恒等,只换 kernel 路径,没有理由留开关。1.7B 所需旗标只剩 `--grad-checkpoint`。
+
+## 41. 1.7B 七池全量 SFT + graphed 评测(2026-09-02)
+
+- **训练**:`Qwen3-TTS-12Hz-1.7B-Base` 七池全量 6470 条(无 cap,cyrene 28% / cerydra 4.7% 不平衡按"全音频"语义接受),1.61B 可训,1617 更新,~25 分钟(0.9s/update),峰值 VRAM 14.72GB 零 OOM,sem loss 2.49→~0.9。export 七音色 @3000-3006(3.6GB)。
+- **graphed sampler 在 1.7B 开箱即用**(零改动,hidden 2048):112 wav(7 音色 × 2 句 × 8 take,T=0.9/top-k50)无 runaway(max 12.2s,全部正常 EOS)。
+- **CER 质变**:0.000-0.0099(0.6B capped 是 0.024-0.041)——1.7B 可懂度大幅更优。
+- **身份分离矩阵**:diag 0.824-0.908;margin 五升二薄——cyrene +0.21 / castorice +0.14 / aglaea +0.15 / cipher +0.09 / cerydra +0.18 均优于 0.6B;**hyacine −0.006(转负!)与 hysilens +0.048 变薄**,两者弱轴都是 hyacine↔cyrene——疑似全量训练的池不平衡(cyrene 28% 梯度占比)把共享权重往 cyrene 声学拉,盖过小池。0.6B capped 时 hyacine 也有同轴混淆(0.813),全量放大了它。
+- **MOS**:cerydra 3.29 / aglaea 3.24 最高(超各自池均值),cipher 2.74 / hysilens 2.63 最低(与池质量一致)。
+- **结论**:1.7B 全量多人 SFT 整体强于 0.6B capped(CER/大池 margin/MOS),代价是小池(hyacine/hysilens)身份被大池侵蚀——下一轮候选:cap 对齐(如 400)或池加权采样。
+
+## 42. 1.7B 超参四臂:质量选 D(5e-6/B8),身份选 B(1e-5/B8),warmup 50 固化(2026-09-02)
+
+- 四臂(lr1e-5/5e-6 × 等效B4/B8 = B1×accum4/8,warmup 50,七池全量 6470)全部 exit=0,各 ~27 min;打分双 GPU 双 scorer **按条目半切**(同句恒定同进程 → MOS 进程偏移臂间相消;3136 wav,h1/h2 report 分文件)。
+- **质量**:D 全场最优(ALL CER 6.60%/MOS 2.947/ood CER 37.5%);**身份**:lr 1e-5 双臂小池 margin 翻倍(hyacine +.087 vs +.048);**warmup 50 vs 20**(C vs §41 单变量):hyacine −.006→+.048,长 warmup 救小池一半,固化默认。
+- OOD 是唯一 runaway 源(A 21/D 24 每类 32 take,其余 224 全零),prompt 特异,不入排序依据。
+- 推荐:D(质量)或 B(身份);报告 runs/hp17b_eval_report.md,日志 runs/hp17b_*/train.log + runs/hp17b_{rollout,score_h1,score_h2}.log。
+
+### §42 修正(同日):锁 B(lr1e-5/B8)+ warmup 50 固化
+
+- 显著性检验:hyacine margin B-vs-D **+6.4σ**(hysilens/cipher/cerydra +3.5~4.1σ)——身份是全场唯一强信号;MOS D−B=0.047(3σ)在听感阈以下,CER(去 ood)差 ~2σ 弱信号,sim 四臂持平。
+- warmup 50 vs 20(C vs §41)单变量:hyacine −0.006→+0.048,与上条互为独立证据,**warmup 50 固化为 SFT 默认**。
+- GRPO 可行性:B 组内 std_sim 0.0343 全场最高、死组 2/196 最少,组内 MOS std 与 §41 实训水平同档——B 的 export 可直接作 GRPO 基座。
+- 元结论:1ep SFT 超参平坦区,停止 lr/batch 调参;后续杠杆 = 池平衡(cap/加权采样)→ GRPO。
+- OOD 顶墙两型(真 runaway 1e-5 / 长但稳 5e-6),单 dur 阈值会误判,须 sim 联合判据。
+
+### §42 附录:漂移普查 × 官方 1.7B CV 对比
+
+- 发现 `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` 并完成同架构对照(per-key 加权 rel-L2 + delta SVD;官方烘焙槽位散布 2861-3066,**排除须取双方槽位并集**,§39 的 ≥3000 规则对官方不适用)。
+- **我们(B)全组件漂移 0.25-0.8%,官方 3.4-7.0%——温和 10-30 倍,量级完全合理**;官方 text_embedding 仅动 0.012% ≈ 冻结,二次验证无条件冻结。
+- SVD:官方漂移幅度大且相对集中(fc1 PR≈395,结构化适应);我们弥散微扰(PR≈1414-1808)——1 epoch 温和 SGD 形态。§41 漂移 ≈ B 一半,与 lr 比例一致。
+- 数据:`runs/hp17b_census17b.json`。
+
+### §42 续:B-ep2(resume +1 epoch)= 当前全场最优
+
+- B(lr1e-5/B8/w50)resume 续训 1 epoch: MOS 2.900→**2.972**(超 D 成为全场最高)、去ood MOS **3.073**、hyacine margin +0.081→**+0.100**(历史最佳,身份质量双赢)、sim 0.8328;代价 ALL CER +0.82pp(ood 顶墙 15→19,去ood 仅+0.18pp)、aglaea margin 略降。
+- 漂移全组件 ×1.5(0.004-0.012),仍为官方 1/5-1/10;**epoch 外推:到官方漂移量级还有 3-5 epoch 空间,epoch 是比 lr 更大的杠杆**。
+- ep1 export 备份 `runs/hp17b_lr1e5_bs8/export_ep1`;评测 `runs/hp17b_lr1e5_bs8_ep2_eval/`,普查 `runs/hp17b_census17b_ep2.json`。
+
+### §42 终:B-ep3 曲线见顶回落,ep2 = 最优基座
+
+- B 续训三连(ep1/2/3):MOS 2.900/**2.972**/2.895,去ood MOS 2.994/**3.073**/2.996,去ood CER 1.25/1.43/1.53 单调爬,margin 三epoch稳定(hyacine +.098),sim 缓涨至 0.836,ood 顶墙 14-19 波动。
+- **质量曲线 U 型,ep2 见顶:B-ep2 = 最终推荐 GRPO 基座**(`runs/hp17b_lr1e5_bs8/export`,注意其中已是 ep3 权重——**ep2 权重在 `export_ep2`**)。ep3 回退瓶颈 = 数据重复暴露,非漂移量(×1.3 仍远低于官方)。
+- **GRPO 基座正式导出:`runs/b_ep2`**(= export_ep2 的拷贝,bit 校验 0.000000;custom_voice 七音色 @3000-3006 小写键,3.83GB)。GRPO `--model-path runs/b_ep2` 即用。
+
+### §42 终裁(用户听感):基座 = B-ep1(`runs/b_ep1`)
+
+- 用户 A/B 试听(ep1 vs ep2 同句官方栈合成):**ep1 效果最好**——耳朵为最终裁判,推翻指标侧的 ep2 推荐(MOS +0.072 属听感不可闻差异;ep1 本就 CER 占优)。
+- **GRPO 基座:`runs/b_ep1`**(bit 校验 = export_ep1,七音色 @3000-3006);`runs/b_ep2` 保留作对照。
+- 教训:小 MOS 差(≪0.1)不可作为基座选择依据;epoch 曲线 "ep2 峰" 对 UTMOS 成立,对人耳不成立。
