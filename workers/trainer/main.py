@@ -31,8 +31,9 @@ def main() -> None:
         help="pool selector(s) under the cache root, e.g. "
         "Cyrene/Chinese(PRC); each namespace string IS its speaker name "
         "(export spk_id, GRPO sampling); sft takes K namespaces (K=1 = "
-        "single-speaker), grpo takes exactly one for now (asserted in "
-        "run_grpo; the list form is the future multi-speaker interface)",
+        "single-speaker); grpo takes the calibration pool selector(s) the "
+        "text pool's speaker keys resolve against (multi-speaker pools: "
+        "one .jsonl row per (speaker, text))",
     )
     shared.add_argument("--lr", type=float)
     shared.add_argument("--warmup-steps", type=int)

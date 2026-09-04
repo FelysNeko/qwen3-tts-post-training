@@ -39,14 +39,13 @@ class EagerSampler(Sampler):
     def __init__(
         self,
         ttm: LoraTrainerModel,
-        speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
     ):
         assert language.lower() == "auto", (
             "eager sampler supports the Auto (non-streaming) layout only"
         )
-        super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
+        super().__init__(ttm, language=language, batch_size=batch_size)
         model = ttm.model
         self.talker = model.talker
         tc = model.config.talker_config
@@ -73,7 +72,7 @@ class EagerSampler(Sampler):
     # prefill
     # ------------------------------------------------------------------
 
-    def _build_prefill(self, texts: list[str]) -> tuple:
+    def _build_prefill(self, texts: list[str], speaker: str) -> tuple:
         """Port of ``Qwen3TTSForConditionalGeneration.generate`` lines that
         assemble talker input embeds for the Auto + speaker + non-streaming
         case (no instruct, no voice clone)."""
@@ -100,7 +99,7 @@ class EagerSampler(Sampler):
         )
         spk_e = self.codec_emb(
             torch.tensor(
-                [[tc.spk_id[self.speaker.lower()]]], device=dev, dtype=dtype_ids
+                [[tc.spk_id[speaker.lower()]]], device=dev, dtype=dtype_ids
             )
         )
         pre1 = self.codec_emb(
@@ -160,8 +159,8 @@ class EagerSampler(Sampler):
         trailing_b = padded_t
         return embeds_b, mask, trailing_b, pad_e
 
-    def _prefill(self, texts: list[str]) -> tuple:
-        embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts)
+    def _prefill(self, texts: list[str], speaker: str) -> tuple:
+        embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts, speaker)
         dev = self.ttm.device
         cache = DynamicCache()
         position_ids, rope_deltas = self.talker.get_rope_index(mask)
@@ -322,12 +321,13 @@ class EagerSampler(Sampler):
         token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
+        speaker: str,
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``Sampler.sample``: returns (codes, cur_len)."""
         torch.manual_seed(seed)
         texts = [text] * self.batch_size
         cache, mask, trailing, pad_e, rope_deltas, past_hidden, logits = self._prefill(
-            texts
+            texts, speaker
         )
         cur_len = prefill_cur_len(self.ttm, text)
         init_cur_len = cur_len

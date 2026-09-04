@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-03（§43：GRPO 前置收束——w100 定案（无害无用，维持 50）、B8=纯 CER 杠杆、新 8 类评测集+预算协议、1e-5 长文本退化、基座=runs/b_ep1）
+最后更新：2026-09-03（§46：多人 GRPO 代码落地并收敛——speaker 全链路 per-call 必填（构造期零 speaker），L4/L5 复验全过，待 graphed 全链路 smoke）
 
 ## 1. 目标
 
@@ -984,3 +984,30 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **b_ep1 新集复测**(896 wav,`runs/b_ep1_eval/`):ALL CER 10.22%/去ood 5.02%,margin 与旧代一致(hyacine +0.071/cerydra +0.187),long_2 30.9% ——**退化坐实但短中句一切正常**。
 - **GRPO 基座定案:`runs/b_ep1`**(custom_voice 七音色 @3000-3006,官方栈部署已验证)。底料形态 = 实测最优:std_sim 0.0343 全场最高、死组 2/196 最少、rollout 质量中等(天花板效应最小)。**风险旗标:GRPO 文本池避免 100+ 字长句**(1e-5 长程漂移;若必须练长文本,届时评估 5e-6 系基座换身份 margin)。
 - 运维教训(本次新增):pkill 模式自匹配自杀(`pkill -f x.py` 匹配自身 shell)→ 用 `[x]` 括号断匹配;scorer 必须先于 score 客户端且逐个 verify connected;`CacheLayout` 构造需 `Path` 非 str;大清扫后 ext4.vhdx 需 Windows 侧 Optimize-VHD 才归还宿主(121G 已释放未压缩)。
+
+## 44. GRPO 基座换代:d_ep1(5e-6 系)+ 多人架构决议(2026-09-03)
+
+- **决策**:用户以 ~1min 长文本能力为优先 → GRPO 基座弃 1e-5 系(b_ep1 转对照),按 §42 正典配方重训 5e-6。**d_ep1 = lr5e-6/B8/warmup50/1ep/seed0/wd0.01/ckpt100/grad-ckpt**,`runs/d_ep1_train` 训练,export bit 校验(BYTE_IDENTICAL)后安装 **`runs/d_ep1`**。
+- **验收**:lr 在 update 50 精确达 5e-6;loss 轨迹 vs 原 w50-D(已删)80 个 log 点全部 3-4 位小数级一致(首 2.6623/2.6657,末 1.9296/1.9301 = 0.03% 相对差)——数据序/调度/代码一致性成立,残差为 bf16 kernel 归约非确定性;export 七音色 @3000-3006,spk 键 `{voice}/chinese(prc)` 全小写。
+- **spk 键格式确认**:`{voice}/chinese(prc)`(整串小写)→ GRPO `speaker = namespace = "{voice}/Chinese(PRC)"` 经 `.lower()` 命中,**现有接线原样可用**,无需改代码。
+- **事实更正**:早前"171 字 ≈ 625 tok"系把码长误当 token;实测中文 ≈ **0.6-0.7 tok/字**(78 字→54 tok)。512 训练预算下 ~140 字是"自然时长 = rollout 余量"的耦合点。
+- **多人 GRPO 架构决议(代码未动)**:pool = jsonl `{"speaker", "text"}`(in-character,文本与角色绑定);每步 8 组 = (speaker_i, text_i) × 8 rollouts,组内 advantage 纯净度不变;7 套 RewardConfig(sv_center/scale from 各自 metrics.json)+ 7 centroid 常驻 GPU;已知缝隙:sampler speaker 在 `__init__`(将来 7 实例 vs 挪进 `sample()` 签名,后者 graph 安全——spk 行是输入非权重),动代码时定。
+- **语料 v1 决议(用户拍板)**:`delta-me13/corpora/textonly/{sp}/chs.jsonl` **整条不拆行**、只筛超长(≤140 字)= **1002 条**(cyrene 199 / hyacine 246 / aglaea 150 / cipher 143 / castorice 126 / cerydra 80 / hysilens 58;cyrene:hysilens = 3.4× 用户认可);**CER 计算需 normalize**(参照侧去标点/空白/符号、英文小写——scorer 侧后续代码);**前置探针未做**:`\n` 多行占 54%,而 SFT 音频池 text 0/200 多行(p50 23 字/max 69)→ 多行 prompt 对模型 OOD,全量上池前需 8+4 条多行/单行对照 rollout。
+- d_ep1 的 8 类基线评测暂缺(用户决定跳过,以 D′ 数字近似;需要时 `probes/w100_rollout.py cuda:? "d_ep1=runs/d_ep1"` 即插即用)。
+
+## 45. GRPO 文本池 v1 合成(2026-09-03)
+
+- **`private_dataset/grpo_pool_v1.jsonl` = 3200 条**,格式 `{"speaker": "{voice}/chinese(prc)", "text": ...}`(全小写,命中 d_ep1 export spk 键)。
+- 构成:delta-me13 chs 整条 **len∈[6,200] 去重后 964 条**(1037 − 55 条内部重复 − 18 条 <6 字碎片;in-character 各归各角色)+ 共享 2236 条 = generated_chat 201 + random_novel 497 + some_pink_revere 54 + america_against_america 打乱后前 1484,seed-0 shuffle 后 7 角色均分(319/320)。**全池 len∈[6,200] 零违例**。
+- 各角色:hyacine 561 / cyrene 512 / cipher 460 / aglaea 461 / castorice 436 / cerydra 397 / hysilens 373(用户认可 ~140 差)。长度 p50 75 / p90 145 / min 6 / max 200,>140 共 ~467 条(512 训练预算撞墙风险带,用户知情接受)。
+- 私有语料管线(`private_dataset/*.md|txt`):去 md(标题行/#/*/**/有序列表)→ `\n\n` 切节 → 节内 `。` 切句 → 节内合并(每行 cap = `randint(100,200)` seed 0,独句超帽整句独占)→ >200 行删除 → 逐文件 seed-0 打乱。数据集:america 2202 / random_novel 497 / some_pink 54 / generated_chat 201。
+
+## 46. 多人 GRPO 代码落地(2026-09-03)
+
+- **sampler**:ABC `sample(..., speaker: str | None = None)`(None → 回落构造 speaker,旧调用零破坏)+ `Sampler._resolve` 助手;`eager._build_prefill/_prefill` 显式收 spk(不再读实例属性);`hf` `speakers=[spk]*batch`;`cuda_graph._graph_prefill` 透传(prefill 每次 `seqlens.zero_()` 重写静态 KV 池,换人状态隔离);`torch_compile` 继承 Eager 自动生效。
+- **logprob.py**:`compute_ref/compute_policy(..., speaker=None)`;`_resolve_vec` 按次查 `codec_embedding.weight[spk_id[spk.lower()]]`(一行 view)。
+- **rollout.py**:`rollout_group(..., speaker)` 显式契约参数。
+- **loop.py**:池 → `(speaker, text)` 对(`_load_text_pool`:.jsonl 多人 / txt 单人绑定唯一 namespace);`_pick_prompts` 均匀抽行(speaker 随行,构成镜像池子);`_resolve_namespace` 大小写无关逐级解析(`cyrene/chinese(prc)` → `.cache/cyrene/Chinese(PRC)`);per-speaker 校准(7 × RewardConfig + centroid 矩阵行归一化,sim = 行选择 matmul);`reward_v3` 按组 cfg;monitor 新增 `per_speaker {n, sim, cer}` 块、`mos_dead_frac` 按各组 eps;run_grpo assert 放开(namespaces 非空,pool 角色解析 fail-loud)。
+- **验证(L4/L5 + 校准,均 PASS)**:同 seed 属性路径 vs kwarg bit-equal;A→B→A 隔离(A 复现 bit 级、B 不同);换 speaker ref logprobs 差异 |d| mean 0.33(身份真实起效);policy 可微且有限;7 池 sv_center 0.845-0.882 互异、centroid 单位范数、两两 sim 0.52-0.84。
+- **收敛(用户裁决)**:speaker 彻底退出构造期——`Sampler.build` 无 speaker 参数;`warmup_sample(text, token_budget)` 内部自取 export spk 表首项(warmup 语音任意,只看两次重放 bit-equality);`_warmup_graph()`/`_warmup()` 零参。终态:构造期零 speaker,一切 speaker 都是 per-call 必填。
+- **待办**:graphed 全链路 smoke(scorer + trainer 2-3 步,launch 清单含 `\n` 多行 OOD 探针)。

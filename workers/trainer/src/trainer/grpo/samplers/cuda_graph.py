@@ -260,12 +260,11 @@ class CudaGraphSampler(EagerSampler):
     def __init__(
         self,
         ttm: LoraTrainerModel,
-        speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
         lmax: int = 1024,
     ):
-        super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
+        super().__init__(ttm, language=language, batch_size=batch_size)
         install_attention_patch()
         self.lmax = lmax
         dev = ttm.device
@@ -357,7 +356,7 @@ class CudaGraphSampler(EagerSampler):
     # decode
     # ------------------------------------------------------------------
 
-    def _graph_prefill(self, text: str) -> tuple:
+    def _graph_prefill(self, text: str, speaker: str) -> tuple:
         """Prefill the main StaticKVCache with ONLY the valid text tokens.
 
         ``_build_prefill`` left-pads to a fixed length; padding must never
@@ -367,7 +366,7 @@ class CudaGraphSampler(EagerSampler):
         the left pad and prefill [B, text_len] directly into pool positions
         0..text_len-1."""
         texts = [text] * self.batch_size
-        embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts)
+        embeds_b, mask, trailing_b, pad_e = self._build_prefill(texts, speaker)
         dev = self.ttm.device
         text_len = prefill_cur_len(self.ttm, text)
         # FA2 kvcache writes past the pool unchecked — an oversized prefill is
@@ -484,6 +483,7 @@ class CudaGraphSampler(EagerSampler):
         token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
+        speaker: str,
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``EagerSampler.sample``."""
         torch.manual_seed(seed)
@@ -496,7 +496,7 @@ class CudaGraphSampler(EagerSampler):
             past_hidden,
             logits,
             text_len,
-        ) = self._graph_prefill(text)
+        ) = self._graph_prefill(text, speaker)
         cur_len = text_len
         init_cur_len = cur_len
         max_new_tokens = max(0, token_budget - cur_len)

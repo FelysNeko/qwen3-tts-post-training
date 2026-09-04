@@ -53,26 +53,31 @@ class Sampler(ABC):
       within an impl; cross-impl bit-equality holds only for `fast` vs `hf`.
     - Batching is internal: the single `text` is repeated `batch_size` times
       to form the GRPO group (no heterogeneous prompts, no assert needed).
+    - `sample(..., speaker=...)` is REQUIRED per call (multi-speaker GRPO
+      pools roll out one (speaker, text) pair per group) — the speaker is
+      NOT constructor state. Identity enters as prefill input VALUES (spk
+      row id), never as captured weights — safe under CUDA graphs and
+      torch.compile.
     """
 
     def __init__(
         self,
         ttm: LoraTrainerModel,
-        speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
     ):
         # Generation layout is pinned: language="Auto" + non-streaming (SFT
         # collate parity — the validity precondition for logprob.py).
         self.ttm = ttm
-        self.speaker = speaker
         self.language = language
         self.batch_size = batch_size
 
     def warmup_sample(self, text: str, token_budget: int) -> list[torch.Tensor]:
         """One dummy generation at the RL contract config (seed 0, T=0.9,
         top_k=50, subtalker trio at upstream defaults); returns its codes.
-        Uses the sampler's fixed `batch_size` (the GRPO group size).
+        Uses the sampler's fixed `batch_size` (the GRPO group size) and the
+        export table's first speaker — the warmup voice is arbitrary (only
+        bit-equality of repeated calls matters).
         ``token_budget`` is total tokens (prefill cur_len + new) budget."""
         codes, _ = self.sample(
             text,
@@ -83,6 +88,7 @@ class Sampler(ABC):
             token_budget=token_budget,
             subtalker_temperature=0.9,
             subtalker_top_k=50,
+            speaker=next(iter(self.ttm.model.config.talker_config.spk_id)),
         )
         return codes
 
@@ -90,37 +96,33 @@ class Sampler(ABC):
     def build(
         ttm: LoraTrainerModel,
         impl: str = "hf",
-        speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
         lmax: int = 1024,
     ) -> Sampler:
-        """Factory — `impl` selects the sampler (lazy imports, no eager deps)."""
+        """Factory — `impl` selects the sampler (lazy imports, no eager deps).
+        The self-capturing impls (graphed / compiled) pick their own warmup
+        voice internally; real speakers are per `sample` call args."""
         match impl:
             case "hf":
                 from trainer.grpo.samplers.hf import HFSampler
 
-                return HFSampler(
-                    ttm, speaker=speaker, language=language, batch_size=batch_size
-                )
+                return HFSampler(ttm, language=language, batch_size=batch_size)
             case "fast":
                 from trainer.grpo.samplers.eager import EagerSampler
 
-                return EagerSampler(
-                    ttm, speaker=speaker, language=language, batch_size=batch_size
-                )
+                return EagerSampler(ttm, language=language, batch_size=batch_size)
             case "compiled":
                 from trainer.grpo.samplers.torch_compile import TorchCompileSampler
 
                 return TorchCompileSampler(
-                    ttm, speaker=speaker, language=language, batch_size=batch_size
+                    ttm, language=language, batch_size=batch_size
                 )
             case "graphed":
                 from trainer.grpo.samplers.cuda_graph import CudaGraphSampler
 
                 return CudaGraphSampler(
                     ttm,
-                    speaker=speaker,
                     language=language,
                     batch_size=batch_size,
                     lmax=lmax,
@@ -140,6 +142,7 @@ class Sampler(ABC):
         token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
+        speaker: str,
     ) -> tuple[list[torch.Tensor], int]:
         """Generate one code-group sequence per group item. Returns
         ``(codes, cur_len)`` where ``codes`` is list of [T, num_code_groups]
@@ -164,4 +167,6 @@ class Sampler(ABC):
         temperature/top_k (a real TTS codec research dimension).
         ``token_budget`` is total tokens (prefill cur_len + new) budget;
         effective ``max_new = token_budget - cur_len`` (replaces
-        max_new_tokens/lmax/runaway_t_max, ``AGENTS.md`` token_budget)."""
+        max_new_tokens/lmax/runaway_t_max, ``AGENTS.md`` token_budget).
+        ``speaker`` (multi-speaker GRPO) is the voice for this call; see
+        the class docstring for why it is graph-safe."""

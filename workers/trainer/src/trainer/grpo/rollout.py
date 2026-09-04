@@ -48,6 +48,7 @@ def rollout_group(
     seed: int,
     tag: str,
     *,
+    speaker: str,
     temperature: float,
     top_k: int,
     token_budget: int,
@@ -57,6 +58,8 @@ def rollout_group(
 
     ``prompt`` is a single text, internally repeated `sampler.batch_size`
     times to form the GRPO group (homogeneous, no assert needed).
+    ``speaker`` is the voice for this group (multi-speaker GRPO pools roll
+    out one (speaker, text) pair per group).
     ``token_budget`` is total tokens (prefill cur_len + new) budget;
     ``max_new = token_budget - cur_len`` is derived inside the sampler.
     The non-varying part of the RL sampling contract is pinned here
@@ -71,6 +74,7 @@ def rollout_group(
         token_budget=token_budget,
         subtalker_temperature=0.9,
         subtalker_top_k=50,
+        speaker=speaker,
     )
     wavs, fs = ttm.decode(codes)
     if work_dir is None:

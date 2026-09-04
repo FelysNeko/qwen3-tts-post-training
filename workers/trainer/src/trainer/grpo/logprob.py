@@ -106,15 +106,19 @@ class LogProbComputer:
     `forward_sub_talker_finetune` for the predictor heads (codebooks 1..15).
     """
 
-    def __init__(self, ttm: LoraTrainerModel, speaker: str = "cyrene"):
+    def __init__(self, ttm: LoraTrainerModel):
         self.ttm = ttm
         self.model = ttm.model
         self.talker = ttm.model.talker
 
         talker_config = self.talker.config
         self.num_code_groups = talker_config.num_code_groups
-        self.speaker_vec = self.talker.model.codec_embedding.weight[
-            talker_config.spk_id[speaker.lower()]
+
+    def _vec(self, speaker: str) -> torch.Tensor:
+        """Speaker-embedding row [hidden] — mirrors the rollout prefill's
+        `codec_embedding` slot-6 row."""
+        return self.talker.model.codec_embedding.weight[
+            self.talker.config.spk_id[speaker.lower()]
         ]
 
     @torch.inference_mode()
@@ -125,6 +129,8 @@ class LogProbComputer:
         temperature: float = 0.9,
         subtalker_temperature: float = 0.9,
         micro: int | None = None,
+        *,
+        speaker: str,
     ) -> LogProbResult:
         """Reference (adapter OFF) log-probs — frozen base forward, no grads.
 
@@ -132,17 +138,22 @@ class LogProbComputer:
         peak = one chunk) and re-pads the packed rows to a common width.
         Exact per-sequence equality in exact arithmetic: right padding +
         causal attention make valid-position logits independent of the batch
-        shape; only bf16 kernel reassociation differs (~1e-3)."""
+        shape; only bf16 kernel reassociation differs (~1e-3). `speaker`
+        (multi-speaker GRPO) is the voice for this batch — required, no
+        fallback (the multi-speaker loop always knows it)."""
         self.ttm.set_adapter(False)
         try:
             if micro is None or micro >= len(texts):
-                return self._forward(texts, codes, temperature, subtalker_temperature)
+                return self._forward(
+                    texts, codes, temperature, subtalker_temperature, speaker
+                )
             results = [
                 self._forward(
                     texts[i : i + micro],
                     codes[i : i + micro],
                     temperature,
                     subtalker_temperature,
+                    speaker,
                 )
                 for i in range(0, len(texts), micro)
             ]
@@ -164,10 +175,12 @@ class LogProbComputer:
         codes: list[torch.Tensor],
         temperature: float = 0.9,
         subtalker_temperature: float = 0.9,
+        *,
+        speaker: str,
     ) -> LogProbResult:
         """Policy (adapter ON) log-probs — differentiable, part of the train graph."""
         self.ttm.set_adapter(True)
-        return self._forward(texts, codes, temperature, subtalker_temperature)
+        return self._forward(texts, codes, temperature, subtalker_temperature, speaker)
 
     def _forward(
         self,
@@ -175,9 +188,10 @@ class LogProbComputer:
         codes: list[torch.Tensor],
         temperature: float,
         subtalker_temperature: float,
+        speaker: str,
     ) -> LogProbResult:
         batch = self.ttm.collate(texts, codes)
-        tf = self.ttm.teacher_forcing(batch, self.speaker_vec)
+        tf = self.ttm.teacher_forcing(batch, self._vec(speaker))
 
         b = len(codes)
         q = self.num_code_groups

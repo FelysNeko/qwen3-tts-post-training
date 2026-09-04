@@ -28,6 +28,7 @@ class HFSampler(Sampler):
         token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
+        speaker: str,
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``Sampler.sample`` (see base class)."""
         torch.manual_seed(seed)
@@ -38,7 +39,7 @@ class HFSampler(Sampler):
             input_ids=input_ids,
             instruct_ids=[None] * self.batch_size,
             languages=[self.language] * self.batch_size,
-            speakers=[self.speaker] * self.batch_size,
+            speakers=[speaker] * self.batch_size,
             non_streaming_mode=True,
             do_sample=do_sample,
             temperature=temperature,

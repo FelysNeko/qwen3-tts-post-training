@@ -29,7 +29,7 @@ from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.paths import repo_root
-from qwen3_tts_post_training.reward.reward import reward_v3
+from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 from qwen3_tts_post_training.system import (
     current_rss_mb,
     gpu_allocated_mb,
@@ -54,27 +54,21 @@ logger = logging.getLogger(__name__)
 # mirrors rollout_group's pinned subtalker sampling trio (do_sample@T=0.9/top_k=50)
 SUBTALKER_TEMPERATURE = 0.9
 
-# v1 placeholder text pool (domain: narrative / dialogue / rhythmic narration).
-TEXT_POOL = (
-    "风从山谷那边吹来，把整片麦田都推成了金色的波浪。",
-    "他说：“我们回家吧。”声音很轻，却像是商量了一辈子。",
-    "雨落在屋顶上，嗒嗒嗒，像一只不肯睡的小猫在敲门。",
-    "她翻开那本旧书，第一页上写着：给你的，永远晚一步。",
-    "深夜的便利店里，热水壶咕噜噜地响，他望着窗外发呆。",
-    "“别担心，”母亲说，“路再长，也有走到头的一天。”",
-    "钟声敲了十二下，院子里那棵老槐树的影子慢慢转了个方向。",
-    "我们沿着河堤走了很远，直到路灯一盏盏亮起来。",
-)
-
 
 @dataclass
 class TrainConfig:
     # The pool selector(s) — pool dirs are {cache_dir}/{namespace},
-    # namespace mirroring the corpus hierarchy. EXACTLY ONE for now
-    # (asserted in run_grpo); the list form is the future multi-speaker
-    # GRPO interface. The namespace string IS the speaker name (SFT export
-    # spk_id) — `speaker` left None falls back to it.
+    # namespace mirroring the corpus hierarchy. The namespace string IS the
+    # speaker name (SFT export spk_id) — `speaker` left None falls back to
+    # it. Multi-speaker GRPO passes all pool namespaces: the text pool's
+    # speaker keys resolve against them (case-insensitively — pool keys are
+    # lowercase export spk_ids like "cyrene/chinese(prc)", on-disk dirs are
+    # "cyrene/Chinese(PRC)").
     namespaces: list[str]
+
+    # .jsonl = {"speaker", "text"} rows (multi-speaker pool); otherwise one
+    # prompt per line, bound to the single --namespaces entry. Required.
+    text_pool_path: str
 
     # §16: the preprocess cache is the SINGLE source for calibration AND
     # data — metrics.json (sim stats → RewardConfig) + centroid.npy MUST
@@ -89,8 +83,6 @@ class TrainConfig:
     lora_r: int = 16
     lora_alpha: float = 64
 
-    text_pool: tuple[str, ...] = TEXT_POOL
-    text_pool_path: str | None = None  # if set, overrides text_pool (one line each)
     num_prompts: int = 8  # distinct prompts per step (Fish Audio S2 layout)
     group_size: int = 8  # rollouts per prompt (the GRPO group)
     num_steps: int = 1
@@ -122,21 +114,63 @@ class TrainConfig:
     monitor: bool = True
 
 
-def _load_text_pool(cfg: TrainConfig) -> list[str]:
-    """Text pool from file (one prompt per line) or the built-in placeholder."""
-    if cfg.text_pool_path is None:
-        return list(cfg.text_pool)
-    return [line.strip() for line in Path(cfg.text_pool_path).read_text().splitlines()]
+PoolItem = tuple[str, str]  # (speaker key, prompt text)
 
 
-def _pick_prompts(pool: list[str], cfg: TrainConfig, step: int) -> list[str]:
-    """Fish-Audio-style batch: `num_prompts` DISTINCT prompts per step, each
-    rolled out `group_size` times (8×8 = 64 rollouts per update). Distinct
-    prompts average out per-group reward noise; within-group variance stays
-    pure sampling noise of the same text (the GRPO baseline)."""
+def _load_text_pool(cfg: TrainConfig) -> list[PoolItem]:
+    """Prompt pool as (speaker, text) pairs — `--text-pool-path` is required.
+
+    `.jsonl` rows carry `{"speaker", "text"}` — the multi-speaker pool; the
+    speaker key is the export spk_id (e.g. "cyrene/chinese(prc)"). Legacy
+    one-prompt-per-line files bind every prompt to the single `--namespaces`
+    entry."""
+    assert cfg.text_pool_path, (
+        "grpo requires --text-pool-path (.jsonl with {\"speaker\", \"text\"}"
+        " rows, or a one-prompt-per-line .txt bound to one namespace)"
+    )
+    if cfg.text_pool_path.endswith(".jsonl"):
+        rows = [
+            json.loads(line)
+            for line in Path(cfg.text_pool_path).read_text().splitlines()
+        ]
+        return [(row["speaker"], row["text"]) for row in rows]
+    assert len(cfg.namespaces) == 1, (
+        "single-speaker text pools bind to exactly one --namespaces entry; "
+        'multi-speaker pools are .jsonl files with {"speaker", "text"} rows'
+    )
+    spk = cfg.namespaces[0]
+    return [
+        (spk, line.strip())
+        for line in Path(cfg.text_pool_path).read_text().splitlines()
+    ]
+
+
+def _pick_prompts(pool: list[PoolItem], cfg: TrainConfig, step: int) -> list[PoolItem]:
+    """Fish-Audio-style batch: `num_prompts` DISTINCT pool items per step,
+    each rolled out `group_size` times (8×8 = 64 rollouts per update).
+    Sampling is uniform over the pool rows, so per-step speaker composition
+    mirrors the pool's; distinct prompts average out per-group reward noise,
+    while within-group variance stays pure sampling noise of the same
+    (speaker, text) pair (the GRPO baseline)."""
     rng = random.Random(cfg.seed * 1000003 + step)
     k = min(cfg.num_prompts, len(pool))
     return rng.sample(pool, k)
+
+
+def _resolve_namespace(root: Path, key: str) -> Path:
+    """Case-insensitively resolve a '{voice}/{lang}' pool key under the cache
+    root — pool keys are lowercase export spk_ids while on-disk pool dirs
+    mirror the corpus hierarchy (e.g. 'cyrene/chinese(prc)' ->
+    'cyrene/Chinese(PRC)')."""
+    cur = root
+    for part in key.split("/"):
+        cur = next(
+            (p for p in cur.iterdir() if p.is_dir() and p.name.lower() == part.lower()),
+            None,
+        )
+        if cur is None:
+            raise FileNotFoundError(f"no cache pool under {root} resolves {key!r}")
+    return cur
 
 
 def _cleanup_wavs(wav_paths: list[Path]) -> None:
@@ -204,17 +238,15 @@ def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
 
 def run_grpo(cfg: TrainConfig) -> None:
 
-    assert len(cfg.namespaces) == 1 and cfg.namespaces[0], (
-        "grpo takes exactly one --namespaces entry for now (multi-speaker "
-        "GRPO is future work)"
+    assert cfg.namespaces and all(cfg.namespaces), (
+        "grpo takes at least one --namespaces entry (the calibration pool "
+        "selector(s); multi-speaker pools resolve their speaker keys "
+        "against them)"
     )
-    namespace = cfg.namespaces[0]
-    # the namespace string IS the speaker (no separate speaker config)
-    speaker = namespace
-
     assert Path(cfg.model_path).exists(), (
         f"TTS ckpt not found at {cfg.model_path!r} — pass --model-path"
     )
+    pool = _load_text_pool(cfg)
 
     ttm = LoraTrainerModel(
         cfg.model_path,
@@ -225,24 +257,24 @@ def run_grpo(cfg: TrainConfig) -> None:
     sampler = Sampler.build(
         ttm,
         impl=cfg.sampler_impl,
-        speaker=speaker,
         batch_size=cfg.group_size,
         lmax=cfg.token_budget_infer,
     )
-    lpc = LogProbComputer(ttm, speaker=speaker)
+    lpc = LogProbComputer(ttm)
     scorer = Client(
         push_endpoint=cfg.scorer_push_endpoint,
         pull_endpoint=cfg.scorer_pull_endpoint,
         timeout_s=cfg.scorer_timeout,
     )
     try:
-        _train_loop(cfg, ttm, sampler, lpc, scorer)
+        _train_loop(cfg, pool, ttm, sampler, lpc, scorer)
     finally:
         scorer.close()
 
 
 def _train_loop(
     cfg: TrainConfig,
+    pool: list[PoolItem],
     ttm: LoraTrainerModel,
     sampler: Sampler,
     lpc: LogProbComputer,
@@ -262,13 +294,21 @@ def _train_loop(
         kl_beta=cfg.kl_beta,
         num_code_groups=ttm.talker.config.num_code_groups,
     )
-    layout = CacheLayout(Path(cfg.cache_dir) / cfg.namespaces[0])
-    reward_cfg = layout.reward_config()
-    sv_centroid = torch.as_tensor(
-        layout.load_centroid(), dtype=torch.float32, device=cfg.device
-    )
-    sv_centroid /= sv_centroid.norm()  # mirrors the old scorer set_ref recipe
-    pool = _load_text_pool(cfg)
+    # per-speaker calibration: one RewardConfig (sv stats from that pool's
+    # metrics.json) and one unit-norm centroid row per pool speaker; sims are
+    # a row-select off the stacked centroid matrix (one batched matmul).
+    speakers = sorted({spk for spk, _ in pool})
+    reward_cfgs: dict[str, RewardConfig] = {}
+    centroid_rows: list[torch.Tensor] = []
+    for spk in speakers:
+        layout = CacheLayout(_resolve_namespace(Path(cfg.cache_dir), spk))
+        reward_cfgs[spk] = layout.reward_config()
+        centroid = torch.as_tensor(
+            layout.load_centroid(), dtype=torch.float32, device=cfg.device
+        )
+        centroid_rows.append(centroid / centroid.norm())  # mirrors the old scorer set_ref recipe
+    centroids = torch.stack(centroid_rows)  # [n_spk, hidden]
+    spk_row = {spk: i for i, spk in enumerate(speakers)}
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
 
     for step in range(start_step, start_step + cfg.num_steps):
@@ -287,13 +327,14 @@ def _train_loop(
         # time ≈ n_rollouts × rollout + last score.
         t_roll0 = time.monotonic()
         pending: list[tuple[dict, int]] = []  # (group, req_id)
-        for gi, prompt in enumerate(prompts):
+        for gi, (spk, prompt) in enumerate(prompts):
             rollout = rollout_group(
                 sampler,
                 ttm,
                 prompt,
                 seed=cfg.seed * 1000003 + step * 1009 + gi,
                 tag=f"step{step}g{gi}",
+                speaker=spk,
                 temperature=cfg.temperature,
                 top_k=cfg.top_k,
                 token_budget=cfg.token_budget,
@@ -306,6 +347,7 @@ def _train_loop(
                 continue
             g = {
                 "gi": gi,
+                "speaker": spk,
                 "prompt": prompt,
                 "codes": rollout.codes,
                 "wavs": rollout.wav_paths,
@@ -339,16 +381,17 @@ def _train_loop(
                     continue
                 # trainer owns lifecycle: delete tmpfs wavs after scoring
                 _cleanup_wavs(g["wavs"])
-                # sims are local now: one batched matmul against the centroid
-                # (float32-exact transport; ~1e-7 accumulation difference vs
-                # the old scorer-side dot — see STATUS §16.9)
+                # sims are local now: one batched matmul against the pool
+                # speaker's centroid row (float32-exact transport; ~1e-7
+                # accumulation difference vs the old scorer-side dot — see
+                # STATUS §16.9)
                 g["sim"] = (
                     torch.tensor(
                         [r.get_embedding_unwrap() for r in results],
                         dtype=torch.float32,
                         device=cfg.device,
                     )
-                    @ sv_centroid
+                    @ centroids[spk_row[g["speaker"]]]
                 )
                 g["cer"] = torch.tensor(
                     [r.get_cer_unwrap() for r in results],
@@ -370,7 +413,9 @@ def _train_loop(
             if needs_resample(g["sim"], g["cer"]):
                 skips["flat_group"] = skips.get("flat_group", 0) + 1
                 continue
-            g["R"], g["bd"] = reward_v3(g["sim"], g["cer"], g["mos"], reward_cfg)
+            g["R"], g["bd"] = reward_v3(
+                g["sim"], g["cer"], g["mos"], reward_cfgs[g["speaker"]]
+            )
             trainable.append(g)
 
         if not trainable:
@@ -392,6 +437,7 @@ def _train_loop(
                 cfg.temperature,
                 subtalker_temperature=SUBTALKER_TEMPERATURE,
                 micro=micro,
+                speaker=g["speaker"],
             )
             if micro is None:
                 pol = lpc.compute_policy(
@@ -399,6 +445,7 @@ def _train_loop(
                     g["codes"],
                     cfg.temperature,
                     subtalker_temperature=SUBTALKER_TEMPERATURE,
+                    speaker=g["speaker"],
                 )
                 loss, metrics = grpo_loss(
                     pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo
@@ -433,6 +480,7 @@ def _train_loop(
                     g["codes"][sl],
                     cfg.temperature,
                     subtalker_temperature=SUBTALKER_TEMPERATURE,
+                    speaker=g["speaker"],
                 )
                 width = ref.log_probs.shape[1]
                 pad = width - pol_c.log_probs.shape[1]
@@ -499,6 +547,13 @@ def _train_loop(
         def _col_g(key: str, trained=trained) -> float:
             return torch.cat([g[key] for _, _, g in trained]).mean().item()
 
+        per_speaker: dict[str, dict[str, float]] = {}
+        for _, _, g in trained:
+            d = per_speaker.setdefault(g["speaker"], {"n": 0, "sim": 0.0, "cer": 0.0})
+            d["n"] += 1
+            d["sim"] += float(g["sim"].mean())
+            d["cer"] += float(g["cer"].mean())
+
         monitor = {
             "step": step,
             "groups_trained": len(trained),
@@ -519,7 +574,10 @@ def _train_loop(
             "std_wer": round(torch.cat([b.std_wer for b in bds]).mean().item(), 5),
             "mos_dead_frac": round(
                 torch.stack(
-                    [(b.std_mos < reward_cfg.mos_flameout_eps).float() for b in bds]
+                    [
+                        (b.std_mos < reward_cfgs[g["speaker"]].mos_flameout_eps).float()
+                        for b, (_, _, g) in zip(bds, trained)
+                    ]
                 )
                 .mean()
                 .item(),
@@ -528,6 +586,14 @@ def _train_loop(
             "sim_mean": round(_col_g("sim"), 4),
             "cer_mean": round(_col_g("cer"), 4),
             "mos_mean": round(_col_g("mos"), 4),
+            "per_speaker": {
+                k: {
+                    "n": v["n"],
+                    "sim": round(v["sim"] / v["n"], 4),
+                    "cer": round(v["cer"] / v["n"], 4),
+                }
+                for k, v in sorted(per_speaker.items())
+            },
             "t_rollout": round(t_rollout, 2),
             "t_score": round(t_score, 2),
             "t_train": round(t_train, 2),

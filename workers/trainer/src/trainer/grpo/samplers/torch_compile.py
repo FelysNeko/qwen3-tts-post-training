@@ -56,11 +56,10 @@ class TorchCompileSampler(EagerSampler):
     def __init__(
         self,
         ttm: LoraTrainerModel,
-        speaker: str = "cyrene",
         language: str = "Auto",
         batch_size: int = 8,
     ):
-        super().__init__(ttm, speaker=speaker, language=language, batch_size=batch_size)
+        super().__init__(ttm, language=language, batch_size=batch_size)
         enable_compile(ttm)
         self._warmup()
 
@@ -90,6 +89,7 @@ class TorchCompileSampler(EagerSampler):
         token_budget: int,
         subtalker_temperature: float,
         subtalker_top_k: int,
+        speaker: str,
     ) -> tuple[list[torch.Tensor], int]:
         """Same contract as ``EagerSampler.sample``."""
         return super().sample(
@@ -101,4 +101,5 @@ class TorchCompileSampler(EagerSampler):
             token_budget=token_budget,
             subtalker_temperature=subtalker_temperature,
             subtalker_top_k=subtalker_top_k,
+            speaker=speaker,
         )
