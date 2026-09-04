@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 from trainer.grpo.loop import TrainConfig, run_grpo
 from trainer.sft.loop import SftConfig, run_sft
@@ -100,6 +101,10 @@ def main() -> None:
     if args.command == "sft":
         run_sft(SftConfig(**overrides))
     else:
+        # graphed KV pool + teacher-forcing peak need low-fragmentation
+        # allocator segments (§47: micro=4 OOM'd with 1.58G stranded in
+        # reserved-but-unallocated under the default allocator)
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         run_grpo(TrainConfig(**overrides))
 
 

@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-03（§46：多人 GRPO 代码落地并收敛——speaker 全链路 per-call 必填（构造期零 speaker），L4/L5 复验全过，待 graphed 全链路 smoke）
+最后更新：2026-09-04（§47：长样本可行性定案（budget 896/micro2/graphed，smoke 通过）、打分无瓶颈、默认 config 落地）
 
 ## 1. 目标
 
@@ -1011,3 +1011,14 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **验证(L4/L5 + 校准,均 PASS)**:同 seed 属性路径 vs kwarg bit-equal;A→B→A 隔离(A 复现 bit 级、B 不同);换 speaker ref logprobs 差异 |d| mean 0.33(身份真实起效);policy 可微且有限;7 池 sv_center 0.845-0.882 互异、centroid 单位范数、两两 sim 0.52-0.84。
 - **收敛(用户裁决)**:speaker 彻底退出构造期——`Sampler.build` 无 speaker 参数;`warmup_sample(text, token_budget)` 内部自取 export spk 表首项(warmup 语音任意,只看两次重放 bit-equality);`_warmup_graph()`/`_warmup()` 零参。终态:构造期零 speaker,一切 speaker 都是 per-call 必填。
 - **待办**:graphed 全链路 smoke(scorer + trainer 2-3 步,launch 清单含 `\n` 多行 OOD 探针)。
+
+## 47. 长样本 GRPO 可行性研究 + 默认 config 定档(2026-09-04)
+
+- **背景**:正式 GRPO 前验证"最长样本能否完整 rollout + 完成 batch 计算"。过程中两次事故与一次误判:①scorer+trainer 同时加载双栈 → 系统死机(AGENTS 老教训复踩,改为加载错峰);②budget 880/micro4 首跑 flash-attn backward OOM(13.3G+1.58G 碎片);③600s 打分超时实际是 4070S 被桌面占用 → GPU-PV 时间片饿死, MOS 单次 879.8s(正常 2-8s)。
+- **CUDA 序号发现**:torch `cuda:0=4070 SUPER(12G,scorer)`、`cuda:1=5070 Ti(16G,trainer)`——与 nvidia-smi 显示顺序**相反**;历史所有 session 的 trainer 实际一直在 5070 Ti 上,约定未变。
+- **budget 探针**:>170 字 4 speaker × 3 seed @1024 全自然 EOS,`cur_len+t_max` max = **864**(hysilens 197字);take 间自然时长差大(531-732 码)。→ budget 定 **896**(864+32 余量)。
+- **VRAM 阶梯**(total 821 worst):rollout @880 lmax896 **5.1G**;ref 全组 B8 **9.4G**(推理模式远比外推轻);policy+backward **micro=4 OOM、micro=2 14.4G**(expandable_segments 下贴线可跑)。→ policy 必须 micro=2,ref 保持全组。
+- **打分瓶颈测量**(probes/tmp 分阶段 harness,40-51s wav):SV **0.38s/wav**、MOS 8-rep **0.35s/wav**、ASR(Qwen3-ASR-1.7B 生成式,非 wav2vec2)**0.80s/wav**——稳态一组 ~12s,**无瓶颈**;ASR compile 无必要。
+- **长池 smoke 通过**(30 行 ≥185 字,num_prompts 4,2 步):step 0 = 2g/2flat loss -0.049 dur 98s;step 1 = 1g/3flat **KL 0.00306** dur 147s;t_max 507-511 真进梯度;**flat 跳过率 ~31%**(长散文 take 全读准 → WER 无 spread,设计性);零 runaway。
+- **默认 config 落地**(TrainConfig):`token_budget 896 / token_budget_infer 896 / logprob_micro 2 / sampler_impl graphed / scorer_timeout 1800 / model_path runs/d_ep1`;main.py grpo 路径注入 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+- **已知未修(用户裁决暂缓)**:超时→陈旧响应 id-mismatch 毒化 + 超时删 wav→scorer 读已删文件崩溃的级联脆弱性(scorer fail-soft + 超时不删 wav 两处小修待做)。

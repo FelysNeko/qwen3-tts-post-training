@@ -78,7 +78,9 @@ class TrainConfig:
     # <repo>/.cache).
     cache_dir: str = str(repo_root() / ".cache")
 
-    model_path: str = "/mnt/d/Repository/models/PhiLia093-TTS/"
+    # §44: GRPO continues from the pipeline's custom_voice export — the
+    # multi-speaker d_ep1 base (bit-verified copy of the 5e-6/B8 SFT arm).
+    model_path: str = "runs/d_ep1"
     device: str = "cuda:1"
     lora_r: int = 16
     lora_alpha: float = 64
@@ -87,18 +89,19 @@ class TrainConfig:
     group_size: int = 8  # rollouts per prompt (the GRPO group)
     num_steps: int = 1
     seed: int = 0
-    token_budget: int = 512  # total tokens budget (prompt + new + 8 overhead) for training: OOM guard (B8 T500 14.4G) and runaway guard; rollout max_new = budget - cur_len
-    token_budget_infer: int = (
-        1024  # total tokens budget for inference (graphed lmax); 1024 ≈60s audio
-    )
+    # §47 VRAM ladder (d_ep1 1.7B, B8, total 821 tokens worst case): rollout
+    # 5.1G, ref full-B8 9.4G, policy+backward micro=2 14.4G (micro=4 OOM).
+    # 896 > max observed cur_len+t_max 864 with runaway-guard margin.
+    token_budget: int = 896  # total tokens (prompt + new) for training: OOM guard and runaway guard; rollout max_new = budget - cur_len
+    token_budget_infer: int = 896  # graphed KV pool (lmax) — sized to the budget
 
     temperature: float = 0.9
     top_k: int = 50
-    sampler_impl: str = "hf"  # hf | fast | compiled | graphed (PROJECT_STATUS §9)
+    sampler_impl: str = "graphed"  # hf | fast | compiled | graphed (PROJECT_STATUS §9)
 
     variant: str = "dr"
     kl_beta: float = 0.001
-    logprob_micro: int = 0  # policy/ref micro-batch (0 = full group of 8 in one pass); splits the teacher-forcing activation peak so B8 fits 16G-class cards
+    logprob_micro: int = 2  # policy micro-chunk (ref stays full-B8: inference-mode fits at 9.4G); micro=4 OOMs in backward at this budget (§47 ladder)
     lr: float = 1e-5
     warmup_steps: int = 10  # linear LR ramp: tames the Adam first-step sign
     # jolt (all params move ±lr at once; observed as KL 586 on step 1, fish3)
@@ -107,7 +110,7 @@ class TrainConfig:
 
     scorer_push_endpoint: str = "tcp://127.0.0.1:5555"
     scorer_pull_endpoint: str = "tcp://127.0.0.1:5556"
-    scorer_timeout: float = 600.0
+    scorer_timeout: float = 1800.0  # long-audio groups score in ~30s, but desktop contention on the scoring GPU can inflate 100x (§47: 880s MOS outlier)
     out_dir: str = "runs/grpo_v1"
     ckpt_every: int = 1
     resume: bool = False
