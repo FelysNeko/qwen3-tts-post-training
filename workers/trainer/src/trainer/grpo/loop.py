@@ -102,8 +102,8 @@ class TrainConfig:
     variant: str = "dr"
     kl_beta: float = 0.001
     logprob_micro: int = 2  # policy micro-chunk (ref stays full-B8: inference-mode fits at 9.4G); micro=4 OOMs in backward at this budget (§47 ladder)
-    lr: float = 1e-5
-    warmup_steps: int = 10  # linear LR ramp: tames the Adam first-step sign
+    lr: float = 1e-6
+    warmup_steps: int = 20  # linear LR ramp: tames the Adam first-step sign
     # jolt (all params move ±lr at once; observed as KL 586 on step 1, fish3)
     weight_decay: float = 0.01
     grad_clip: float = 1.0
@@ -283,8 +283,14 @@ def _train_loop(
     lpc: LogProbComputer,
     scorer: Client,
 ) -> None:
+    # fused like SFT (math identical, single kernel per param, no foreach
+    # transient) — trainable set is small (LoRA + codec_head), but every MB
+    # counts at the §47 14.4G teacher-forcing peak
     optimizer = torch.optim.AdamW(
-        ttm.trainable_parameters, lr=cfg.lr, weight_decay=cfg.weight_decay
+        ttm.trainable_parameters,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        fused=True,
     )
     start_step = _load_ckpt(cfg, ttm, optimizer) if cfg.resume else 0
 

@@ -1022,3 +1022,4 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **长池 smoke 通过**(30 行 ≥185 字,num_prompts 4,2 步):step 0 = 2g/2flat loss -0.049 dur 98s;step 1 = 1g/3flat **KL 0.00306** dur 147s;t_max 507-511 真进梯度;**flat 跳过率 ~31%**(长散文 take 全读准 → WER 无 spread,设计性);零 runaway。
 - **默认 config 落地**(TrainConfig):`token_budget 896 / token_budget_infer 896 / logprob_micro 2 / sampler_impl graphed / scorer_timeout 1800 / model_path runs/d_ep1`;main.py grpo 路径注入 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
 - **已知未修(用户裁决暂缓)**:超时→陈旧响应 id-mismatch 毒化 + 超时删 wav→scorer 读已删文件崩溃的级联脆弱性(scorer fail-soft + 超时不删 wav 两处小修待做)。
+- **CER normalize 确认(用户要求复核,2026-09-04)**:发现早已落地(8-21 patch,`reward/text.py` verbatim from playground bake-off;`asr.py:50` 双侧 normalize)——此前"待落地"的判断有误。7/7 单元边界(标点/英文大小写/`\n`/中文数字/全角/emoji/空串)+ 4 池 3271 行实数据 A/B 零偏差(缓存 cer 本就是归一化口径)+ 池 v1 审计零危险行(无归一化后 <4 字符)。**无需任何代码改动**。
