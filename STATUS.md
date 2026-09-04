@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-04（§47：长样本可行性定案（budget 896/micro2/graphed，smoke 通过）、打分无瓶颈、默认 config 落地）
+最后更新：2026-09-04（§48：GRPO run 1 完训（52 步 @ lr 1e-6，三次崩溃续跑，KL 平台 0.009 零发散）；E2 评测待做）
 
 ## 1. 目标
 
@@ -1023,3 +1023,12 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **默认 config 落地**(TrainConfig):`token_budget 896 / token_budget_infer 896 / logprob_micro 2 / sampler_impl graphed / scorer_timeout 1800 / model_path runs/d_ep1`;main.py grpo 路径注入 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
 - **已知未修(用户裁决暂缓)**:超时→陈旧响应 id-mismatch 毒化 + 超时删 wav→scorer 读已删文件崩溃的级联脆弱性(scorer fail-soft + 超时不删 wav 两处小修待做)。
 - **CER normalize 确认(用户要求复核,2026-09-04)**:发现早已落地(8-21 patch,`reward/text.py` verbatim from playground bake-off;`asr.py:50` 双侧 normalize)——此前"待落地"的判断有误。7/7 单元边界(标点/英文大小写/`\n`/中文数字/全角/emoji/空串)+ 4 池 3271 行实数据 A/B 零偏差(缓存 cer 本就是归一化口径)+ 池 v1 审计零危险行(无归一化后 <4 字符)。**无需任何代码改动**。
+
+## 48. GRPO run 1 完训:50 步 @ lr 1e-6(2026-09-04)
+
+- **配置**:d_ep1 基座 + 池 v1(3200),lr **1e-6**/warmup 20/50 步(用户 9ccbaf1 @13:19 提交定档 lr 1e-6+warmup 20——本次 run 全程实际执行值;GRPO_RUN1.md 初稿写 1e-5 系笔误已改)。budget 896/infer 896/micro2/graphed/fused AdamW/timeout 1800 全走 §47 默认。
+- **轨迹(51 个有效 monitor 行,1 行死机坏行跳过)**:KL 0.0024 → 平台 0.009(max 0.0119,零发散);grad max 3.30;t_max max 843 < 896 零撞墙;cer_mean 十分位 72/62/63/69/61‰ = 批组成噪声内无趋势(lr 1e-6×50 步,设计上的小步走);sim 稳 0.86-0.89;组级 63% 训练 / 37% flat 跳过。
+- **三次宿主级崩溃 + 续跑**:①WSL GPU 栈崩(满载 25 min,CUDA unknown error @ codec decode);②Windows 整机死机(满载 ~19 min);③第三次 SIGINT 不可中断(torch 吞信号,CUDA op 中)→ kill -9。ckpt_every=1 兑现:每次损失 ≤1 在途组。**step_00032.pt 死机截断成 0 字节** → `torch.load` EOF,resume 必炸;手工隔离(.corrupt)+ latest 指回 31 恢复(可弹性化:_load_ckpt 向前回退到最新可加载档)。
+- **resume 语义发现**:`loop.py:323 range(start_step, start_step + cfg.num_steps)` —— **num_steps 在 resume 时是相对步数**;--num-steps 50 --resume 实际跑了 32..52+(SIGINT 停于 53 在途)。净训步数 ≈52(0-52 含两步重跑),超出用户目标 2 步,无害。
+- **产物**:`runs/grpo_v1/step_00000-00052.pt`(LoRA delta + codec head + optimizer,~104MB/个);monitor.jsonl 53 行;logs = runs/grpo_v1_{trainer,scorer}.log。
+- **待办(E2)**:step_00052 vs d_ep1 的 8 类配对评测;前置问题 = GRPO ckpt 是训练档不是 custom_voice export,需要 LoRA 合入导出或 eval 侧加载 adapter 的通路(w100_rollout arm 机制吃 export 路径)。

@@ -275,6 +275,45 @@ def run_grpo(cfg: TrainConfig) -> None:
         scorer.close()
 
 
+def _log_group(
+    f,
+    step: int,
+    gi: int,
+    speaker: str,
+    prompt: str,
+    cer=None,
+    sim=None,
+    skipped: bool = False,
+    reason: str | None = None,
+) -> None:
+    """Per-group telemetry: one jsonl row per sampled group, written from
+    quantities the skip/training path already computes. Offline analysis
+    (per-source/per-length flat rates, who supplies the signal) joins rows
+    via (step, gi) — draws are rng-replayable (seed * 1000003 + step)."""
+    if f is None:
+        return
+    f.write(
+        json.dumps(
+            {
+                "step": step,
+                "gi": gi,
+                "speaker": speaker,
+                "chars": len(prompt),
+                "cer_mean": round(float(cer.mean()), 5) if cer is not None else None,
+                "cer_std": round(float(cer.std(unbiased=False)), 5)
+                if cer is not None
+                else None,
+                "sim_std": round(float(sim.std(unbiased=False)), 5)
+                if sim is not None
+                else None,
+                "skipped": skipped,
+                "reason": reason,
+            }
+        )
+        + "\n"
+    )
+
+
 def _train_loop(
     cfg: TrainConfig,
     pool: list[PoolItem],
@@ -297,6 +336,7 @@ def _train_loop(
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     monitor_f = (out / "monitor.jsonl").open("a") if cfg.monitor else None
+    groups_f = (out / "groups.jsonl").open("a")
 
     algo = GRPOConfig(
         variant=cfg.variant,
@@ -352,6 +392,7 @@ def _train_loop(
             cur_len = rollout.cur_len
             if t_max + cur_len >= cfg.token_budget:
                 skips["runaway"] = skips.get("runaway", 0) + 1
+                _log_group(groups_f, step, gi, spk, prompt, skipped=True, reason="runaway")
                 _cleanup_wavs(rollout.wav_paths)
                 continue
             g = {
@@ -369,6 +410,7 @@ def _train_loop(
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"step {step}: scorer send failed ({e}) — group skipped")
+                _log_group(groups_f, step, gi, spk, prompt, skipped=True, reason="scorer_send")
                 _cleanup_wavs(g["wavs"])
                 skips["scorer_item"] = skips.get("scorer_item", 0) + 1
                 continue
@@ -385,6 +427,10 @@ def _train_loop(
                     results = scorer.recv_score(rid, timeout=scorer.timeout_s)
                 except (TimeoutError, RuntimeError) as e:
                     logger.warning(f"step {step}: scorer failed ({e}) — group skipped")
+                    _log_group(
+                        groups_f, step, g["gi"], g["speaker"], g["prompt"],
+                        skipped=True, reason="scorer_recv",
+                    )
                     _cleanup_wavs(g["wavs"])
                     skips["scorer_item"] = skips.get("scorer_item", 0) + 1
                     continue
@@ -419,7 +465,13 @@ def _train_loop(
         # whose WER actually spreads carry a learnable within-group signal
         trainable: list[dict] = []
         for g in groups:
-            if needs_resample(g["sim"], g["cer"]):
+            flat = needs_resample(g["sim"], g["cer"])
+            _log_group(
+                groups_f, step, g["gi"], g["speaker"], g["prompt"],
+                cer=g["cer"], sim=g["sim"], skipped=flat,
+                reason="flat_group" if flat else None,
+            )
+            if flat:
                 skips["flat_group"] = skips.get("flat_group", 0) + 1
                 continue
             g["R"], g["bd"] = reward_v3(
@@ -633,3 +685,4 @@ def _train_loop(
 
     if monitor_f is not None:
         monitor_f.close()
+    groups_f.close()
