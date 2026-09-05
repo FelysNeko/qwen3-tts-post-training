@@ -28,7 +28,7 @@ from qwen3_tts_post_training.reward.text import cer, normalize
 
 ARMS = [
     "d_ep1=runs/d_ep1",
-    "g40=runs/grpo_v2_s40/export",
+    "off=runs/sft_official/export",
 ]
 VOICES = ["cyrene", "castorice", "aglaea", "hyacine", "cipher", "hysilens", "cerydra"]
 with open(ROOT / "probes/tmp/general.json") as f:

@@ -3,7 +3,7 @@ per step (Fish-Audio S2 layout), one optimizer update per step.
 
 Pipeline per step:
     prompts → rollout (sample → decode → wav) → scorer (HTTP request/lookup,
-    client-side CER/sim) → reward_v3 → needs_resample? (skip) →
+    client-side CER/sim) → reward_v3 →
     compute_ref/compute_policy → grpo_loss → backward (per-group accumulation,
     equal group weighting) → grad clip → optimizer step → monitor line → ckpt.
 
@@ -48,7 +48,6 @@ from trainer.grpo.grpo import (
     column_weights,
     group_advantage,
     grpo_loss,
-    needs_resample,
 )
 from trainer.grpo.logprob import LogProbComputer
 from trainer.grpo.rollout import rollout_group
@@ -437,18 +436,18 @@ def _collect_scores(
     return groups, time.monotonic() - t0
 
 
-def _filter_trainable(
+def _score_groups(
     groups: list[_Group],
     groups_f,
     step: int,
-    skips: Counter,
     reward_cfgs: dict[str, RewardConfig],
 ) -> list[_Group]:
-    """Per-group zero-signal filter (DAPO dynamic sampling): only groups
-    whose WER actually spreads carry a learnable within-group signal."""
+    """Log every surviving group and compute its reward. All groups train:
+    dead components are zeroed by per-component flameout inside reward_v3,
+    so an easy-text group degenerates into a sim-only advantage instead of
+    being skipped (needs_resample was removed 2026-09-05 — STATUS §54)."""
     trainable: list[_Group] = []
     for g in groups:
-        flat = needs_resample(g.sim, g.cer)
         _log_group(
             groups_f,
             step,
@@ -457,12 +456,7 @@ def _filter_trainable(
             g.prompt,
             cer=g.cer,
             sim=g.sim,
-            skipped=flat,
-            reason="flat_group" if flat else None,
         )
-        if flat:
-            skips["flat_group"] += 1
-            continue
         g.R, g.bd = reward_v3(g.sim, g.cer, g.mos, reward_cfgs[g.speaker])
         trainable.append(g)
     return trainable
@@ -749,7 +743,7 @@ def _train_loop(
         )
         groups, t_score = _collect_scores(cfg, pending, scorer, centroids, spk_row)
 
-        trainable = _filter_trainable(groups, groups_f, step, skips, reward_cfgs)
+        trainable = _score_groups(groups, groups_f, step, reward_cfgs)
         if not trainable:
             logger.warning(f"step {step}: no trainable group — skipped")
             continue

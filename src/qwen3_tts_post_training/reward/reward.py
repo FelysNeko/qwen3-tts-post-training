@@ -92,7 +92,7 @@ def reward_v3(
     groups (one Adam step along it collapsed the policy — smoke C1v8/C1v9)
     and (b) was philosophically at odds with Dr.GRPO's "keep magnitude
     information" design. The std flameout survives only as a signal-health
-    indicator (breakdown + needs_resample); a degenerate component (std <
+    indicator (breakdown); a degenerate component (std <
     flameout_eps) is zeroed so it cannot leak a constant offset either.
 
     cfg is REQUIRED: sv_center/sv_scale come from the pool's metrics.json

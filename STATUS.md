@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-04（§51：scorer 减负——CER 交还调用方（16/16 逐位等价）、ScoreField 退役、sv-dir 删除；§50：FastAPI request/lookup 重构）
+最后更新：2026-09-05（§53+补：DNSMOS 同尺对拍——我们 P835 3.304≈FlowTTS RL 起点，0.2 缺口=其全部增益且在 SIG 维；MOS 闸门设计（τ_s=池均值+eps 0.25）标定数据在册，奖励形式待训练 ablation 终审）
 
 ## 1. 目标
 
@@ -1055,3 +1055,35 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **wire 再简化**(§50 之上):`ScoreItem` 删 `text`;`ScoreResult` 删 `cer`(unwrap 同步);`ScoreField` 整删——分发改用 `ScoreRequest` 三 bool(asr/mos/sv,允许全 False = 空跑);`--sv-dir` 全链删除(`ensure_sv_ckpt` 本就以 ModelScope 缓存为准,sv_dir 只是死代码覆盖)。
 - **CER 客户端化**:`cer/normalize` 本就在共享包 `reward/text.py`,scorer 的 `ASRScorer.score()` 删除只留 `transcribe()`;调用方三处同口径本地计算:GRPO loop(逐 take `cer(normalize(g["prompt"]), normalize(transcript))`)、preprocess pipeline(text 层两处)、w100_score。**16/16 逐位等价**(新链路 vs E2 报告旧值);GRPO 2 步 smoke step 0 与 ZMQ 时代完全一致(cer 0.0663/R 1.4129/5组3skip)。
 - **过程抓虫**:phase 2 曾误用 phase 1 枚举泄漏的 `prompt`(最后一个组文本)→ 全组 CER≈1 的 flat 假死——per-group 文本必须走 `g["prompt"]`。另:pkill 模式 `main --device` 匹配不到 `main.py --device`,旧 scorer 存活占住 8000 端口使新 scorer bind 失败——**杀 scorer 用 `pkill -f "workers/scorer/main.py"`**。
+
+## 52. 官方配方臂:sft_official(2e-5/eff8/3ep)+ 宿主死机 ×8 时代(2026-09-05)
+
+- **动机**:官方 finetuning README 两套配方(2e-6@eff128 / 2e-5@eff8 一键脚本)此前从未实测;本臂 = 官方一键配方逐项映射(2e-5、B1×accum8 = eff8 ≡ 官方 B2×A4、3ep)+ 我们实测最优 warmup 50(§42 固化;用户先拍 100 后改回,§43 已证 100≡50)。**已知预期(§43 风险旗标)**:1e-5 已实测长文本 CER 退化 23-31%,2e-5×3ep 总位移积分 ≈ 1e-5×1ep 的 6 倍,长句恶化风险高、小池 margin 侵蚀放大;短中句身份可能更强。总位移积分 ≈ d_ep1(5e-6×1ep)的 1.2 倍,远低于官方产品级(3.4-7%,§42 普查)。
+- **训练**:1.7B-Base 七池全量 6470,2426 步(~1.7s/步,B1 grad-ckpt 峰值同 §40),sem 2.49→0.14-0.66(epoch2 区间,过拟合形态出现);ckpt_every=100 滚动。**死机 ×1 打断(本日第 8 起),`--resume` 按 pos 级断点续跑,种子化数据序回放,零损失**——SFT resume 语义(`latest.pt` = trainable params + optimizer + pos)实战验证。
+- **产物**:`runs/sft_official/export`(七音色 @3000-3006 小写键,3.6G,官方栈可用)。
+- **待办**:以 `off=runs/sft_official/export` 臂入 w100 评测 vs d_ep1/b_ep1 同框——long 类 CER 直接标定大学习率的长程代价,补全 lr 杠杆档案线。
+- **空间治理**:runs/ 86G→62G(删 w100 bs4 双臂 + abl3_base + 探针);候选待删:d_ep1_train 14G(export 已独立安装)、w100 bs8 双臂 8.6G;ext4.vhdx 归还需 Windows 侧 Optimize-VHD(§43)。
+
+### §52 补:off vs d_ep1 配对评测(同 session 双臂重打,n=896 配对,2026-09-05)
+
+- **长文本崩坏实锤(预期风险最大剂量应验)**:long 类 CER 4.96%→**34.53%**(配对 Δ+29.6pp;1e-5 系为 23-31%,2e-5×3ep 加倍剂量再叠加 3ep 重复暴露);ood +14.5pp 且 sim **−0.09**(难内容身份走弱);chat +1.1pp/short +3.9pp 轻退化;hard −1.4pp/news/multi 地板持平。**OVERALL CER 7.00%→13.00%(+6pp)**,MOS −0.019 持平。
+- **身份反向惊喜**:margin 全线**小池大涨**——hyacine +0.041(0.034→0.074 翻倍)、hysilens +0.028、cipher +0.021;大池微降(cyrene −0.006)。与 §42"lr 1e-5 小池 margin 翻倍"同律放大:**身份确实是 lr 杠杆(§43"身份只看 lr"),且不服从池不平衡侵蚀担忧(§41)**。
+- **结论**:官方 2e-5 配方 = lr 杠杆曲线的远端锚点(5e-6 长安全/弱身份 → 1e-5 长漂 23-31% → 2e-5×3ep 长类 34.5%/margin 大涨)。**d_ep1(5e-6)仍是我们含 100+ 字池的正确基座**;若未来做纯短文本/强身份场景,2e-5 系配方有独立价值。
+- 评测产物:runs/{d_ep1,off}_eval/report_h{0,1}.json(E2 旧报告存档为 *_e2.bak);rollout 896+896(scorer 双卡半切,同 session 同进程);配对分析 /tmp/opencode/pair_off_dep1.py。
+
+## 53. DNSMOS 对拍:FlowTTS 的优化问题在我们模型中"存在与否"的裁决(2026-09-05)
+
+- **背景**:FlowTTS-GRPO(arXiv 2606.23190)以 P.835 DNSMOS OVRL 为 proxy reward 只训 FM 组件,test-zh 上 P835 3.31-3.35 → 3.51-3.54(+0.2,P808 3.95-3.99)。用户命题:"这个 DNSMOS 问题在我们 AR 模型里是否根本不存在"。同尺对拍 = Seed-TTS-Eval test-zh 同一 meta.lst(2020 条目标文本,seed-0 采样 200 条)× d_ep1 出厂态 × 7 音色 × 4 take = 5600 wav,同款 sig_bak_ovr/model_v8 onnx(限流版:ThreadPoolExecutor(3)+intra_op 2——原脚本无界线程池 load 49 炸机,补丁在 probes/tmp 副本)。
+- **对拍结果(test-zh)**:**我们 P808 3.870 / P835 3.304** vs F5+GRPO 3.948/3.514、CV3+GRPO 3.987/3.536、GT 人声锚 3.678/3.064。
+- **裁决:命题不成立——"他们的 DNSMOS 问题"在我们模型里同样存在,且我们恰好站在他们的 RL 起点上**:我们 P835 3.304 ≈ 他们两家的 RL 基线(3.313/3.353),距其终版 0.21-0.23 = 他们用 9545 步×512样本买到的全部增益;P808 3.870 则已近终版(差 0.08-0.12,超 F5 基线)。增益规模本身(+0.1~0.2,基座越好越小)证实该问题是个"小池子"。
+- **缺口定位**:BAK 4.079(饱和,超 GT 人声 3.899)→ 噪声轴无份;差距全在 **SIG 维(我们 3.568)**——语音频谱质感/伪影。但 GT 人声 P835 只有 3.064(比所有合成模型都低 0.2+)⇒ 该指标压真人录音、偏好合成谱纹理的偏差未标定,**0.2 缺口是可闻缺陷还是 DNSMOS 口味,未决**(需人耳或自训质量模型)。
+- **配套诊断(general.json 1792 wav)**:健康组 DNSMOS 组内 std 0.074(UTMOS 一半);OVRL-CER 相关 −0.119(内容盲);OVRL-UTMOS +0.639/P808-UTMOS +0.710(共享粗崩坏轴);阳性对照抓得到真崩坏、误开组排序=随机。
+- **试听裁决(用户 13 组,apps runs/listening_mos_ab/)**:UTMOS 误开组最差命中 1/4=随机;用户听到的差异全在身份("不太像")与音色("闷"),非音质;阳性对照双指标抓最差2条 4-5/6。→ 地板职能成立、细粒度驱动职能不成立的结论与 §10 一致;**MOS 奖励形式的最终裁决交用户设计的训练 ablation**。
+- **产物**:runs/seedtts_eval/(5600 wav,零撞墙)、probes/tmp/dnsmos_{d_ep1,off,gt,seedtts}.csv、probes/tmp/analyze_dnsmos.py、试听包 runs/listening_mos_ab/。DNSMOS 栈=vendored 至 probes/tmp/DNS-Challenge(sparse)+ probes/tmp/dnsmos_venv(librosa<1.0 keyword 补丁)。
+- **运维**:①`microsoft/P.808` 仓库是主观听测框架,DNSMOS 模型本体在 `microsoft/DNS-Challenge`(sparse-checkout DNSMOS/);其 dnsmos_local.py 短于 9.01s 音频自我拼接补长(官方协议);②用户将显示输出从核显切回独显——死机时代(本日 10 次)疑似 iGPU 模式 CPU/显存压力所致,待观察;③/tmp tmpfs 双次被重启清空,易失工作目录一律改 probes/tmp/。
+
+### §53 补:MOS 闸门设计定稿数据 + 杂项收尾(2026-09-05 晚)
+
+- **mos_tau/闸门设计(供 ablation 臂直接引用)**:τ_s = 该池 metrics.json 的 mos.mean(七池 2.605-3.103)+ `mos_flameout_eps` 抬至 **0.25**。标定(d_ep1+off 共 1792 wav、448 组,τ=μ_s 口径):健康类(chat/long/multilingual/news)组内 r_mos std **p95 0.144 / max 0.232** → gate 0.25 零误开;退化组检出 89/224(40%)且信号浓缩(检出组 std 均值 0.253→**0.398**,单组梯度贡献 λ0.2×0.398≈0.08,强于现状的稀释版 0.05)。现状参照:τ=2.5 无闸健康组误开 19/224(cipher 5/32、hysilens 4/32,音质轴零相关已证)。臂谱:0=现状(g40 现成)/ A=τ_s+闸 / C=λ_mos=0 / B(可选)=μ_s 无闸全驱动。**判读纪律**:ablation 里 UTMOS/DNSMOS 读数只能当地板活动率(mos_dead/cap)看——两者健康组细粒度排序均为随机水平(试听 1/4、2/4),DNSMOS 可被策略讨好(FlowTTS +0.2 即证);质量终审 = CER/SV + 人耳。
+- **DNSMOS GPU**:官方脚本 CPU-only(session 无 providers);onnxruntime-gpu + 一行 providers 可启,但模型仅 0.2-1.2MB、瓶颈在 librosa mel 与逐条编排,3 CPU workers 已 5.5 it/s——GPU 无收益,不做。
+- **Seed-TTS-Eval 获取**:Google Drive `gdown 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP`(1.24G,**实为 tar 挂 .zip 名**,`file` 识别后 tar -xf);`zh/meta.lst` 2020 条 `id|prompt_text|prompt_wav|target_text`,目标文本 p50 24 字/budget 384 富余。FlowTTS Table 2 列序 = CER/SS1/SS2/**P808/P835**(曾串列误读,corrected 见 §53 主段)。
