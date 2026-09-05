@@ -272,24 +272,3 @@ def grpo_loss(
         clamped=info.get("clamped"),
         weight_mass=info.get("weight_mass"),
     )
-
-
-def needs_resample(
-    sim: torch.Tensor,
-    cer: torch.Tensor,
-    sv_eps: float = 1e-3,
-    wer_eps: float = 1e-3,
-) -> bool:
-    """Zero-signal group → skip the update (DAPO-style dynamic sampling).
-
-    The only reliable within-group signal is WER spread: MOS is dead by
-    design (hinge floor, std≡0 in healthy groups) and SV rank on
-    same-policy takes is measurement noise (SV_REWARD_FINDINGS §四). So a
-    group trains ONLY when r_wer actually spreads — this covers both
-    all-perfect groups (r_wer ≡ 1) and flat-CER groups (8 takes with
-    identical cer, observed on the graphed smoke C1v8: std_wer = 0 with
-    cer = 0.14, where a single Adam step along the leftover SV-noise
-    ranking collapsed the policy into 12-79 s babbling rollouts).
-    """
-    r_wer = 1.0 - cer
-    return bool(r_wer.std(unbiased=False) < wer_eps)
