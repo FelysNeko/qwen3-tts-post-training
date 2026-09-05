@@ -27,14 +27,11 @@ from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 
 ARMS = [
-    "lr1e5_bs4",
-    "lr1e5_bs8",
-    "lr5e6_bs4",
-    "lr5e6_bs8",
-    "b_ep1=runs/b_ep1",
+    "d_ep1=runs/d_ep1",
+    "g40=runs/grpo_v2_s40/export",
 ]
 VOICES = ["cyrene", "castorice", "aglaea", "hyacine", "cipher", "hysilens", "cerydra"]
-with open(ROOT / "probes/general.json") as f:
+with open(ROOT / "probes/tmp/general.json") as f:
     CATS = json.load(f)
 PROMPTS = [(c, i, t) for c, items in CATS.items() for i, t in enumerate(items)]
 

@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-04（§48：GRPO run 1 完训（52 步 @ lr 1e-6，三次崩溃续跑，KL 平台 0.009 零发散）；E2 评测待做）
+最后更新：2026-09-04（§49：run 2 止损于 40 步 + 导出键名事故修复 + 首个 E2 配对评测：CER −1pp（long −2.5/ood −4.9），sim/MOS 持平）
 
 ## 1. 目标
 
@@ -1032,3 +1032,12 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **resume 语义发现**:`loop.py:323 range(start_step, start_step + cfg.num_steps)` —— **num_steps 在 resume 时是相对步数**;--num-steps 50 --resume 实际跑了 32..52+(SIGINT 停于 53 在途)。净训步数 ≈52(0-52 含两步重跑),超出用户目标 2 步,无害。
 - **产物**:`runs/grpo_v1/step_00000-00052.pt`(LoRA delta + codec head + optimizer,~104MB/个);monitor.jsonl 53 行;logs = runs/grpo_v1_{trainer,scorer}.log。
 - **待办(E2)**:step_00052 vs d_ep1 的 8 类配对评测;前置问题 = GRPO ckpt 是训练档不是 custom_voice export,需要 LoRA 合入导出或 eval 侧加载 adapter 的通路(w100_rollout arm 机制吃 export 路径)。
+
+## 49. GRPO run 2(lr 5e-6)+ 首个 E2 配对评测:GRPO 真实生效(2026-09-04)
+
+- **run 2 配置**:d_ep1 基座 + 池 v1,lr **5e-6**/warmup 20/50 步 + **组级 telemetry**(`groups.jsonl`:每 (step,gi) 一行 {speaker,chars,cer_mean,cer_std,sim_std,skipped,reason},逐行 flush——skip 归因/每源 flat 率的账本;run 1 的 154 skip 全为 flat_group 零 runaway,skip 主因 = 短文本全员读准,chat(17字)单位最难错、delta 体量最大,**cipher 欠训 30%**(delta 均长 44 字全场最短)。
+- **宿主级事故 ×6**:CUDA driver "device not ready" / WSL GPU 栈崩 / 整机死机交替,ckpt_every=1 每次损失 ≤1 步;SIGINT 不可中断(torch 吞信号)+ atexit 清扫 /dev/shm 会杀 scorer 在打分的 wav(级联连锁,scorer fail-soft 仍搁置)。**resume 语义**:`loop.py:323` num_steps 是相对步数。用户止损于 **step 40/50**。
+- **导出 v1 事故(用户听感抓出,g40_eval 全噪音)**:LoRA 包装改写 state_dict 键名(84 个 `gate_proj.base.weight` + 168 个 lora 键泄漏)→ 官方栈按名加载全部 miss → **talker MLP 随机初始化**。合并数学本身无错(fp32 单元测试 6e-7)。
+- **导出 v2**(`probes/tmp/export_grpo.py`):键名清洗重建(`.base.weight`→`.weight`、丢 lora 键)+ **键集合与基座严格相等断言**(404==404,早有此护栏即无此事故)+ 真合并等价探针(v1 的校验量的是 delta 幅度,无效;v2 前后向对照 0.0312 = bf16 舍入级)。验收:talker MLP Δ0.0015(deltas 落地)、code predictor/embedding Δ0(原样)。
+- **E2 配对评测**(w100 协议,d_ep1 与 g40 同 session 同 seed 同打分进程,n=896/臂):**OVERALL CER −1.01pp(7.00→5.99)、MOS +0.003、sim +0.0055**;分类:**long −2.47pp(4.96→2.49,近腰斩——5e-6 系长文本路线被 GRPO 继续改善)**、**ood −4.90pp 且 MOS +0.100/sim +0.030**、short −0.89pp;唯一微退 emotional +0.26pp(噪声级)。**40 步即见效、身份/自然度零代价**——r_sv 护栏 + Dr.GRPO 水位盲区的设计按预期工作。
+- **产物**:`runs/grpo_v2/`(ckpt 0-40)、`runs/grpo_v2_s40/export`(v2 正规导出)、`runs/{d_ep1,g40}_eval/report_h{0,1}.json`;`probes/w100_score.py` ARMS/CATS 路径已更新可复用。

@@ -312,6 +312,7 @@ def _log_group(
         )
         + "\n"
     )
+    f.flush()  # survive hard freezes — this log exists to be post-mortem evidence
 
 
 def _train_loop(
