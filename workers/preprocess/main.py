@@ -67,16 +67,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch", type=int, default=16, help="scoring chunk size")
     parser.add_argument(
-        "--push-endpoint",
-        default="tcp://127.0.0.1:5555",
-        help="ZMQ PUSH bind (scorer PULL-connects here)",
+        "--scorer-url",
+        default="http://127.0.0.1:8000",
+        help="FastAPI scorer base URL (§50 request/lookup service)",
     )
-    parser.add_argument(
-        "--pull-endpoint",
-        default="tcp://127.0.0.1:5556",
-        help="ZMQ PULL bind (scorer PUSH-connects here)",
-    )
-    parser.add_argument("--timeout", type=float, default=600.0, help="scorer timeout s")
     return parser.parse_args()
 
 
@@ -110,11 +104,7 @@ def main() -> None:
         ids = processor(text=text)["input_ids"]
         return len(ids[0]) if ids and isinstance(ids[0], list) else len(ids)
 
-    client = Client(
-        push_endpoint=args.push_endpoint,
-        pull_endpoint=args.pull_endpoint,
-        timeout_s=args.timeout,
-    )
+    client = Client(url=args.scorer_url)
     try:
         out = run_pipeline(
             dataset=dataset,

@@ -89,12 +89,9 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from qwen3_tts_post_training.cache import CacheLayout
-from qwen3_tts_post_training.client.protocol import (
-    ScoreField,
-    ScoreItem,
-    ScoreResult,
-)
+from qwen3_tts_post_training.client.protocol import ScoreItem, ScoreResult
 from qwen3_tts_post_training.client.trainer import Client
+from qwen3_tts_post_training.reward.text import cer, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +461,6 @@ def apply_embedding_layer(
     )
     if not todo:
         return table
-    entries_by_name = {entry.name: entry for entry in cache.corpus_entries}
     config.layout.embedding_dir.mkdir(parents=True, exist_ok=True)
 
     updated: dict[str, TaskRow] = {}
@@ -473,13 +469,10 @@ def apply_embedding_layer(
         chunk = todo[index : index + batch]
         results = client.score(
             [
-                ScoreItem(
-                    wav_path=str(config.layout.enhanced_dir / f"{row.name}.wav"),
-                    text=entries_by_name[row.name].text,
-                )
+                ScoreItem(wav_path=str(config.layout.enhanced_dir / f"{row.name}.wav"))
                 for row in chunk
             ],
-            fields={ScoreField.EMBEDDING},
+            sv=True,
         )
         for row, result in zip(chunk, results):
             embedding_path = config.layout.embedding_dir / f"{row.name}.npy"
@@ -564,12 +557,12 @@ def collect_corpus_metrics(
             results = client.score(
                 [
                     ScoreItem(
-                        wav_path=str(config.layout.enhanced_dir / f"{row.name}.wav"),
-                        text=entries_by_name[row.name].text,
+                        wav_path=str(config.layout.enhanced_dir / f"{row.name}.wav")
                     )
                     for row in chunk
                 ],
-                fields={ScoreField.TRANSCRIPT, ScoreField.CER, ScoreField.MOS},
+                asr=True,
+                mos=True,
             )
             for row, result in zip(chunk, results):
                 text_results[row.name] = result
@@ -580,7 +573,10 @@ def collect_corpus_metrics(
                         sim=float(name_to_norms[row.name] @ centroid),
                         checksum=Checksum.from_disk(config, row.name),
                         transcript=result.get_transcript_unwrap(),
-                        cer=result.get_cer_unwrap(),
+                        cer=cer(
+                            normalize(entries_by_name[row.name].text),
+                            normalize(result.get_transcript_unwrap()),
+                        ),
                         mos=result.get_mos_unwrap(),
                     ).model_dump_json(),
                     file=asset_file,
@@ -632,7 +628,13 @@ def finalize(
                     if result is not None
                     else cached.transcript
                 ),
-                cer=result.get_cer_unwrap() if result is not None else cached.cer,
+                cer=(
+                    cer(
+                        normalize(entry.text), normalize(result.get_transcript_unwrap())
+                    )
+                    if result is not None
+                    else cached.cer
+                ),
                 mos=result.get_mos_unwrap() if result is not None else cached.mos,
                 sim=float(sim),
                 checksum=Checksum.from_disk(config, entry.name),

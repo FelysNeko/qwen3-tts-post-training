@@ -86,9 +86,7 @@ def main() -> None:
     grpo.add_argument("--variant", default=None, choices=["vanilla", "dr", "gspo"])
     grpo.add_argument("--kl-beta", type=float, default=None)
     grpo.add_argument("--logprob-micro", type=int, default=None)
-    grpo.add_argument("--scorer-push-endpoint", default=None)
-    grpo.add_argument("--scorer-pull-endpoint", default=None)
-    grpo.add_argument("--scorer-timeout", type=float, default=None)
+    grpo.add_argument("--scorer-url", default=None)
 
     args = parser.parse_args()
     # CLI kwargs 直灌（未给的键 = None 已过滤 → 落回 dataclass 默认值）；

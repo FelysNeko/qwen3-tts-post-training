@@ -1,19 +1,14 @@
-"""Multi-objective scorer: SV embedding + ASR/CER + MOS, dispatched by the
-request's ScoreField set — only the model groups a caller actually needs are
-run (and lazy-loaded). Calibration-free: similarities are the caller's job."""
+"""Multi-objective scorer: SV embedding + ASR transcript + MOS, dispatched
+by the request's three service bools — only the model groups a caller
+actually needs are run (and lazy-loaded). Calibration-free: similarities and
+CERs are the caller's job."""
 
 from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 
-from qwen3_tts_post_training.client.protocol import (
-    ScoreField,
-    ScoreItem,
-    ScoreResult,
-    Timing,
-)
+from qwen3_tts_post_training.client.protocol import ScoreItem, ScoreResult, Timing
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +26,7 @@ class Scorers:
             from scorer.sv import SVScorer
 
             t0 = time.time()
-            self._sv = SVScorer(Path(self.args.sv_dir), self.args.device)
+            self._sv = SVScorer(self.args.device)
             logger.info(f"sv loaded in {time.time() - t0:.1f}s")
         return self._sv
 
@@ -64,12 +59,12 @@ class Scorers:
         return self._mos
 
     def score(
-        self, items: list[ScoreItem], fields: frozenset[ScoreField]
+        self, items: list[ScoreItem], asr: bool = False, mos: bool = False, sv: bool = False
     ) -> tuple[list[ScoreResult], Timing]:
         results = [ScoreResult(wav_path=item.wav_path) for item in items]
         t_sv = t_asr = t_mos = 0.0
 
-        if ScoreField.EMBEDDING in fields:
+        if sv:
             t0 = time.time()
             embeddings = [
                 self.sv.embed_wav(item.wav_path, "eres2netv2") for item in items
@@ -78,22 +73,19 @@ class Scorers:
             for result, embedding in zip(results, embeddings):
                 result.embedding = embedding.tolist()
 
-        if fields & {ScoreField.TRANSCRIPT, ScoreField.CER}:
+        if asr:
             t0 = time.time()
-            got = self.asr.score(
-                [item.wav_path for item in items], [item.text for item in items]
-            )
+            transcripts = self.asr.transcribe([item.wav_path for item in items])
             t_asr = time.time() - t0
-            for result, row in zip(results, got):
-                result.transcript = row["transcript"]
-                result.cer = row["cer"]
+            for result, item in zip(results, items):
+                result.transcript = transcripts[item.wav_path]
 
-        if ScoreField.MOS in fields:
+        if mos:
             t0 = time.time()
             mos_scores = self.mos.score([item.wav_path for item in items])
             t_mos = time.time() - t0
-            for result, mos in zip(results, mos_scores):
-                result.mos = mos
+            for result, mos_score in zip(results, mos_scores):
+                result.mos = mos_score
 
         timing = Timing(sv=round(t_sv, 2), asr=round(t_asr, 2), mos=round(t_mos, 2))
         return results, timing

@@ -7,7 +7,6 @@ the CALLER's job — this worker is calibration-free."""
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -60,8 +59,7 @@ class FBank:
 
 
 class SVScorer:
-    def __init__(self, sv_dir: Path, device: str):
-        self.sv_dir = Path(sv_dir)
+    def __init__(self, device: str):
         self.device = device
         self.fe = FBank(80, sample_rate=TARGET_SR, mean_nor=True)
         self._models: dict[str, tuple[torch.nn.Module, str]] = {}
@@ -71,7 +69,7 @@ class SVScorer:
             conf = MODELS[name]
             module, cls = conf["obj"].rsplit(".", 1)
             model = getattr(importlib.import_module(module), cls)(**conf["args"])
-            ckpt = ensure_sv_ckpt(self.sv_dir, name)
+            ckpt = ensure_sv_ckpt(name)
             model.load_state_dict(torch.load(ckpt, map_location="cpu"))
             model.to(self.device).eval()
             self._models[name] = (model, self.device)

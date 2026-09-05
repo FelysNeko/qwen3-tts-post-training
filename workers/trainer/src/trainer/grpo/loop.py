@@ -26,10 +26,11 @@ import torch
 import torch.nn.functional as F
 
 from qwen3_tts_post_training.cache import CacheLayout
-from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
+from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.paths import repo_root
 from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
+from qwen3_tts_post_training.reward.text import cer, normalize
 from qwen3_tts_post_training.system import (
     current_rss_mb,
     gpu_allocated_mb,
@@ -108,9 +109,7 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
 
-    scorer_push_endpoint: str = "tcp://127.0.0.1:5555"
-    scorer_pull_endpoint: str = "tcp://127.0.0.1:5556"
-    scorer_timeout: float = 1800.0  # long-audio groups score in ~30s, but desktop contention on the scoring GPU can inflate 100x (§47: 880s MOS outlier)
+    scorer_url: str = "http://127.0.0.1:8000"  # FastAPI scorer (§50); client buffers/re-sends — downtime costs latency, never groups
     out_dir: str = "runs/grpo_v1"
     ckpt_every: int = 1
     resume: bool = False
@@ -128,7 +127,7 @@ def _load_text_pool(cfg: TrainConfig) -> list[PoolItem]:
     one-prompt-per-line files bind every prompt to the single `--namespaces`
     entry."""
     assert cfg.text_pool_path, (
-        "grpo requires --text-pool-path (.jsonl with {\"speaker\", \"text\"}"
+        'grpo requires --text-pool-path (.jsonl with {"speaker", "text"}'
         " rows, or a one-prompt-per-line .txt bound to one namespace)"
     )
     if cfg.text_pool_path.endswith(".jsonl"):
@@ -264,11 +263,7 @@ def run_grpo(cfg: TrainConfig) -> None:
         lmax=cfg.token_budget_infer,
     )
     lpc = LogProbComputer(ttm)
-    scorer = Client(
-        push_endpoint=cfg.scorer_push_endpoint,
-        pull_endpoint=cfg.scorer_pull_endpoint,
-        timeout_s=cfg.scorer_timeout,
-    )
+    scorer = Client(url=cfg.scorer_url)
     try:
         _train_loop(cfg, pool, ttm, sampler, lpc, scorer)
     finally:
@@ -356,7 +351,9 @@ def _train_loop(
         centroid = torch.as_tensor(
             layout.load_centroid(), dtype=torch.float32, device=cfg.device
         )
-        centroid_rows.append(centroid / centroid.norm())  # mirrors the old scorer set_ref recipe
+        centroid_rows.append(
+            centroid / centroid.norm()
+        )  # mirrors the old scorer set_ref recipe
     centroids = torch.stack(centroid_rows)  # [n_spk, hidden]
     spk_row = {spk: i for i, spk in enumerate(speakers)}
     group_ids = torch.zeros(cfg.group_size, dtype=torch.long, device=cfg.device)
@@ -370,10 +367,11 @@ def _train_loop(
         gs = cfg.group_size
         skips: dict[str, int] = {}
 
-        # ---- phase 1: rollout + push (zero-thread ZMQ batch pipeline) ----
-        # Trainer rolls out group by group and PUSHes each group's wavs
-        # (non-blocking, HWM 1000); the scorer drains and scores in parallel
-        # while the trainer continues. Phase 2 drains the PULL side — wall
+        # ---- phase 1: rollout + submit (async HTTP request/lookup) ----
+        # Trainer rolls out group by group and POSTs each group's wavs to the
+        # scorer's queue (submit never fails — an unreachable scorer just
+        # defers the send to the poll loop); the scorer drains and scores in
+        # parallel while the trainer continues. Phase 2 polls — wall
         # time ≈ n_rollouts × rollout + last score.
         t_roll0 = time.monotonic()
         pending: list[tuple[dict, int]] = []  # (group, req_id)
@@ -393,7 +391,9 @@ def _train_loop(
             cur_len = rollout.cur_len
             if t_max + cur_len >= cfg.token_budget:
                 skips["runaway"] = skips.get("runaway", 0) + 1
-                _log_group(groups_f, step, gi, spk, prompt, skipped=True, reason="runaway")
+                _log_group(
+                    groups_f, step, gi, spk, prompt, skipped=True, reason="runaway"
+                )
                 _cleanup_wavs(rollout.wav_paths)
                 continue
             g = {
@@ -404,62 +404,61 @@ def _train_loop(
                 "wavs": rollout.wav_paths,
                 "t_max": t_max,
             }
-            try:
-                rid = scorer.send_score(
-                    [ScoreItem(wav_path=str(p), text=prompt) for p in g["wavs"]],
-                    fields={ScoreField.EMBEDDING, ScoreField.CER, ScoreField.MOS},
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"step {step}: scorer send failed ({e}) — group skipped")
-                _log_group(groups_f, step, gi, spk, prompt, skipped=True, reason="scorer_send")
-                _cleanup_wavs(g["wavs"])
-                skips["scorer_item"] = skips.get("scorer_item", 0) + 1
-                continue
+            rid = scorer.submit(
+                [ScoreItem(wav_path=str(p)) for p in g["wavs"]],
+                asr=True,
+                mos=True,
+                sv=True,
+            )
             pending.append((g, rid))
         t_rollout = time.monotonic() - t_roll0
 
-        # ---- phase 2: score — drain PULL responses, trainer owns unlink ----
-        t_score = 0.0
+        # ---- phase 2: score — poll rounds; the client absorbs scorer death
+        # and restarts (auto re-send), so a group is never dropped here ----
         groups: list[dict] = []
+        t_score = 0.0
         if pending:
             t_s0 = time.monotonic()
-            for g, rid in pending:
-                try:
-                    results = scorer.recv_score(rid, timeout=scorer.timeout_s)
-                except (TimeoutError, RuntimeError) as e:
-                    logger.warning(f"step {step}: scorer failed ({e}) — group skipped")
-                    _log_group(
-                        groups_f, step, g["gi"], g["speaker"], g["prompt"],
-                        skipped=True, reason="scorer_recv",
-                    )
+            while pending:
+                still: list[tuple[dict, int]] = []
+                for g, rid in pending:
+                    results = scorer.poll(rid)
+                    if results is None:
+                        still.append((g, rid))
+                        continue
+                    # trainer owns lifecycle: delete tmpfs wavs after scoring
                     _cleanup_wavs(g["wavs"])
-                    skips["scorer_item"] = skips.get("scorer_item", 0) + 1
-                    continue
-                # trainer owns lifecycle: delete tmpfs wavs after scoring
-                _cleanup_wavs(g["wavs"])
-                # sims are local now: one batched matmul against the pool
-                # speaker's centroid row (float32-exact transport; ~1e-7
-                # accumulation difference vs the old scorer-side dot — see
-                # STATUS §16.9)
-                g["sim"] = (
-                    torch.tensor(
-                        [r.get_embedding_unwrap() for r in results],
+                    # sims are local now: one batched matmul against the pool
+                    # speaker's centroid row (float32-exact transport; ~1e-7
+                    # accumulation difference vs the old scorer-side dot — see
+                    # STATUS §16.9)
+                    g["sim"] = (
+                        torch.tensor(
+                            [r.get_embedding_unwrap() for r in results],
+                            dtype=torch.float32,
+                            device=cfg.device,
+                        )
+                        @ centroids[spk_row[g["speaker"]]]
+                    )
+                    # CER moved client-side (§51): normalized edit distance
+                    # between the group's prompt and each take's transcript
+                    g["cer"] = torch.tensor(
+                        [
+                            cer(normalize(g["prompt"]), normalize(r.get_transcript_unwrap()))
+                            for r in results
+                        ],
                         dtype=torch.float32,
                         device=cfg.device,
                     )
-                    @ centroids[spk_row[g["speaker"]]]
-                )
-                g["cer"] = torch.tensor(
-                    [r.get_cer_unwrap() for r in results],
-                    dtype=torch.float32,
-                    device=cfg.device,
-                )
-                g["mos"] = torch.tensor(
-                    [r.get_mos_unwrap() for r in results],
-                    dtype=torch.float32,
-                    device=cfg.device,
-                )
-                groups.append(g)
+                    g["mos"] = torch.tensor(
+                        [r.get_mos_unwrap() for r in results],
+                        dtype=torch.float32,
+                        device=cfg.device,
+                    )
+                    groups.append(g)
+                pending = still
+                if pending:
+                    time.sleep(scorer.poll_interval)
             t_score = time.monotonic() - t_s0
 
         # per-group zero-signal filter (DAPO dynamic sampling): only groups
@@ -468,8 +467,14 @@ def _train_loop(
         for g in groups:
             flat = needs_resample(g["sim"], g["cer"])
             _log_group(
-                groups_f, step, g["gi"], g["speaker"], g["prompt"],
-                cer=g["cer"], sim=g["sim"], skipped=flat,
+                groups_f,
+                step,
+                g["gi"],
+                g["speaker"],
+                g["prompt"],
+                cer=g["cer"],
+                sim=g["sim"],
+                skipped=flat,
                 reason="flat_group" if flat else None,
             )
             if flat:

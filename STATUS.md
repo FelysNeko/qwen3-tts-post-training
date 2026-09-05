@@ -3,7 +3,7 @@
 > 本文件为项目当前状态、迁移记录、标定数字复核与已知问题清单。
 > 设计真相源仍在 `../playground/SV_REWARD_FINDINGS.md`，本文档只记录"当前机器上发生过什么、已验证什么、还差什么"。
 
-最后更新：2026-09-04（§49：run 2 止损于 40 步 + 导出键名事故修复 + 首个 E2 配对评测：CER −1pp（long −2.5/ood −4.9），sim/MOS 持平）
+最后更新：2026-09-04（§51：scorer 减负——CER 交还调用方（16/16 逐位等价）、ScoreField 退役、sv-dir 删除；§50：FastAPI request/lookup 重构）
 
 ## 1. 目标
 
@@ -1041,3 +1041,17 @@ instruct="angry" 系统性改变声学画像：phys_flatness 中位数 0.096→0
 - **导出 v2**(`probes/tmp/export_grpo.py`):键名清洗重建(`.base.weight`→`.weight`、丢 lora 键)+ **键集合与基座严格相等断言**(404==404,早有此护栏即无此事故)+ 真合并等价探针(v1 的校验量的是 delta 幅度,无效;v2 前后向对照 0.0312 = bf16 舍入级)。验收:talker MLP Δ0.0015(deltas 落地)、code predictor/embedding Δ0(原样)。
 - **E2 配对评测**(w100 协议,d_ep1 与 g40 同 session 同 seed 同打分进程,n=896/臂):**OVERALL CER −1.01pp(7.00→5.99)、MOS +0.003、sim +0.0055**;分类:**long −2.47pp(4.96→2.49,近腰斩——5e-6 系长文本路线被 GRPO 继续改善)**、**ood −4.90pp 且 MOS +0.100/sim +0.030**、short −0.89pp;唯一微退 emotional +0.26pp(噪声级)。**40 步即见效、身份/自然度零代价**——r_sv 护栏 + Dr.GRPO 水位盲区的设计按预期工作。
 - **产物**:`runs/grpo_v2/`(ckpt 0-40)、`runs/grpo_v2_s40/export`(v2 正规导出)、`runs/{d_ep1,g40}_eval/report_h{0,1}.json`;`probes/w100_score.py` ARMS/CATS 路径已更新可复用。
+
+## 50. Scorer 全面重构:ZMQ → FastAPI request/lookup(2026-09-04)
+
+- **动机**:ZMQ 强同步配对(send_score→recv_score 按序)下,scorer 死/重启 = in-flight 组全丢,loop 里 scorer_send/scorer_recv 两条 skip 路径丢组;"先 scorer 后 trainer"的启动纪律 + fail-soft 缺口(§43-§48 的事故链)。
+- **新协议**(§50 设计文档 refactor_scorer.md + 实现微调):`POST /request {items, asr, mos, sv}`(三 bool,`model_validator` ≥1;自增 req_id 服务端分配)→ 入队即返;`POST /lookup {req_id}` → **200 就绪(consume-once)** / **202 在队或打分中** / **404 非法**(不存在/已消费/服务重启)/ **500 打分失败**(全 None + error 文案,同样消费);`DELETE /pool` 清空。单 GPU 线程消费队列,任何异常落池为错误条目;`Scorers.score()` 打分核心零改动(MOS 确定性不动)。状态全 threading.Lock 护。
+- **客户端**(`client/trainer.py` 重写,GRPO/preprocess 共用):本地**句柄** → req_id 映射;`submit` 永不失败(scorer 不可达 = 缓冲,首次 poll 才 POST);`poll` 吸收全部状态码,**404/500 自动同载荷新 id 重发**;阻塞 `score()` 保留(pipeline.py 零改动)。**restarts cost latency, never groups;启动顺序无关**。协议层协议类型:ScoreField 保留为打分核心词汇表,wire 上是三 bool(cer 随 asr)。
+- **删除**:client/scorer.py、pyzmq(根包);新增 httpx(根包 deps,传导 worker)、fastapi[standard](scorer,本就有)。
+- **验证**:假模型探针 7 项全过(断连缓冲→复活收结果、consume-once、DELETE /pool→404→重发、kill+restart→404→重发、注入 500→重发);真模型冒烟(单元范数/CER/MOS 合理);GRPO 2 步 smoke 全绿,step 0 数值与 ZMQ 时代逐位一致(cer 0.0663/R 1.4129)。loop 删 scorer_send/scorer_recv 丢组路径与 groups.jsonl 两 reason。w100_score.py 已适配新 Client(url=8000/8001 半切)。
+
+## 51. Scorer 减负:CER 交还调用方 + ScoreField 退役 + sv-dir 删除(2026-09-04)
+
+- **wire 再简化**(§50 之上):`ScoreItem` 删 `text`;`ScoreResult` 删 `cer`(unwrap 同步);`ScoreField` 整删——分发改用 `ScoreRequest` 三 bool(asr/mos/sv,允许全 False = 空跑);`--sv-dir` 全链删除(`ensure_sv_ckpt` 本就以 ModelScope 缓存为准,sv_dir 只是死代码覆盖)。
+- **CER 客户端化**:`cer/normalize` 本就在共享包 `reward/text.py`,scorer 的 `ASRScorer.score()` 删除只留 `transcribe()`;调用方三处同口径本地计算:GRPO loop(逐 take `cer(normalize(g["prompt"]), normalize(transcript))`)、preprocess pipeline(text 层两处)、w100_score。**16/16 逐位等价**(新链路 vs E2 报告旧值);GRPO 2 步 smoke step 0 与 ZMQ 时代完全一致(cer 0.0663/R 1.4129/5组3skip)。
+- **过程抓虫**:phase 2 曾误用 phase 1 枚举泄漏的 `prompt`(最后一个组文本)→ 全组 CER≈1 的 flat 假死——per-group 文本必须走 `g["prompt"]`。另:pkill 模式 `main --device` 匹配不到 `main.py --device`,旧 scorer 存活占住 8000 端口使新 scorer bind 失败——**杀 scorer 用 `pkill -f "workers/scorer/main.py"`**。

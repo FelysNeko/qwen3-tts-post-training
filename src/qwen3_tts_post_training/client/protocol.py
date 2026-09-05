@@ -1,33 +1,29 @@
-"""ZMQ protocol between trainer (PUSH/PULL bind) and stateless scorer worker.
+"""HTTP protocol between trainer/preprocess clients and the FastAPI scorer.
 
 Audio crosses as absolute tmpfs paths (/dev/shm); scores come back raw —
 sigmoid/std/lambda composition lives in qwen3_tts_post_training.reward. The
-scorer is calibration-free: it returns raw embeddings, and the caller derives
-similarities against its own centroid (`cache.CacheLayout.load_centroid`).
-Validated with pydantic — no manual json building.
+scorer is calibration-free: it returns raw embeddings and transcripts, and
+the caller derives similarities against its own centroid
+(`cache.CacheLayout.load_centroid`) and CERs against its own reference texts
+(`reward.text.cer`). Validated with pydantic — no manual json building.
+
+Wire (async request/lookup, crash-tolerant by construction):
+- POST /request  {items, asr, mos, sv} -> {req_id}   (queued server-side)
+- POST /lookup   {req_id} -> 200 ready (CONSUMED, once) / 202 in flight /
+  404 unknown id (never existed, already consumed, or scorer restarted) /
+  500 scored-with-error (consumed; all-None results + `error` text)
+- DELETE /pool   clears the ready pool
+Clients keep their own handle -> req_id mapping and re-send automatically on
+404/500, so a scorer restart loses nothing the caller still holds.
 """
 
 from __future__ import annotations
 
-from enum import StrEnum
-
 from pydantic import BaseModel
-
-
-class ScoreField(StrEnum):
-    """What a caller wants back per wav. The scorer derives which model
-    groups to run ({EMBEDDING} → SV embed, {TRANSCRIPT, CER} → ASR, {MOS} →
-    MOS), lazy-loads only those, and None-fills everything unrequested."""
-
-    EMBEDDING = "embedding"
-    TRANSCRIPT = "transcript"
-    CER = "cer"
-    MOS = "mos"
 
 
 class ScoreItem(BaseModel):
     wav_path: str
-    text: str
 
 
 class ScoreResult(BaseModel):
@@ -44,7 +40,6 @@ class ScoreResult(BaseModel):
     wav_path: str
     embedding: list[float] | None = None
     transcript: str | None = None
-    cer: float | None = None
     mos: float | None = None
 
     def get_embedding_unwrap(self) -> list[float]:
@@ -57,11 +52,6 @@ class ScoreResult(BaseModel):
         assert transcript is not None, "transcript was not requested from the scorer"
         return transcript
 
-    def get_cer_unwrap(self) -> float:
-        cer = self.cer
-        assert cer is not None, "cer was not requested from the scorer"
-        return cer
-
     def get_mos_unwrap(self) -> float:
         mos = self.mos
         assert mos is not None, "mos was not requested from the scorer"
@@ -69,13 +59,20 @@ class ScoreResult(BaseModel):
 
 
 class ScoreRequest(BaseModel):
-    """Bottom-level ZMQ message: trainer -> scorer. `fields` is REQUIRED —
-    every caller states exactly what it needs, there is no implicit
-    score-everything default."""
+    """POST /request body: what to score and which services to run (a
+    service left False is simply not run — an all-False request scores
+    nothing and returns all-None results)."""
 
-    id: int
     items: list[ScoreItem]
-    fields: frozenset[ScoreField]
+    asr: bool = False
+    mos: bool = False
+    sv: bool = False
+
+
+class LookupRequest(BaseModel):
+    """POST /lookup body."""
+
+    req_id: int
 
 
 class Timing(BaseModel):
@@ -85,9 +82,13 @@ class Timing(BaseModel):
 
 
 class ScoreResponse(BaseModel):
-    """Bottom-level ZMQ message: scorer -> trainer."""
+    """POST /lookup 200/500 body (consume-once: the id leaves the ready pool
+    on either). `timing`/`rss_mb` are diagnostics; on a scoring failure the
+    results are all-None, `error` carries the message, and the transport
+    status is 500."""
 
-    id: int
+    req_id: int
     results: list[ScoreResult]
-    timing: Timing
-    rss_mb: int
+    timing: Timing | None = None
+    rss_mb: int | None = None
+    error: str | None = None

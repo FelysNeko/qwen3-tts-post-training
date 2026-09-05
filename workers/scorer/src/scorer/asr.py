@@ -1,11 +1,10 @@
-"""WER scoring: Qwen3-ASR-1.7B-hf, greedy, batch-8 — verbatim inference path
-from playground/qwen_asr_probe.py (RTFx 52-66, rerun delta 0.000)."""
+"""ASR scoring: Qwen3-ASR-1.7B-hf, greedy, batch-8 — verbatim inference path
+from playground/qwen_asr_probe.py (RTFx 52-66, rerun delta 0.000). CER is
+the caller's job (`qwen3_tts_post_training.reward.text.cer`)."""
 
 from __future__ import annotations
 
 import torch
-
-from qwen3_tts_post_training.reward.text import cer, normalize
 
 
 class ASRScorer:
@@ -38,16 +37,3 @@ class ASRScorer:
             ):
                 texts[w] = t
         return texts
-
-    def score(self, wavs: list[str], texts_ref: list[str]) -> list[dict]:
-        transcripts = self.transcribe(wavs)
-        results = []
-        for wav, ref in zip(wavs, texts_ref):
-            hyp = transcripts[wav]
-            results.append(
-                {
-                    "transcript": hyp,
-                    "cer": cer(normalize(ref), normalize(hyp)),
-                }
-            )
-        return results

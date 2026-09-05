@@ -19,12 +19,12 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 HALF = int(sys.argv[1])
-PUSH = f"tcp://127.0.0.1:{5555 if HALF == 0 else 5557}"
-PULL = f"tcp://127.0.0.1:{5556 if HALF == 0 else 5558}"
+URL = f"http://127.0.0.1:{8000 if HALF == 0 else 8001}"
 
 from qwen3_tts_post_training.cache import CacheLayout
-from qwen3_tts_post_training.client.protocol import ScoreField, ScoreItem
+from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
+from qwen3_tts_post_training.reward.text import cer, normalize
 
 ARMS = [
     "d_ep1=runs/d_ep1",
@@ -42,6 +42,7 @@ def eval_dir(arm: str) -> Path:
         return ROOT / f"runs/{name}_eval"
     return ROOT / f"runs/hp17b_w100_{name}_eval"
 
+
 CENT = torch.stack(
     [
         torch.as_tensor(
@@ -52,7 +53,7 @@ CENT = torch.stack(
     ]
 )
 CENT /= CENT.norm(dim=1, keepdim=True)
-FIELDS = frozenset({ScoreField.EMBEDDING, ScoreField.CER, ScoreField.MOS})
+
 GROUPS = [
     (arm, voice, cat, pi, text)
     for arm in ARMS
@@ -74,18 +75,16 @@ def flush() -> None:
         p.write_text(json.dumps({"groups": REPORTS[arm]}, ensure_ascii=False))
 
 
-client = Client(push_endpoint=PUSH, pull_endpoint=PULL, timeout_s=600.0)
+client = Client(url=URL, poll_interval=2.0)
 for gi, (arm, voice, cat, pi, text) in enumerate(GROUPS):
     if gi % 2 != HALF:
         continue
     key = f"{voice}/{cat}_{pi:02d}"
     if key in REPORTS[arm]:
         continue
-    wavs = [
-        eval_dir(arm) / f"{voice}/{cat}_{pi:02d}_{k}.wav" for k in range(4)
-    ]
+    wavs = [eval_dir(arm) / f"{voice}/{cat}_{pi:02d}_{k}.wav" for k in range(4)]
     results = client.score(
-        [ScoreItem(wav_path=str(w), text=text) for w in wavs], fields=FIELDS
+        [ScoreItem(wav_path=str(w)) for w in wavs], asr=True, mos=True, sv=True
     )
     rows = []
     for w, r in zip(wavs, results):
@@ -94,7 +93,7 @@ for gi, (arm, voice, cat, pi, text) in enumerate(GROUPS):
             {
                 "dur": sf.info(w).duration,
                 "mos": r.get_mos_unwrap(),
-                "cer": r.get_cer_unwrap(),
+                "cer": cer(normalize(text), normalize(r.get_transcript_unwrap())),
                 "sim": {v: float(s) for v, s in zip(VOICES, emb @ CENT.T)},
             }
         )

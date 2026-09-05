@@ -14,6 +14,7 @@ dependencies = [
     "librosa",
     "modelscope>=1.17",
     "qwen3-tts-post-training",
+    "fastapi[standard]>=0.141",
 ]
 
 [tool.uv.sources]

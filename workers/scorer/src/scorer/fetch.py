@@ -9,10 +9,6 @@ Sources:
     sarulab-speech/UTMOSv2
 - Qwen3-ASR-1.7B-hf and facebook/wav2vec2-base already auto-download via
   transformers / huggingface_hub on first load.
-
-`sv_dir` (CLI `--sv-dir`) remains an override: if a ckpt already sits under
-sv_dir/pretrained/... (e.g. a cloned 3D-Speaker checkout) it is used verbatim;
-otherwise the ModelScope snapshot is fetched through the modelscope client.
 """
 
 from __future__ import annotations
@@ -22,37 +18,27 @@ from pathlib import Path
 
 UTMOS_HF_REPO = "sarulab-speech/UTMOSv2"
 
-# model name -> (modelscope model_id, file in repo, file rel to sv_dir)
+# model name -> (modelscope model_id, file in repo)
 SV_SOURCES = {
     "eres2netv2": {
         "model_id": "iic/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common",
         "file": "pretrained_eres2netv2w24s4ep4.ckpt",
-        "rel": (
-            "pretrained/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common/"
-            "pretrained_eres2netv2w24s4ep4.ckpt"
-        ),
     },
-    "campplus": {
+    "cam++": {
         "model_id": "iic/speech_campplus_sv_zh-cn_16k-common",
         "file": "campplus_cn_common.bin",
-        "rel": (
-            "pretrained/speech_campplus_sv_zh-cn_16k-common/campplus_cn_common.bin"
-        ),
     },
 }
 
 logger = logging.getLogger(__name__)
 
 
-def ensure_sv_ckpt(sv_dir: str | Path | None, name: str) -> Path:
+def ensure_sv_ckpt(name: str) -> Path:
     """Resolve (downloading once via ModelScope if needed) the SV ckpt for
-    `name`. A file already present under sv_dir/pretrained/... wins."""
-    conf = SV_SOURCES[name]
-    manual = Path(sv_dir) / conf["rel"] if sv_dir else None
-    if manual is not None and manual.exists() and manual.stat().st_size > 0:
-        return manual
+    `name`. Returns the ModelScope-managed cache path."""
     from modelscope.hub.file_download import model_file_download
 
+    conf = SV_SOURCES[name]
     logger.info(f"fetching SV ckpt {name} via ModelScope ({conf['model_id']})")
     local = model_file_download(
         model_id=conf["model_id"], file_path=conf["file"], revision="master"
