@@ -2,10 +2,10 @@
 per step (Fish-Audio S2 layout), one optimizer update per step.
 
 Pipeline per step:
-    prompts → rollout (sample → decode → wav) → scorer (ZMQ PUSH/PULL) →
-    reward_v3 → needs_resample? (skip) → compute_ref/compute_policy →
-    grpo_loss → backward (per-group accumulation, equal group weighting) →
-    grad clip → optimizer step → monitor line → ckpt.
+    prompts → rollout (sample → decode → wav) → scorer (HTTP request/lookup,
+    client-side CER/sim) → reward_v3 → needs_resample? (skip) →
+    compute_ref/compute_policy → grpo_loss → backward (per-group accumulation,
+    equal group weighting) → grad clip → optimizer step → monitor line → ckpt.
 
 The reference policy is the same weights with LoRA adapters disabled
 (LoraTrainerModel.set_adapter), so only one model lives in VRAM. Ckpts carry
@@ -19,6 +19,7 @@ import json
 import logging
 import random
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,7 +30,11 @@ from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.paths import repo_root
-from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
+from qwen3_tts_post_training.reward.reward import (
+    RewardBreakdown,
+    RewardConfig,
+    reward_v3,
+)
 from qwen3_tts_post_training.reward.text import cer, normalize
 from qwen3_tts_post_training.system import (
     current_rss_mb,
@@ -117,6 +122,25 @@ class TrainConfig:
 
 
 PoolItem = tuple[str, str]  # (speaker key, prompt text)
+
+
+@dataclass
+class _Group:
+    """One (prompt × group_size) rollout unit as it travels the step
+    pipeline — phase 1 fills the rollout half, phase 2 the score tensors,
+    the filter stage the reward."""
+
+    gi: int
+    speaker: str
+    prompt: str
+    codes: list
+    wavs: list[Path]
+    t_max: int
+    sim: torch.Tensor | None = None
+    cer: torch.Tensor | None = None
+    mos: torch.Tensor | None = None
+    R: torch.Tensor | None = None
+    bd: RewardBreakdown | None = None
 
 
 def _load_text_pool(cfg: TrainConfig) -> list[PoolItem]:
@@ -233,11 +257,6 @@ def _load_ckpt(cfg: TrainConfig, ttm: LoraTrainerModel, optimizer) -> int:
     return step + 1
 
 
-# ---------------------------------------------------------------------------
-# main loop
-# ---------------------------------------------------------------------------
-
-
 def run_grpo(cfg: TrainConfig) -> None:
 
     assert cfg.namespaces and all(cfg.namespaces), (
@@ -310,6 +329,364 @@ def _log_group(
     f.flush()  # survive hard freezes — this log exists to be post-mortem evidence
 
 
+# ---------------------------------------------------------------------------
+# step pipeline: rollout+submit → collect scores → filter → train
+# ---------------------------------------------------------------------------
+
+
+def _rollout_and_submit(
+    cfg: TrainConfig,
+    step: int,
+    prompts: list[PoolItem],
+    sampler: Sampler,
+    ttm: LoraTrainerModel,
+    scorer: Client,
+    groups_f,
+    skips: Counter,
+) -> tuple[list[tuple[_Group, int]], float]:
+    """Phase 1: roll each prompt's group out to wavs and hand them to the
+    scorer (submit never fails — an unreachable scorer just defers the send
+    to the poll loop). Returns the pending (group, handle) list."""
+    t0 = time.monotonic()
+    pending: list[tuple[_Group, int]] = []
+    for gi, (spk, prompt) in enumerate(prompts):
+        rollout = rollout_group(
+            sampler,
+            ttm,
+            prompt,
+            seed=cfg.seed * 1000003 + step * 1009 + gi,
+            tag=f"step{step}g{gi}",
+            speaker=spk,
+            temperature=cfg.temperature,
+            top_k=cfg.top_k,
+            token_budget=cfg.token_budget,
+        )
+        t_max = max(c.shape[0] for c in rollout.codes)
+        cur_len = rollout.cur_len
+        if t_max + cur_len >= cfg.token_budget:
+            skips["runaway"] += 1
+            _log_group(groups_f, step, gi, spk, prompt, skipped=True, reason="runaway")
+            _cleanup_wavs(rollout.wav_paths)
+            continue
+        g = _Group(
+            gi=gi,
+            speaker=spk,
+            prompt=prompt,
+            codes=rollout.codes,
+            wavs=rollout.wav_paths,
+            t_max=t_max,
+        )
+        rid = scorer.submit(
+            [ScoreItem(wav_path=str(p)) for p in g.wavs], asr=True, mos=True, sv=True
+        )
+        pending.append((g, rid))
+    return pending, time.monotonic() - t0
+
+
+def _collect_scores(
+    cfg: TrainConfig,
+    pending: list[tuple[_Group, int]],
+    scorer: Client,
+    centroids: torch.Tensor,
+    spk_row: dict[str, int],
+) -> tuple[list[_Group], float]:
+    """Phase 2: poll rounds until every pending group comes back — the client
+    absorbs scorer death and restarts (auto re-send), so a group is never
+    dropped here. Fills sim/cer/mos; the trainer owns tmpfs wav unlink."""
+    t0 = time.monotonic()
+    groups: list[_Group] = []
+    while pending:
+        still: list[tuple[_Group, int]] = []
+        for g, rid in pending:
+            results = scorer.poll(rid)
+            if results is None:
+                still.append((g, rid))
+                continue
+            _cleanup_wavs(g.wavs)
+            # sims are local now: one batched matmul against the pool
+            # speaker's centroid row (float32-exact transport; ~1e-7
+            # accumulation difference vs the old scorer-side dot — see
+            # STATUS §16.9)
+            g.sim = (
+                torch.tensor(
+                    [r.get_embedding_unwrap() for r in results],
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
+                @ centroids[spk_row[g.speaker]]
+            )
+            # CER moved client-side (§51): normalized edit distance
+            # between the group's prompt and each take's transcript
+            g.cer = torch.tensor(
+                [
+                    cer(normalize(g.prompt), normalize(r.get_transcript_unwrap()))
+                    for r in results
+                ],
+                dtype=torch.float32,
+                device=cfg.device,
+            )
+            g.mos = torch.tensor(
+                [r.get_mos_unwrap() for r in results],
+                dtype=torch.float32,
+                device=cfg.device,
+            )
+            groups.append(g)
+        pending = still
+        if pending:
+            time.sleep(scorer.poll_interval)
+    return groups, time.monotonic() - t0
+
+
+def _filter_trainable(
+    groups: list[_Group],
+    groups_f,
+    step: int,
+    skips: Counter,
+    reward_cfgs: dict[str, RewardConfig],
+) -> list[_Group]:
+    """Per-group zero-signal filter (DAPO dynamic sampling): only groups
+    whose WER actually spreads carry a learnable within-group signal."""
+    trainable: list[_Group] = []
+    for g in groups:
+        flat = needs_resample(g.sim, g.cer)
+        _log_group(
+            groups_f,
+            step,
+            g.gi,
+            g.speaker,
+            g.prompt,
+            cer=g.cer,
+            sim=g.sim,
+            skipped=flat,
+            reason="flat_group" if flat else None,
+        )
+        if flat:
+            skips["flat_group"] += 1
+            continue
+        g.R, g.bd = reward_v3(g.sim, g.cer, g.mos, reward_cfgs[g.speaker])
+        trainable.append(g)
+    return trainable
+
+
+def _train_group_one(
+    cfg: TrainConfig,
+    g: _Group,
+    gs: int,
+    micro: int | None,
+    n_tr: int,
+    lpc: LogProbComputer,
+    algo: GRPOConfig,
+    group_ids: torch.Tensor,
+    skips: Counter,
+) -> tuple[torch.Tensor, GRPOMetrics, _Group] | None:
+    """One group's loss pass (backward included). Returns the detached step
+    loss + metrics, or None when every chunk was non-finite.
+
+    micro=None: full-batch policy graph, one backward.
+    micro=k: the policy graph is backwarded PER CHUNK so at most `k`
+    sequences' activations ever coexist. Exact recombination: per-token terms
+    are row-independent and the loss is a weighted token mean, so
+    full = Σ_c loss_c·(W_c/W_total); the group advantage baseline is computed
+    ONCE on all gs rows — never per chunk (that would change the Dr.GRPO
+    baseline)."""
+    ref = lpc.compute_ref(
+        [g.prompt] * gs,
+        g.codes,
+        cfg.temperature,
+        subtalker_temperature=SUBTALKER_TEMPERATURE,
+        micro=micro,
+        speaker=g.speaker,
+    )
+    if micro is None:
+        pol = lpc.compute_policy(
+            [g.prompt] * gs,
+            g.codes,
+            cfg.temperature,
+            subtalker_temperature=SUBTALKER_TEMPERATURE,
+            speaker=g.speaker,
+        )
+        loss, metrics = grpo_loss(
+            pol.log_probs, ref.log_probs, g.R, pol.mask, group_ids, algo
+        )
+        if not torch.isfinite(loss):
+            # non-finite loss (e.g. a sampled token falling out of the
+            # teacher-forcing top-k) backprops NaN grads — drop the group
+            skips["nonfinite_loss"] += 1
+            return None
+        (loss / n_tr).backward()
+        return loss.detach(), metrics, g
+
+    A, gmean, gstd = group_advantage(g.R, algo.variant, group_ids, algo.std_eps)
+    W_total = (ref.mask * column_weights(ref.mask, algo)).sum().clamp_min(1e-12)
+    W_used = ref.log_probs.new_zeros(())
+    loss_acc = ref.log_probs.new_zeros(())
+    pol_acc = ref.log_probs.new_zeros(())
+    kl_acc: list[torch.Tensor] = []
+    for i in range(0, gs, micro):
+        sl = slice(i, i + micro)
+        pol_c = lpc.compute_policy(
+            [g.prompt] * micro,
+            g.codes[sl],
+            cfg.temperature,
+            subtalker_temperature=SUBTALKER_TEMPERATURE,
+            speaker=g.speaker,
+        )
+        width = ref.log_probs.shape[1]
+        pad = width - pol_c.log_probs.shape[1]
+        lp_c = F.pad(pol_c.log_probs, (0, pad)) if pad else pol_c.log_probs
+        mk_c = F.pad(pol_c.mask, (0, pad)) if pad else pol_c.mask
+        loss_c, met_c = grpo_loss(
+            lp_c,
+            ref.log_probs[sl],
+            A[sl],
+            mk_c,
+            group_ids[sl],
+            algo,
+            advantage=A[sl],
+        )
+        if not torch.isfinite(loss_c):
+            # one non-finite chunk drops only that chunk (earlier
+            # chunks are already backwarded and cannot be undone);
+            # remaining chunks renormalize over W_used below
+            skips["nonfinite_loss"] += 1
+            continue
+        W_used = W_used + met_c.weight_mass
+        loss_acc = loss_acc + loss_c.detach() * met_c.weight_mass
+        pol_acc = pol_acc + met_c.policy_loss.detach() * met_c.weight_mass
+        if met_c.kl is not None:
+            kl_acc.append(met_c.kl * met_c.weight_mass)
+        # equal group weighting across the step: each chunk carries
+        # its share of the group's 1/n_tr contribution
+        (loss_c * met_c.weight_mass / W_total / n_tr).backward()
+    if W_used.item() == 0.0:
+        return None  # every chunk non-finite — the group contributed no grads
+    metrics = GRPOMetrics(
+        loss_acc / W_used,
+        pol_acc / W_used,
+        torch.stack(kl_acc).sum() / W_used if kl_acc else None,
+        A,
+        gmean,
+        gstd,
+    )
+    return loss_acc.detach() / W_used, metrics, g
+
+
+def _train_groups(
+    cfg: TrainConfig,
+    trainable: list[_Group],
+    lpc: LogProbComputer,
+    algo: GRPOConfig,
+    group_ids: torch.Tensor,
+    skips: Counter,
+) -> tuple[list[tuple[torch.Tensor, GRPOMetrics, _Group]], float]:
+    """Phase 3: one optimizer pass worth of gradient accumulation — one group
+    per iteration, equal group weighting (each group contributes
+    1/len(trainable) to the update)."""
+    t0 = time.monotonic()
+    micro = cfg.logprob_micro or None
+    gs = cfg.group_size
+    n_tr = len(trainable)
+    trained: list[tuple[torch.Tensor, GRPOMetrics, _Group]] = []
+    for g in trainable:
+        out = _train_group_one(cfg, g, gs, micro, n_tr, lpc, algo, group_ids, skips)
+        if out is not None:
+            trained.append(out)
+    return trained, time.monotonic() - t0
+
+
+def _bundle_mean(key: str, bds: list[RewardBreakdown]) -> float:
+    return torch.cat([getattr(b, key) for b in bds]).float().mean().item()
+
+
+def _group_mean(key: str, groups: list[_Group]) -> float:
+    return torch.cat([getattr(g, key) for g in groups]).mean().item()
+
+
+def _build_monitor(
+    step: int,
+    device: str,
+    trained: list[tuple[torch.Tensor, GRPOMetrics, _Group]],
+    skips: Counter,
+    grad_norm: torch.Tensor,
+    lr_t: float,
+    reward_cfgs: dict[str, RewardConfig],
+    t_rollout: float,
+    t_score: float,
+    t_train: float,
+    t_opt: float,
+    t0: float,
+) -> dict:
+    losses = torch.stack([l for l, _, _ in trained])
+    pol_losses = torch.stack([m.policy_loss for _, m, _ in trained])
+    kls = [m.kl for _, m, _ in trained if m.kl is not None]
+    advs = torch.cat([m.advantage for _, m, _ in trained])
+    R_all = torch.cat([g.R for _, _, g in trained])
+    bds = [g.bd for _, _, g in trained]
+
+    per_speaker: dict[str, dict[str, float]] = {}
+    for _, _, g in trained:
+        d = per_speaker.setdefault(g.speaker, {"n": 0, "sim": 0.0, "cer": 0.0})
+        d["n"] += 1
+        d["sim"] += float(g.sim.mean())
+        d["cer"] += float(g.cer.mean())
+
+    return {
+        "step": step,
+        "groups_trained": len(trained),
+        "groups_skipped": sum(skips.values()),
+        "skips": dict(skips),
+        "loss": round(losses.mean().item(), 4),
+        "policy_loss": round(pol_losses.mean().item(), 4),
+        "kl": round(torch.stack(kls).mean().item(), 5) if kls else None,
+        "grad_norm": round(grad_norm.item(), 4),
+        "lr": f"{lr_t:.2e}",
+        "mean_R": round(R_all.mean().item(), 4),
+        "t_max": max(g.t_max for _, _, g in trained),
+        "adv_std": round(advs.std(unbiased=False).item(), 4),
+        "r_sv_mean": round(_bundle_mean("r_sv", bds), 4),
+        "r_wer_mean": round(_bundle_mean("r_wer", bds), 4),
+        "r_mos_mean": round(_bundle_mean("r_mos", bds), 4),
+        "std_sv": round(torch.cat([b.std_sv for b in bds]).mean().item(), 5),
+        "std_wer": round(torch.cat([b.std_wer for b in bds]).mean().item(), 5),
+        "mos_dead_frac": round(
+            torch.stack(
+                [
+                    (b.std_mos < reward_cfgs[g.speaker].mos_flameout_eps).float()
+                    for b, (_, _, g) in zip(bds, trained)
+                ]
+            )
+            .mean()
+            .item(),
+            3,
+        ),
+        "sim_mean": round(_group_mean("sim", [g for _, _, g in trained]), 4),
+        "cer_mean": round(_group_mean("cer", [g for _, _, g in trained]), 4),
+        "mos_mean": round(_group_mean("mos", [g for _, _, g in trained]), 4),
+        "per_speaker": {
+            k: {
+                "n": v["n"],
+                "sim": round(v["sim"] / v["n"], 4),
+                "cer": round(v["cer"] / v["n"], 4),
+            }
+            for k, v in sorted(per_speaker.items())
+        },
+        "t_rollout": round(t_rollout, 2),
+        "t_score": round(t_score, 2),
+        "t_train": round(t_train, 2),
+        "t_opt": round(t_opt, 2),
+        "rss_mb": peak_rss_mb(),
+        "rss_cur_mb": current_rss_mb(),
+        "gpu_alloc_mb": gpu_allocated_mb(device),
+        "gpu_reserved_mb": gpu_reserved_mb(device),
+        "dur_s": round(time.monotonic() - t0, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# main loop
+# ---------------------------------------------------------------------------
+
+
 def _train_loop(
     cfg: TrainConfig,
     pool: list[PoolItem],
@@ -364,236 +741,24 @@ def _train_loop(
             pg["lr"] = lr_t
         t0 = time.monotonic()
         prompts = _pick_prompts(pool, cfg, step)
-        gs = cfg.group_size
-        skips: dict[str, int] = {}
+        skips: Counter = Counter()
 
-        # ---- phase 1: rollout + submit (async HTTP request/lookup) ----
-        # Trainer rolls out group by group and POSTs each group's wavs to the
-        # scorer's queue (submit never fails — an unreachable scorer just
-        # defers the send to the poll loop); the scorer drains and scores in
-        # parallel while the trainer continues. Phase 2 polls — wall
-        # time ≈ n_rollouts × rollout + last score.
-        t_roll0 = time.monotonic()
-        pending: list[tuple[dict, int]] = []  # (group, req_id)
-        for gi, (spk, prompt) in enumerate(prompts):
-            rollout = rollout_group(
-                sampler,
-                ttm,
-                prompt,
-                seed=cfg.seed * 1000003 + step * 1009 + gi,
-                tag=f"step{step}g{gi}",
-                speaker=spk,
-                temperature=cfg.temperature,
-                top_k=cfg.top_k,
-                token_budget=cfg.token_budget,
-            )
-            t_max = max(c.shape[0] for c in rollout.codes)
-            cur_len = rollout.cur_len
-            if t_max + cur_len >= cfg.token_budget:
-                skips["runaway"] = skips.get("runaway", 0) + 1
-                _log_group(
-                    groups_f, step, gi, spk, prompt, skipped=True, reason="runaway"
-                )
-                _cleanup_wavs(rollout.wav_paths)
-                continue
-            g = {
-                "gi": gi,
-                "speaker": spk,
-                "prompt": prompt,
-                "codes": rollout.codes,
-                "wavs": rollout.wav_paths,
-                "t_max": t_max,
-            }
-            rid = scorer.submit(
-                [ScoreItem(wav_path=str(p)) for p in g["wavs"]],
-                asr=True,
-                mos=True,
-                sv=True,
-            )
-            pending.append((g, rid))
-        t_rollout = time.monotonic() - t_roll0
+        # phase 1: rollout + submit; phase 2: poll until scored
+        pending, t_rollout = _rollout_and_submit(
+            cfg, step, prompts, sampler, ttm, scorer, groups_f, skips
+        )
+        groups, t_score = _collect_scores(cfg, pending, scorer, centroids, spk_row)
 
-        # ---- phase 2: score — poll rounds; the client absorbs scorer death
-        # and restarts (auto re-send), so a group is never dropped here ----
-        groups: list[dict] = []
-        t_score = 0.0
-        if pending:
-            t_s0 = time.monotonic()
-            while pending:
-                still: list[tuple[dict, int]] = []
-                for g, rid in pending:
-                    results = scorer.poll(rid)
-                    if results is None:
-                        still.append((g, rid))
-                        continue
-                    # trainer owns lifecycle: delete tmpfs wavs after scoring
-                    _cleanup_wavs(g["wavs"])
-                    # sims are local now: one batched matmul against the pool
-                    # speaker's centroid row (float32-exact transport; ~1e-7
-                    # accumulation difference vs the old scorer-side dot — see
-                    # STATUS §16.9)
-                    g["sim"] = (
-                        torch.tensor(
-                            [r.get_embedding_unwrap() for r in results],
-                            dtype=torch.float32,
-                            device=cfg.device,
-                        )
-                        @ centroids[spk_row[g["speaker"]]]
-                    )
-                    # CER moved client-side (§51): normalized edit distance
-                    # between the group's prompt and each take's transcript
-                    g["cer"] = torch.tensor(
-                        [
-                            cer(normalize(g["prompt"]), normalize(r.get_transcript_unwrap()))
-                            for r in results
-                        ],
-                        dtype=torch.float32,
-                        device=cfg.device,
-                    )
-                    g["mos"] = torch.tensor(
-                        [r.get_mos_unwrap() for r in results],
-                        dtype=torch.float32,
-                        device=cfg.device,
-                    )
-                    groups.append(g)
-                pending = still
-                if pending:
-                    time.sleep(scorer.poll_interval)
-            t_score = time.monotonic() - t_s0
-
-        # per-group zero-signal filter (DAPO dynamic sampling): only groups
-        # whose WER actually spreads carry a learnable within-group signal
-        trainable: list[dict] = []
-        for g in groups:
-            flat = needs_resample(g["sim"], g["cer"])
-            _log_group(
-                groups_f,
-                step,
-                g["gi"],
-                g["speaker"],
-                g["prompt"],
-                cer=g["cer"],
-                sim=g["sim"],
-                skipped=flat,
-                reason="flat_group" if flat else None,
-            )
-            if flat:
-                skips["flat_group"] = skips.get("flat_group", 0) + 1
-                continue
-            g["R"], g["bd"] = reward_v3(
-                g["sim"], g["cer"], g["mos"], reward_cfgs[g["speaker"]]
-            )
-            trainable.append(g)
-
+        trainable = _filter_trainable(groups, groups_f, step, skips, reward_cfgs)
         if not trainable:
             logger.warning(f"step {step}: no trainable group — skipped")
             continue
 
-        # ---- phase 3: train — gradient accumulation, one group per pass ----
-        # (peak activation memory stays at single-group level; each group
-        # contributes 1/len(trainable) to the update, equal group weighting)
-        t_train0 = time.monotonic()
-        micro = cfg.logprob_micro or None
-        optimizer.zero_grad(set_to_none=True)
-        trained: list[tuple[torch.Tensor, object, dict]] = []
-        for g in trainable:
-            n_tr = len(trainable)
-            ref = lpc.compute_ref(
-                [g["prompt"]] * gs,
-                g["codes"],
-                cfg.temperature,
-                subtalker_temperature=SUBTALKER_TEMPERATURE,
-                micro=micro,
-                speaker=g["speaker"],
-            )
-            if micro is None:
-                pol = lpc.compute_policy(
-                    [g["prompt"]] * gs,
-                    g["codes"],
-                    cfg.temperature,
-                    subtalker_temperature=SUBTALKER_TEMPERATURE,
-                    speaker=g["speaker"],
-                )
-                loss, metrics = grpo_loss(
-                    pol.log_probs, ref.log_probs, g["R"], pol.mask, group_ids, algo
-                )
-                if not torch.isfinite(loss):
-                    # non-finite loss (e.g. a sampled token falling out of the
-                    # teacher-forcing top-k) backprops NaN grads — drop the group
-                    skips["nonfinite_loss"] = skips.get("nonfinite_loss", 0) + 1
-                    continue
-                (loss / n_tr).backward()
-                trained.append((loss.detach(), metrics, g))
-                continue
-
-            # micro-batch path: the policy graph is backwarded PER CHUNK so at
-            # most `micro` sequences' activations ever coexist. Exact
-            # recombination: per-token terms are row-independent and the loss
-            # is a weighted token mean, so full = Σ_c loss_c·(W_c/W_total);
-            # the group advantage baseline is computed ONCE on all gs rows —
-            # never per chunk (that would change the Dr.GRPO baseline).
-            A, gmean, gstd = group_advantage(
-                g["R"], algo.variant, group_ids, algo.std_eps
-            )
-            W_total = (ref.mask * column_weights(ref.mask, algo)).sum().clamp_min(1e-12)
-            W_used = ref.log_probs.new_zeros(())
-            loss_acc = ref.log_probs.new_zeros(())
-            pol_acc = ref.log_probs.new_zeros(())
-            kl_acc: list[torch.Tensor] = []
-            for i in range(0, gs, micro):
-                sl = slice(i, i + micro)
-                pol_c = lpc.compute_policy(
-                    [g["prompt"]] * micro,
-                    g["codes"][sl],
-                    cfg.temperature,
-                    subtalker_temperature=SUBTALKER_TEMPERATURE,
-                    speaker=g["speaker"],
-                )
-                width = ref.log_probs.shape[1]
-                pad = width - pol_c.log_probs.shape[1]
-                lp_c = F.pad(pol_c.log_probs, (0, pad)) if pad else pol_c.log_probs
-                mk_c = F.pad(pol_c.mask, (0, pad)) if pad else pol_c.mask
-                loss_c, met_c = grpo_loss(
-                    lp_c,
-                    ref.log_probs[sl],
-                    A[sl],
-                    mk_c,
-                    group_ids[sl],
-                    algo,
-                    advantage=A[sl],
-                )
-                if not torch.isfinite(loss_c):
-                    # one non-finite chunk drops only that chunk (earlier
-                    # chunks are already backwarded and cannot be undone);
-                    # remaining chunks renormalize over W_used below
-                    skips["nonfinite_loss"] = skips.get("nonfinite_loss", 0) + 1
-                    continue
-                W_used = W_used + met_c.weight_mass
-                loss_acc = loss_acc + loss_c.detach() * met_c.weight_mass
-                pol_acc = pol_acc + met_c.policy_loss.detach() * met_c.weight_mass
-                if met_c.kl is not None:
-                    kl_acc.append(met_c.kl * met_c.weight_mass)
-                # equal group weighting across the step: each chunk carries
-                # its share of the group's 1/n_tr contribution
-                (loss_c * met_c.weight_mass / W_total / n_tr).backward()
-            if W_used.item() == 0.0:
-                continue  # every chunk non-finite — the group contributed no grads
-            metrics = GRPOMetrics(
-                loss_acc / W_used,
-                pol_acc / W_used,
-                torch.stack(kl_acc).sum() / W_used if kl_acc else None,
-                A,
-                gmean,
-                gstd,
-            )
-            trained.append((loss_acc.detach() / W_used, metrics, g))
-        t_train = time.monotonic() - t_train0
-
+        # phase 3: gradient accumulation, one group per pass; phase 4: update
+        trained, t_train = _train_groups(cfg, trainable, lpc, algo, group_ids, skips)
         if not trained:
             logger.warning(f"step {step}: all losses non-finite — skipped")
             continue
-
-        # ---- phase 4: update ----
         t_opt0 = time.monotonic()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             ttm.trainable_parameters, cfg.grad_clip
@@ -601,79 +766,23 @@ def _train_loop(
         optimizer.step()
         t_opt = time.monotonic() - t_opt0
 
-        losses = torch.stack([l for l, _, _ in trained])
-        pol_losses = torch.stack([m.policy_loss for _, m, _ in trained])
-        kls = [m.kl for _, m, _ in trained if m.kl is not None]
-        advs = torch.cat([m.advantage for _, m, _ in trained])
-        R_all = torch.cat([g["R"] for _, _, g in trained])
-        bds = [g["bd"] for _, _, g in trained]
-
-        def _col(key: str, bds=bds) -> float:
-            return torch.cat([getattr(b, key) for b in bds]).float().mean().item()
-
-        def _col_g(key: str, trained=trained) -> float:
-            return torch.cat([g[key] for _, _, g in trained]).mean().item()
-
-        per_speaker: dict[str, dict[str, float]] = {}
-        for _, _, g in trained:
-            d = per_speaker.setdefault(g["speaker"], {"n": 0, "sim": 0.0, "cer": 0.0})
-            d["n"] += 1
-            d["sim"] += float(g["sim"].mean())
-            d["cer"] += float(g["cer"].mean())
-
-        monitor = {
-            "step": step,
-            "groups_trained": len(trained),
-            "groups_skipped": sum(skips.values()),
-            "skips": skips,
-            "loss": round(losses.mean().item(), 4),
-            "policy_loss": round(pol_losses.mean().item(), 4),
-            "kl": round(torch.stack(kls).mean().item(), 5) if kls else None,
-            "grad_norm": round(grad_norm.item(), 4),
-            "lr": f"{lr_t:.2e}",
-            "mean_R": round(R_all.mean().item(), 4),
-            "t_max": max(g["t_max"] for _, _, g in trained),
-            "adv_std": round(advs.std(unbiased=False).item(), 4),
-            "r_sv_mean": round(_col("r_sv"), 4),
-            "r_wer_mean": round(_col("r_wer"), 4),
-            "r_mos_mean": round(_col("r_mos"), 4),
-            "std_sv": round(torch.cat([b.std_sv for b in bds]).mean().item(), 5),
-            "std_wer": round(torch.cat([b.std_wer for b in bds]).mean().item(), 5),
-            "mos_dead_frac": round(
-                torch.stack(
-                    [
-                        (b.std_mos < reward_cfgs[g["speaker"]].mos_flameout_eps).float()
-                        for b, (_, _, g) in zip(bds, trained)
-                    ]
-                )
-                .mean()
-                .item(),
-                3,
-            ),
-            "sim_mean": round(_col_g("sim"), 4),
-            "cer_mean": round(_col_g("cer"), 4),
-            "mos_mean": round(_col_g("mos"), 4),
-            "per_speaker": {
-                k: {
-                    "n": v["n"],
-                    "sim": round(v["sim"] / v["n"], 4),
-                    "cer": round(v["cer"] / v["n"], 4),
-                }
-                for k, v in sorted(per_speaker.items())
-            },
-            "t_rollout": round(t_rollout, 2),
-            "t_score": round(t_score, 2),
-            "t_train": round(t_train, 2),
-            "t_opt": round(t_opt, 2),
-            "rss_mb": peak_rss_mb(),
-            "rss_cur_mb": current_rss_mb(),
-            "gpu_alloc_mb": gpu_allocated_mb(cfg.device),
-            "gpu_reserved_mb": gpu_reserved_mb(cfg.device),
-            "dur_s": round(time.monotonic() - t0, 2),
-        }
-        line = json.dumps(monitor, ensure_ascii=False)
+        monitor = _build_monitor(
+            step,
+            cfg.device,
+            trained,
+            skips,
+            grad_norm,
+            lr_t,
+            reward_cfgs,
+            t_rollout,
+            t_score,
+            t_train,
+            t_opt,
+            t0,
+        )
         logger.info(
-            f"step {step} | {len(trained)} groups, {sum(skips.values())} skipped"
+            f"step {step} | {monitor['groups_trained']} groups,"
+            f" {monitor['groups_skipped']} skipped"
             f" | loss {monitor['loss']} (policy {monitor['policy_loss']},"
             f" kl {monitor['kl']}) | grad {monitor['grad_norm']} lr {monitor['lr']}"
             f" | R {monitor['mean_R']} adv_std {monitor['adv_std']}"
@@ -683,7 +792,7 @@ def _train_loop(
             f" mos {monitor['mos_mean']} | {monitor['dur_s']}s"
         )
         if monitor_f is not None:
-            monitor_f.write(line + "\n")
+            monitor_f.write(json.dumps(monitor, ensure_ascii=False) + "\n")
             monitor_f.flush()
 
         if (step + 1) % cfg.ckpt_every == 0:
