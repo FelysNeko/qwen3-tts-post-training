@@ -1,22 +1,32 @@
-"""Reward v3.1 (design truth source: playground/SV_REWARD_FINDINGS.md §四/§七).
+"""Reward v3.2 (design truth source: playground/SV_REWARD_FINDINGS.md §四/§七).
 
 GRPO-internal — nothing outside `trainer.grpo` imports this module.
 
-    R = λ_sv·r_sv + λ_wer·r_wer + λ_mos·r_mos   (RAW magnitudes, no std division)
+    R = λ_sv·r_sv + λ_wer·r_wer + λ_mos·r_mos + λ_p835·r_p835
+        (RAW magnitudes, no within-group std division)
 
 - r_sv  = sigmoid((sim_e2v2 − sv_center)/sv_scale)  (sv_center/sv_scale from
   the pool's metrics.json sim stats via cache.CacheLayout.load_metrics — the
   0.8585/0.0966 playground pair is retired; E2V2 speaker sim, unit-normalized)
 - r_wer = 1 − CER_qwen3asr                          (normalize() + edit-distance CER)
-- r_mos = max(0, 2.5 − mos_utmosv2fold0)            (hinge 护栏, 线性地板: 只挡不驱动)
+- r_mos = mos_role="floor": max(0, 2.5 − mos_utmosv2fold0)   (hinge 护栏: 只挡不驱动)
+         mos_role="raw":   mos_utmosv2fold0  (raw drive, FlowTTS 式 — 指标即教师;
+                                             τ 不参与; "健康组 std≡0" 性质不复存在)
+- r_p835 = P.835 DNSMOS calibrated OVRL, verbatim   (FlowTTS §2.3 "adopt the
+  OVRL score as the training reward"; raw MOS scale ~[2.5, 4] — no sigmoid or
+  centering: Dr.GRPO subtracts the group mean downstream, so only the
+  within-group dispersion survives into the advantage)
 - Every term 熄火 (zeroed) when its within-group std drops below its
-  flameout eps (MD: 组内 std<eps 熄火) — MOS by construction in healthy
+  flameout eps (MD: 组内 std<eps 熄火) — floor-mode MOS by construction in healthy
   groups (r_mos ≡ 0 → std = 0), SV/WER in degenerate groups (e.g.
   all-perfect transcripts); otherwise a flat group would amplify pure
   ranking noise to full scale (one Adam step along it collapsed the policy
   — smoke C1v8/C1v9). Dr.GRPO subtracts the group mean downstream, so
   magnitudes are kept.
-- λ = (1.0, 1.0, 0.2) — v3 定稿.
+- λ = (1.0, 1.0, 0.2, 0.0) defaults — v3 定稿 + the v3.2 fourth term silent.
+  The MOS 4-arm ablation (2026-09) drives the combinations: 无MOS (0,0) /
+  P835 驱动 (0, 0.4) / UTMOS raw (0.2, raw) / 现状地板 (0.2, floor); effective
+  drive is balanced across arms 2|3 (0.4×DNSMOS std ≈ 0.2×UTMOS std).
 
 r_mos floor (2026-08-23, UTMOS-replacement A/B conclusion): a sigmoid is still
 sloped inside the healthy zone (mos 2.7-3.3 → r_mos 0.73-0.98), so healthy
@@ -47,18 +57,29 @@ class RewardConfig:
     lam_sv: float = 1.0
     lam_wer: float = 1.0
     lam_mos: float = 0.2
+    lam_p835: float = 0.0
+    mos_role: str = "floor"  # floor | raw
     flameout_eps: float = 1e-3
     mos_flameout_eps: float = 1e-4
     mos_flameout: bool = True
+    p835_flameout_eps: float = 1e-4
+
+    def __post_init__(self) -> None:
+        if self.mos_role not in ("floor", "raw"):
+            raise ValueError(
+                f"mos_role must be 'floor' or 'raw', got {self.mos_role!r}"
+            )
 
 
 class RewardBreakdown(NamedTuple):
     r_sv: torch.Tensor
     r_wer: torch.Tensor
     r_mos: torch.Tensor
+    r_p835: torch.Tensor
     std_sv: torch.Tensor
     std_wer: torch.Tensor
     std_mos: torch.Tensor
+    std_p835: torch.Tensor
     R: torch.Tensor
 
 
@@ -71,13 +92,26 @@ def r_wer_fn(cer: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
 
 
 def r_mos_fn(mos: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
-    """Hinge floor: 0 above τ (healthy, strictly silent), linear penalty below.
+    """floor: hinge — 0 above τ (healthy, strictly silent), linear penalty
+    below. Healthy groups get r_mos ≡ 0, so their within-group std is 0 by
+    construction and the flameout fires deterministically — no threshold
+    gamble on a noisy std estimate. Penalty slope is 1 per MOS unit below τ.
 
-    Healthy groups get r_mos ≡ 0, so their within-group std is 0 by
-    construction and the flameout fires deterministically — no threshold gamble
-    on a noisy std estimate. Penalty slope is 1 per MOS unit below τ.
+    raw: the metric itself is the teacher (FlowTTS-style driving — the
+    2026-09 MOS ablation's arm 3). τ is unused; the "healthy ⇒ std ≡ 0 by
+    construction" property no longer holds, so the flameout degrades from a
+    guarantee to a pure flat-group noise filter.
     """
+    if cfg.mos_role == "raw":
+        return mos
     return torch.clamp(cfg.mos_tau - mos, min=0.0)
+
+
+def r_p835_fn(p835: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
+    """Identity on the calibrated OVRL — FlowTTS §2.3 adopts the raw score as
+    the training reward; no sigmoid/centering (offsets are erased by the
+    group-mean subtraction downstream)."""
+    return p835
 
 
 def reward_v3(
@@ -85,24 +119,30 @@ def reward_v3(
     cer: torch.Tensor,
     mos: torch.Tensor,
     cfg: RewardConfig,
+    p835: torch.Tensor | None = None,
     group_dim: int = -1,
 ) -> tuple[torch.Tensor, RewardBreakdown]:
-    """v3.1 composite reward: RAW component magnitudes, no within-group std
+    """v3.2 composite reward: RAW component magnitudes, no within-group std
     division. Dr.GRPO subtracts the group mean in the advantage, so flat
     groups already produce near-zero A on their own; the old r/std(r)
     standardization (a) amplified pure ranking noise to full scale on flat
     groups (one Adam step along it collapsed the policy — smoke C1v8/C1v9)
     and (b) was philosophically at odds with Dr.GRPO's "keep magnitude
     information" design. The std flameout survives only as a signal-health
-    indicator (breakdown); a degenerate component (std <
-    flameout_eps) is zeroed so it cannot leak a constant offset either.
+    indicator (breakdown); a degenerate component (std < its eps) is zeroed
+    so it cannot leak a constant offset either.
 
     cfg is REQUIRED: sv_center/sv_scale come from the pool's metrics.json
     sim stats (cache.CacheLayout.load_metrics) — there is no default
-    calibration.
+    calibration. p835 is REQUIRED whenever cfg.lam_p835 != 0 — a nonzero
+    weight without the score tensor would silently train a three-term
+    reward instead of the requested four-term one; with lam_p835 == 0 the
+    fourth term is exact zeros and R stays bit-identical to the legacy
+    three-term path (p835 passed or not).
 
     Component scales (per take): r_sv ∈ (0,1) sigmoid; r_wer ∈ [0,1];
-     r_mos = max(0, τ−mos), linear penalty in MOS units, λ_mos=0.2.
+    r_mos = max(0, τ−mos) floor / raw mos; r_p835 = calibrated OVRL (MOS
+    scale); λ_mos=0.2, λ_p835 per ablation arm.
     """
     r_sv = r_sv_fn(sim, cfg)
     r_wer = r_wer_fn(cer, cfg)
@@ -124,5 +164,22 @@ def reward_v3(
     else:
         term_mos = cfg.lam_mos * r_mos
 
-    R = term_sv + term_wer + term_mos
-    return R, RewardBreakdown(r_sv, r_wer, r_mos, std_sv, std_wer, std_mos, R)
+    if p835 is not None:
+        r_p835 = r_p835_fn(p835, cfg)
+        std_p835 = r_p835.std(dim=group_dim, unbiased=False, keepdim=True)
+    else:
+        if cfg.lam_p835 != 0.0:
+            raise ValueError(
+                "lam_p835 != 0 requires the p835 score tensor "
+                "(the loop arms the scorer request via cfg.lam_p835 > 0)"
+            )
+        r_p835 = zeros
+        std_p835 = zeros
+    term_p835 = torch.where(
+        std_p835 < cfg.p835_flameout_eps, zeros, cfg.lam_p835 * r_p835
+    )
+
+    R = term_sv + term_wer + term_mos + term_p835
+    return R, RewardBreakdown(
+        r_sv, r_wer, r_mos, r_p835, std_sv, std_wer, std_mos, std_p835, R
+    )

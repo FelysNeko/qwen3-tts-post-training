@@ -109,6 +109,12 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
 
+    # MOS ablation (2026-09): reward MOS-term shape — lam_p835 > 0 also arms
+    # the scorer request (p835=True) and fills g.p835 / the monitor rows.
+    lam_mos: float = 0.2  # 0 silences the UTMOS term (ablation arms 1/2)
+    lam_p835: float = 0.0  # P.835 OVRL driver weight (arm 2: 0.4; default off)
+    mos_role: str = "floor"  # floor | raw — raw drives with raw UTMOS (arm 3)
+
     scorer_url: str = "http://127.0.0.1:8000"  # FastAPI scorer (§50); client buffers/re-sends — downtime costs latency, never groups
     out_dir: str = "runs/grpo_v1"
     ckpt_every: int = 1
@@ -134,6 +140,7 @@ class _Group:
     sim: torch.Tensor | None = None
     cer: torch.Tensor | None = None
     mos: torch.Tensor | None = None
+    p835: torch.Tensor | None = None
     R: torch.Tensor | None = None
     bd: RewardBreakdown | None = None
 
@@ -375,6 +382,7 @@ def _rollout_and_submit(
             [ScoreItem(wav_path=str(p)) for p in g.wavs],
             asr=True,
             utmosv2=True,
+            p835=cfg.lam_p835 > 0,
             sv=True,
         )
         pending.append((g, rid))
@@ -428,6 +436,12 @@ def _collect_scores(
                 dtype=torch.float32,
                 device=cfg.device,
             )
+            if cfg.lam_p835 > 0:
+                g.p835 = torch.tensor(
+                    [r.get_p835_unwrap() for r in results],
+                    dtype=torch.float32,
+                    device=cfg.device,
+                )
             groups.append(g)
         pending = still
         if pending:
@@ -456,7 +470,9 @@ def _score_groups(
             cer=g.cer,
             sim=g.sim,
         )
-        g.R, g.bd = reward_v3(g.sim, g.cer, g.mos, reward_cfgs[g.speaker])
+        g.R, g.bd = reward_v3(
+            g.sim, g.cer, g.mos, reward_cfgs[g.speaker], p835=g.p835
+        )
         trainable.append(g)
     return trainable
 
@@ -615,6 +631,7 @@ def _build_monitor(
     advs = torch.cat([m.advantage for _, m, _ in trained])
     R_all = torch.cat([g.R for _, _, g in trained])
     bds = [g.bd for _, _, g in trained]
+    p835_groups = [g for _, _, g in trained if g.p835 is not None]
 
     per_speaker: dict[str, dict[str, float]] = {}
     for _, _, g in trained:
@@ -639,6 +656,7 @@ def _build_monitor(
         "r_sv_mean": round(_bundle_mean("r_sv", bds), 4),
         "r_wer_mean": round(_bundle_mean("r_wer", bds), 4),
         "r_mos_mean": round(_bundle_mean("r_mos", bds), 4),
+        "r_p835_mean": round(_bundle_mean("r_p835", bds), 4),
         "std_sv": round(torch.cat([b.std_sv for b in bds]).mean().item(), 5),
         "std_wer": round(torch.cat([b.std_wer for b in bds]).mean().item(), 5),
         "mos_dead_frac": round(
@@ -652,9 +670,24 @@ def _build_monitor(
             .item(),
             3,
         ),
+        "p835_dead_frac": round(
+            torch.stack(
+                [
+                    (b.std_p835 < reward_cfgs[g.speaker].p835_flameout_eps).float()
+                    for b, (_, _, g) in zip(bds, trained)
+                ]
+            )
+            .mean()
+            .item(),
+            3,
+        ),
         "sim_mean": round(_group_mean("sim", [g for _, _, g in trained]), 4),
         "cer_mean": round(_group_mean("cer", [g for _, _, g in trained]), 4),
         "mos_mean": round(_group_mean("mos", [g for _, _, g in trained]), 4),
+        # p835 travels only when armed (cfg.lam_p835 > 0) — None otherwise
+        "p835_mean": (
+            round(_group_mean("p835", p835_groups), 4) if p835_groups else None
+        ),
         "per_speaker": {
             k: {
                 "n": v["n"],
@@ -719,7 +752,11 @@ def _train_loop(
         layout = CacheLayout(_resolve_namespace(Path(cfg.cache_dir), spk))
         sim_stats = layout.load_metrics()["sim"]
         reward_cfgs[spk] = RewardConfig(
-            sv_center=sim_stats["mean"], sv_scale=sim_stats["std"]
+            sv_center=sim_stats["mean"],
+            sv_scale=sim_stats["std"],
+            lam_mos=cfg.lam_mos,
+            lam_p835=cfg.lam_p835,
+            mos_role=cfg.mos_role,
         )
         centroid = torch.as_tensor(
             layout.load_centroid(), dtype=torch.float32, device=cfg.device

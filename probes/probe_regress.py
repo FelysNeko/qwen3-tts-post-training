@@ -244,7 +244,7 @@ print("2: sem shifted-select bit-equal vs legacy pred_start loop  PASS")
 print("3: sub placement (no extra shift) + packing invariants  PASS")
 
 # ---------- 4. reward math (trainer/grpo/reward.py) ----------
-from trainer.grpo.reward import RewardConfig, reward_v3
+from trainer.grpo.reward import RewardConfig, r_mos_fn, reward_v3
 
 from qwen3_tts_post_training.cache import CacheLayout
 
@@ -280,5 +280,48 @@ with tempfile.TemporaryDirectory() as td:
     )
     assert not torch.equal(R1, R3), "shifted metrics did not change the reward"
     print("   non-default injection changes reward  PASS")
+
+    # --- v3.2: lam_p835 term + mos_role (MOS ablation, plan §3-C) ---
+    try:
+        RewardConfig(sv_center=0.8, sv_scale=0.1, mos_role="bogus")
+        raise SystemExit("FAIL: invalid mos_role accepted")
+    except ValueError:
+        pass
+    print("   mos_role validation (floor | raw)  PASS")
+
+    cfg_raw = RewardConfig(sv_center=0.8, sv_scale=0.1, mos_role="raw")
+    assert torch.equal(r_mos_fn(mos, cfg_raw), mos), "raw mos mutated"
+    print("   mos_role=raw passes raw mos through (bit-equal)  PASS")
+
+    p835 = torch.tensor([3.30, 3.52, 3.41, 3.60])
+    cfg_p = RewardConfig(sv_center=0.8585, sv_scale=0.0966, lam_p835=0.4)
+    R4, bd4 = reward_v3(sim, cer_t, mos, cfg_p, p835=p835)
+    assert torch.equal(bd4.r_p835, p835), "r_p835 must be the verbatim OVRL"
+    hand = (
+        bd4.r_sv * cfg_p.lam_sv
+        + bd4.r_wer * cfg_p.lam_wer
+        + bd4.r_mos * cfg_p.lam_mos
+        + cfg_p.lam_p835 * bd4.r_p835
+    )
+    assert torch.equal(R4, hand), "four-term hand reference mismatch"
+    print("   p835 four-term composite (hand reference)  PASS")
+
+    try:
+        reward_v3(sim, cer_t, mos, cfg_p, p835=None)
+        raise SystemExit("FAIL: lam_p835>0 without p835 accepted")
+    except ValueError:
+        pass
+    print("   lam_p835>0 without p835 raises  PASS")
+
+    R5, _ = reward_v3(
+        sim, cer_t, mos, RewardConfig(sv_center=0.8585, sv_scale=0.0966), p835=p835
+    )
+    assert torch.equal(R1, R5), "lam_p835=0 must stay bit-identical to legacy"
+    print("   legacy path bit-identity (p835 tensor, λ=0)  PASS")
+
+    R6, bd6 = reward_v3(sim, cer_t, mos, cfg_p, p835=torch.full_like(p835, 3.40))
+    assert float(bd6.std_p835.mean()) == 0.0, "flat p835 std must be 0"
+    assert torch.equal(R6, R1), "flat p835 group must flameout to the legacy R"
+    print("   flat p835 group flameout  PASS")
 
 print("ALL PASS")

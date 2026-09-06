@@ -86,6 +86,27 @@ def main() -> None:
     grpo.add_argument("--variant", default=None, choices=["vanilla", "dr", "gspo"])
     grpo.add_argument("--kl-beta", type=float, default=None)
     grpo.add_argument("--logprob-micro", type=int, default=None)
+    grpo.add_argument(
+        "--lam-mos",
+        type=float,
+        default=None,
+        help="UTMOS term weight in reward_v3 (default 0.2; 0 = silent — "
+        "MOS-ablation arms 1/2)",
+    )
+    grpo.add_argument(
+        "--lam-p835",
+        type=float,
+        default=None,
+        help="P.835 DNSMOS calibrated-OVRL driver weight (default 0 = off; "
+        "ablation arm 2 uses 0.4; >0 also arms the scorer p835 request)",
+    )
+    grpo.add_argument(
+        "--mos-role",
+        default=None,
+        choices=["floor", "raw"],
+        help="UTMOS term shape: floor = hinge max(0, τ−mos), guard-only "
+        "(default); raw = raw mos drives (FlowTTS-style, arm 3)",
+    )
     grpo.add_argument("--scorer-url", default=None)
 
     args = parser.parse_args()
