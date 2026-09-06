@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 
 from trainer.grpo.loop import TrainConfig, run_grpo
 from trainer.sft.loop import SftConfig, run_sft
+
+logger = logging.getLogger(__name__)
+
+
+def _log_config(command: str, cfg) -> None:
+    """One-line dump of the fully-resolved config (CLI overrides merged with
+    dataclass defaults) — incident forensics needs the exact effective
+    hyperparameters in the log, not a reconstruction from flags."""
+    kv = " ".join(f"{k}={v}" for k, v in dataclasses.asdict(cfg).items())
+    logger.info("%s config: %s", command, kv)
 
 
 def main() -> None:
@@ -118,13 +129,18 @@ def main() -> None:
         if key != "command" and value is not None
     }
     if args.command == "sft":
-        run_sft(SftConfig(**overrides))
+        cfg = SftConfig(**overrides)
+        _log_config("sft", cfg)
+        run_sft(cfg)
     else:
         # graphed KV pool + teacher-forcing peak need low-fragmentation
         # allocator segments (§47: micro=4 OOM'd with 1.58G stranded in
         # reserved-but-unallocated under the default allocator)
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        run_grpo(TrainConfig(**overrides))
+        logger.info("env PYTORCH_CUDA_ALLOC_CONF=%s", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
+        cfg = TrainConfig(**overrides)
+        _log_config("grpo", cfg)
+        run_grpo(cfg)
 
 
 if __name__ == "__main__":
