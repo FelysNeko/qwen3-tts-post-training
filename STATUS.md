@@ -108,7 +108,7 @@ workers/trainer/.venv/bin/python workers/trainer/main.py grpo \
 - [ ] **UTMOS 5-fold 监控未接入**：scorer 默认 fold0；§四 定稿要求"5-fold UTMOS 定期 eval"。`ScorerClient` 也未暴露 `--mos-fold`。
 - [ ] **below-τ 比例监控缺失**：§四 定稿要求"每 batch 记录 below-tau 比例（上升=退化警报）"。现 monitor 只有 `mos_dead`（组内 std<eps 熄火），不是 below-τ 占比。
 - [ ] **时长/语速投机 + 熵坍缩警报**（§七 缺口 5）：组内时长中位数漂移、熵坍缩警报未实现。
-- [ ] **长音频分段**（§四 工程规则）："长音频分段取 mean−λ·std 或最差段"未实现（注：§七 已搁置"时长卫兵"，但"长音频分段"未显式搁置，语义略有出入）。
+- [x] **长音频分段**（§四 工程规则）："长音频分段取 mean−λ·std 或最差段"未实现（注：§七 已搁置"时长卫兵"，但"长音频分段"未显式搁置，语义略有出入）。**→ 2026-09-06 实测关闭**：`probes/tmp/probe_sv_duration.py`（cyrene 池 top-15 by sim 累积拼接、0.7s 静音间隔、15→190s，生产 `SVScorer.embed` 直通路径 CPU 跑；自检单 clip 重算 sim vs 存量 |Δ|=2.8e-6）——**sim 单调升且饱和 0.969→0.994（z 1.12→1.41），无任何长音频衰减**，§四 分段规则 shelved-with-evidence。副产物发现：r_sv 存在轻度**正**时长梯度（15s→60s 约 +0.03-0.05，"更多语音→更自信的池化估计"，~80-100s 饱和），比质量散布（池 σ → r_sv ±0.25）小一个量级、被 r_wer 变长惩罚对冲——二阶效应，记录不处理；注：拼接含多 clip 平均机制，单条连续长 take 只占"更多帧"一半，方向不变。
 - [ ] **优化路线**（§七）：decode 195ms→20-30ms——**torch.compile 已落地（2.4x，`--sampler-impl compiled`）**；**CUDA graph（Phase 3）已实现但被 5070Ti 捕获兼容问题阻塞**（见 §9 C1v5，需迁 cuda:0 或升级工具链）。`torch.compile` ASR 补测（§六，预估 ~2.4x）未做。
 - [ ] **GVR 全量验证**（§七 缺口 6 时序③）：gen ~2.5h → sv + asr + mos（全量 1779 + GT 子样本 300）作 RL step-0 基线；推迟至 1-epoch ckpt 定稿后。
 
