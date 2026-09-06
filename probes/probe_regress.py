@@ -1,10 +1,14 @@
 """Regression probe: batch.collate (vs official reference + legacy placement)
 and the dense logprob algebra (sem shifted-select, sub placement, packing).
-Synthetic tensors only — no model loads."""
+Section 4: reward_v3 math (metrics.json → RewardConfig injection, no-default
+guard) — moved here from probe_preprocess when reward.py became
+trainer/grpo-internal. Synthetic tensors only — no model loads."""
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -238,4 +242,43 @@ counts = mask.view(b, max_j, Q).sum(dim=(1, 2)).long()
 assert torch.equal(counts, lengths * Q)
 print("2: sem shifted-select bit-equal vs legacy pred_start loop  PASS")
 print("3: sub placement (no extra shift) + packing invariants  PASS")
+
+# ---------- 4. reward math (trainer/grpo/reward.py) ----------
+from trainer.grpo.reward import RewardConfig, reward_v3
+
+from qwen3_tts_post_training.cache import CacheLayout
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    pool = CacheLayout(tmp / "pool")
+    pool.cache_namespace_dir.mkdir(parents=True)
+    pool.metrics_json.write_text(json.dumps({"sim": {"mean": 0.8585, "std": 0.0966}}))
+
+    try:
+        RewardConfig()
+        raise SystemExit("FAIL: RewardConfig() without calibration did not raise")
+    except TypeError:
+        pass
+    print("4: bare RewardConfig() without calibration raises  PASS")
+
+    sim = torch.tensor([0.83, 0.88, 0.86, 0.90])
+    cer_t = torch.tensor([0.10, 0.02, 0.05, 0.00])
+    mos = torch.tensor([2.4, 3.1, 2.8, 3.0])
+    stats = pool.load_metrics()["sim"]
+    cfg_file = RewardConfig(sv_center=stats["mean"], sv_scale=stats["std"])
+    R1, _ = reward_v3(sim, cer_t, mos, RewardConfig(sv_center=0.8585, sv_scale=0.0966))
+    R2, _ = reward_v3(sim, cer_t, mos, cfg_file)
+    assert torch.equal(R1, R2), "file calib != explicit pair"
+    print("   metrics.json sim stats == explicit construction (bit-equal)  PASS")
+
+    shifted = CacheLayout(tmp / "pool_shifted")
+    shifted.cache_namespace_dir.mkdir(parents=True)
+    shifted.metrics_json.write_text(json.dumps({"sim": {"mean": 0.80, "std": 0.05}}))
+    s3 = shifted.load_metrics()["sim"]
+    R3, _ = reward_v3(
+        sim, cer_t, mos, RewardConfig(sv_center=s3["mean"], sv_scale=s3["std"])
+    )
+    assert not torch.equal(R1, R3), "shifted metrics did not change the reward"
+    print("   non-default injection changes reward  PASS")
+
 print("ALL PASS")

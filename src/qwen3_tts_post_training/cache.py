@@ -14,8 +14,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from qwen3_tts_post_training.reward.reward import RewardConfig
-
 
 @dataclass(frozen=True)
 class CacheLayout:
@@ -59,17 +57,6 @@ class CacheLayout:
         `vectors @ centroid`; preprocess writes it in `finalize`, same np.save
         layout as the codes/embedding artifacts."""
         return np.load(self.centroid_npy)
-
-    def reward_config(self) -> RewardConfig:
-        """sv_center/sv_scale from the corpus sim distribution (mean/std of
-        the per-clip cosine to the centroid). mos_tau stays at the current
-        2.5: the mos stats in metrics.json are informational until a gate
-        rule is decided (STATUS.md §16)."""
-        metrics = self.load_metrics()
-        return RewardConfig(
-            sv_center=metrics["sim"]["mean"],
-            sv_scale=metrics["sim"]["std"],
-        )
 
     def speaker_ref(self) -> Path:
         """Enhanced wav of the pool's ERes2NetV2 medoid (the `medoid` key

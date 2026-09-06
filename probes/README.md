@@ -3,7 +3,7 @@
 - `probe_regress.py` — `FullTrainerModel.collate` vs 官方 collate_fn 逐字节相等（含 ragged、legacy 放置公式）、logprob dense 代数（sem shifted-select 位相等、sub 放置无额外偏移、packing 不变量）。
 - `probe_gamma.py` — `GRPOConfig.subtalker_weight`（MTP γ）+ per-codebook 归一：γ=1 手算加权参考、γ=0 精确屏蔽（对扰动不变、梯度为 0、inf×0 护栏）、`num_code_groups=1` 旧路径等价、负值拒绝。
 - `probe_micro.py` — GRPO logprob micro-batch 路径与全组前向的等价性（逐 token 位等、Dr.GRPO 基线只在全组上算一次）。
-- `probe_preprocess.py` — 预处理管线(STATUS §16):bool wire(asr/utmosv2/p835/sv)往返 + unwrap 防呆、metrics.json 注入 RewardConfig 与旧标定位等(reward_v3)、合成 corpus 离线阶段(load/filter/布局/asset 幂等、finalize 产物 metrics 标量手算参考、扁平 dropped 契约)。
+- `probe_preprocess.py` — 预处理管线(STATUS §16):bool wire(asr/utmosv2/p835/sv)往返 + unwrap 防呆、metrics.json sim 提取 + centroid 契约(reward 数学在 probe_regress §4,reward_v3 已归 trainer/grpo)、合成 corpus 离线阶段(load/filter/布局/asset 幂等、finalize 产物 metrics 标量手算参考、扁平 dropped 契约)。
 - `probe_clearvoice_ab.py` — vendored MossFormer2_SE_48K vs pip clearvoice 位等验证（2026-08-27 归档：max_abs=0.00e+00，4/4 clips 含 26s）。pip 已卸载，现跑会打印归档结论退出；重装 pip 包可复验。
 
 ## 评测基建（需模型/GPU）

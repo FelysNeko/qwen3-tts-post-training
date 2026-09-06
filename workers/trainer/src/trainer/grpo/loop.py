@@ -30,18 +30,13 @@ from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.paths import repo_root
-from qwen3_tts_post_training.reward.reward import (
-    RewardBreakdown,
-    RewardConfig,
-    reward_v3,
-)
-from qwen3_tts_post_training.reward.text import cer, normalize
 from qwen3_tts_post_training.system import (
     current_rss_mb,
     gpu_allocated_mb,
     gpu_reserved_mb,
     peak_rss_mb,
 )
+from qwen3_tts_post_training.text import cer, normalize
 from trainer.grpo.grpo import (
     GRPOConfig,
     GRPOMetrics,
@@ -50,6 +45,7 @@ from trainer.grpo.grpo import (
     grpo_loss,
 )
 from trainer.grpo.logprob import LogProbComputer
+from trainer.grpo.reward import RewardBreakdown, RewardConfig, reward_v3
 from trainer.grpo.rollout import rollout_group
 from trainer.grpo.samplers.base import Sampler
 from trainer.lora import LoraTrainerModel
@@ -721,7 +717,10 @@ def _train_loop(
     centroid_rows: list[torch.Tensor] = []
     for spk in speakers:
         layout = CacheLayout(_resolve_namespace(Path(cfg.cache_dir), spk))
-        reward_cfgs[spk] = layout.reward_config()
+        sim_stats = layout.load_metrics()["sim"]
+        reward_cfgs[spk] = RewardConfig(
+            sv_center=sim_stats["mean"], sv_scale=sim_stats["std"]
+        )
         centroid = torch.as_tensor(
             layout.load_centroid(), dtype=torch.float32, device=cfg.device
         )

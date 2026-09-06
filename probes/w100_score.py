@@ -24,7 +24,7 @@ URL = f"http://127.0.0.1:{8000 if HALF == 0 else 8001}"
 from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreItem
 from qwen3_tts_post_training.client.trainer import Client
-from qwen3_tts_post_training.reward.text import cer, normalize
+from qwen3_tts_post_training.text import cer, normalize
 
 ARMS = [
     "d_ep1=runs/d_ep1",

@@ -91,7 +91,7 @@ from tqdm import tqdm
 from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreItem, ScoreResult
 from qwen3_tts_post_training.client.trainer import Client
-from qwen3_tts_post_training.reward.text import cer, normalize
+from qwen3_tts_post_training.text import cer, normalize
 
 logger = logging.getLogger(__name__)
 

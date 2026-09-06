@@ -1,11 +1,12 @@
 """HTTP protocol between trainer/preprocess clients and the FastAPI scorer.
 
 Audio crosses as absolute tmpfs paths (/dev/shm); scores come back raw —
-sigmoid/std/lambda composition lives in qwen3_tts_post_training.reward. The
+sigmoid/std/lambda composition lives in the trainer's grpo.reward module. The
 scorer is calibration-free: it returns raw embeddings and transcripts, and
 the caller derives similarities against its own centroid
 (`cache.CacheLayout.load_centroid`) and CERs against its own reference texts
-(`reward.text.cer`). Validated with pydantic — no manual json building.
+(`qwen3_tts_post_training.text.cer`). Validated with pydantic — no manual
+json building.
 
 Wire (async request/lookup, crash-tolerant by construction):
 - POST /request  {items, asr, utmosv2, p835, sv} -> {req_id}   (queued server-side)

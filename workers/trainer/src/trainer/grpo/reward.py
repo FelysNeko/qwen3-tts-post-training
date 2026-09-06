@@ -1,10 +1,12 @@
 """Reward v3.1 (design truth source: playground/SV_REWARD_FINDINGS.md §四/§七).
 
+GRPO-internal — nothing outside `trainer.grpo` imports this module.
+
     R = λ_sv·r_sv + λ_wer·r_wer + λ_mos·r_mos   (RAW magnitudes, no std division)
 
 - r_sv  = sigmoid((sim_e2v2 − sv_center)/sv_scale)  (sv_center/sv_scale from
-  the pool's metrics.json via cache.CacheLayout.reward_config — the 0.8585/
-  0.0966 playground pair is retired; E2V2 speaker sim, unit-normalized)
+  the pool's metrics.json sim stats via cache.CacheLayout.load_metrics — the
+  0.8585/0.0966 playground pair is retired; E2V2 speaker sim, unit-normalized)
 - r_wer = 1 − CER_qwen3asr                          (normalize() + edit-distance CER)
 - r_mos = max(0, 2.5 − mos_utmosv2fold0)            (hinge 护栏, 线性地板: 只挡不驱动)
 - Every term 熄火 (zeroed) when its within-group std drops below its
@@ -37,7 +39,7 @@ import torch
 class RewardConfig:
     # sv_center/sv_scale are REQUIRED — no defaults (the 0.8585/0.0966
     # playground pair was removed 2026-08-30): calibration MUST come from the
-    # pool's metrics.json via cache.CacheLayout.reward_config; a silent
+    # pool's metrics.json sim stats (cache.CacheLayout.load_metrics); a silent
     # fallback would let a foreign or stale pool look healthy
     sv_center: float
     sv_scale: float
@@ -96,7 +98,8 @@ def reward_v3(
     flameout_eps) is zeroed so it cannot leak a constant offset either.
 
     cfg is REQUIRED: sv_center/sv_scale come from the pool's metrics.json
-    (cache.CacheLayout.reward_config) — there is no default calibration.
+    sim stats (cache.CacheLayout.load_metrics) — there is no default
+    calibration.
 
     Component scales (per take): r_sv ∈ (0,1) sigmoid; r_wer ∈ [0,1];
      r_mos = max(0, τ−mos), linear penalty in MOS units, λ_mos=0.2.

@@ -1,6 +1,6 @@
 """ASR scoring: Qwen3-ASR-1.7B-hf, greedy, batch-8 — verbatim inference path
 from playground/qwen_asr_probe.py (RTFx 52-66, rerun delta 0.000). CER is
-the caller's job (`qwen3_tts_post_training.reward.text.cer`)."""
+the caller's job (`qwen3_tts_post_training.text.cer`)."""
 
 from __future__ import annotations
 

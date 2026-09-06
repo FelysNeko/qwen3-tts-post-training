@@ -219,7 +219,7 @@ def grpo_loss(
             Packed layout (logprob.py): column `t*Q + j` = codebook j of time
             step t — the semantic head lives in columns where t*Q % Q == 0.
         ref_log_probs: [B, T] same, under the reference (adapter off).
-        rewards: [B] composed reward R (see reward.reward_v3), one per sample.
+        rewards: [B] composed reward R (see grpo.reward_v3), one per sample.
         mask: [B, T] 1 on valid code slots, 0 on pad/prompt.
         group_ids: optional [B] group index per sample (default: one group).
         advantage: optional precomputed [B] advantage — skips the internal

@@ -3,10 +3,10 @@
 1. Protocol: the bool wire (asr/utmosv2/p835/sv) round-trips; unrequested
     ScoreResult fields are None while `get_*_unwrap` assert-crashes on them;
     nested ScoreResponse round-trip (req_id + Timing with default stages).
-2. Reward injection: sv_center/sv_scale have NO defaults — bare RewardConfig()
-    raises; a metrics.json holding the OLD playground pair (0.8585/0.0966)
-    bit-exactly reproduces the explicit same pair through reward_v3; a
-    shifted metrics injects its values.
+2. Calibration contract: metrics.json sim stats (mean/std) are the single
+    calibration entry (old playground pair 0.8585/0.0966 round-trips through
+    load_metrics); the sibling centroid npy loads. (Reward-math checks live
+    in probe_regress.py — reward_v3 is trainer/grpo-internal now.)
 3. Offline stages on a synthetic corpus (needs soundfile): Cache corpus
     one-to-one validation + filter, artifact-dir layout, task table bools
     (fresh = all-False, intact = all-True), corpus-layer cascade, corruption
@@ -35,7 +35,6 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "workers/preprocess/src"))
 
 import numpy as np
-import torch
 from pydantic import ValidationError
 
 from qwen3_tts_post_training.paths import repo_root
@@ -50,7 +49,6 @@ from qwen3_tts_post_training.client.protocol import (
     ScoreResult,
     Timing,
 )
-from qwen3_tts_post_training.reward.reward import RewardConfig, reward_v3
 
 PASS = "PASS"
 
@@ -133,22 +131,16 @@ def section_protocol() -> None:
 
 
 # ---------------------------------------------------------------- section 2
-def section_reward_injection(tmp: Path) -> None:
+def section_calibration_contract(tmp: Path) -> None:
     old = {"sim": {"mean": 0.8585, "std": 0.0966}}
     pool = CacheLayout(tmp / "pool")
     pool.cache_namespace_dir.mkdir(parents=True)
     pool.metrics_json.write_text(json.dumps(old))
-    cfg = pool.reward_config()
 
-    try:
-        RewardConfig()
-        check("RewardConfig() without calibration raises", False)
-    except TypeError:
-        check("RewardConfig() without calibration raises", True)
-
+    sim = pool.load_metrics()["sim"]
     check(
-        "old playground pair == explicit construction",
-        cfg.sv_center == 0.8585 and cfg.sv_scale == 0.0966,
+        "old playground pair == metrics extraction",
+        sim["mean"] == 0.8585 and sim["std"] == 0.0966,
     )
 
     np.save(pool.centroid_npy, np.asarray([1.0, 0.0]))
@@ -157,23 +149,14 @@ def section_reward_injection(tmp: Path) -> None:
         np.array_equal(pool.load_centroid(), np.asarray([1.0, 0.0])),
     )
 
-    sim = torch.tensor([0.83, 0.88, 0.86, 0.90])
-    cer = torch.tensor([0.10, 0.02, 0.05, 0.00])
-    mos = torch.tensor([2.4, 3.1, 2.8, 3.0])
-    R1, _bd1 = reward_v3(sim, cer, mos, RewardConfig(sv_center=0.8585, sv_scale=0.0966))
-    R2, _bd2 = reward_v3(sim, cer, mos, cfg)
-    check("reward_v3 bit-equal (file calib vs explicit pair)", torch.equal(R1, R2))
-
     shifted = CacheLayout(tmp / "pool_shifted")
     shifted.cache_namespace_dir.mkdir(parents=True)
     shifted.metrics_json.write_text(json.dumps({"sim": {"mean": 0.80, "std": 0.05}}))
-    cfg3 = shifted.reward_config()
+    sim3 = shifted.load_metrics()["sim"]
     check(
         "non-default injection",
-        cfg3.sv_center == 0.80 and cfg3.sv_scale == 0.05,
+        sim3["mean"] == 0.80 and sim3["std"] == 0.05,
     )
-    R3, _ = reward_v3(sim, cer, mos, cfg3)
-    check("injected config changes reward", not torch.equal(R1, R3))
 
 
 # ---------------------------------------------------------------- section 3
@@ -512,7 +495,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         section_protocol()
-        section_reward_injection(tmp)
+        section_calibration_contract(tmp)
         section_offline_stages(tmp)
     print(PASS)
 
