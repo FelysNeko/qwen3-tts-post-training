@@ -2,11 +2,16 @@
 def — no protocol entry today), vendored 3D-Speaker defs + FBank frontend.
 Matches playground/compare_tts_sv.py exactly (same ckpt args, same 16k
 fbank mean-nor, unit-norm float32 embeddings). Similarity to a reference is
-the CALLER's job — this worker is calibration-free."""
+the CALLER's job — this worker is calibration-free.
+
+First-load ckpt fetch delegates to the ModelScope client (canonical 3D-Speaker
+host — not on HF): `ensure_sv_ckpt` (was scorer/fetch.py, absorbed 2026-09-05)."""
 
 from __future__ import annotations
 
 import importlib
+import logging
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -14,13 +19,13 @@ import torch
 import torchaudio.compliance.kaldi as Kaldi
 import torchaudio.functional as AF
 
-from scorer.fetch import ensure_sv_ckpt
+logger = logging.getLogger(__name__)
 
 TARGET_SR = 16000
 
 MODELS = {
     "eres2netv2": {
-        "obj": "scorer.speakerlab.models.eres2net.ERes2NetV2.ERes2NetV2",
+        "obj": "scorer.vendor.speakerlab.models.eres2net.ERes2NetV2.ERes2NetV2",
         "args": {
             "feat_dim": 80,
             "embedding_size": 192,
@@ -30,10 +35,36 @@ MODELS = {
         },
     },
     "campplus": {
-        "obj": "scorer.speakerlab.models.campplus.DTDNN.CAMPPlus",
+        "obj": "scorer.vendor.speakerlab.models.campplus.DTDNN.CAMPPlus",
         "args": {"feat_dim": 80, "embedding_size": 192},
     },
 }
+
+# model name -> (modelscope model_id, file in repo)
+SV_SOURCES = {
+    "eres2netv2": {
+        "model_id": "iic/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common",
+        "file": "pretrained_eres2netv2w24s4ep4.ckpt",
+    },
+    "campplus": {
+        "model_id": "iic/speech_campplus_sv_zh-cn_16k-common",
+        "file": "campplus_cn_common.bin",
+    },
+}
+
+
+def ensure_sv_ckpt(name: str) -> Path:
+    """Resolve (downloading once via ModelScope if needed) the SV ckpt for
+    `name`. Returns the ModelScope-managed cache path."""
+    from modelscope.hub.file_download import model_file_download
+
+    conf = SV_SOURCES[name]
+    logger.info(f"fetching SV ckpt {name} via ModelScope ({conf['model_id']})")
+    local = model_file_download(
+        model_id=conf["model_id"], file_path=conf["file"], revision="master"
+    )
+    logger.info(f"SV ckpt {name} ready: {local}")
+    return Path(local)
 
 
 class FBank:

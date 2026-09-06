@@ -2,32 +2,31 @@
 
 Determinism contract (validated): np.random.seed(fixed) before each
 repetition loop + sequential in-order item processing (no fork workers).
-Weights are fetched (once, via HF cache) from the official
-sarulab-speech/UTMOSv2 repo by scorer.fetch.ensure_utmos."""
+The fold ckpt path is caller-provided (the wrapper resolves it — this module
+does no I/O beyond reading the given file)."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from scorer.fetch import ensure_utmos
-from scorer.utmos.config import DATASET_MAP, build_cfg
-from scorer.utmos.dataset import GPUSpecBuilder, UTMOSSample, load_audio
-from scorer.utmos.model import SSLMultiSpecExtModelV2
+from scorer.vendor.utmos.config import DATASET_MAP, build_cfg
+from scorer.vendor.utmos.dataset import GPUSpecBuilder, UTMOSSample, load_audio
+from scorer.vendor.utmos.model import SSLMultiSpecExtModelV2
 
 
 class UTMOS:
     def __init__(
         self,
-        fold: int = 0,
-        seed: int = 42,
+        ckpt: str | Path,
         device: str = "cuda:0",
         gpu_mel: bool = True,
     ):
         self.cfg = build_cfg()
         self.device = device
         self.model = SSLMultiSpecExtModelV2(self.cfg)
-        ckpt = ensure_utmos(fold, seed)
         self.model.load_state_dict(torch.load(ckpt, map_location="cpu"))
         self.model.eval().to(device)
         # domain one-hot index: upstream predict() default predict_dataset="sarulab"

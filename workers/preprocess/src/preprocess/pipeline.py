@@ -60,10 +60,10 @@ drifts (e.g. an SV model upgrade) refreshes everyone's sim without any
 scorer round-trip. At ~2k clips that pass is a millisecond matmul —
 incremental aggregates would be complexity with no payoff.
 
-Scoring reuses `client/trainer.Client` (trainer-side bind of PUSH 5555 /
-PULL 5556), so the resident scorer worker is oblivious to this caller. The
-scorer is calibration-free — pass 1 requests {vector}, pass 2 requests
-{transcript, cer, mos}, and the row `sim` is computed locally in `finalize`
+Scoring reuses `client/trainer.Client` (the FastAPI scorer's crash-tolerant
+HTTP client), so the resident scorer worker is oblivious to this caller. The
+scorer is calibration-free — pass 1 requests {embedding}, pass 2 requests
+{transcript, utmosv2}, and the row `sim` is computed locally in `finalize`
 from the raw unit-norm ERes2NetV2 vectors. Validation is fail-loudly: a
 malformed manifest/asset line raises — no silent skips. Manifest↔wav
 mismatches are not fatal: they are recorded in `DropReasons`.
@@ -562,7 +562,7 @@ def collect_corpus_metrics(
                     for row in chunk
                 ],
                 asr=True,
-                mos=True,
+                utmosv2=True,
             )
             for row, result in zip(chunk, results):
                 text_results[row.name] = result
@@ -577,7 +577,7 @@ def collect_corpus_metrics(
                             normalize(entries_by_name[row.name].text),
                             normalize(result.get_transcript_unwrap()),
                         ),
-                        mos=result.get_mos_unwrap(),
+                        mos=result.get_utmosv2_unwrap(),
                     ).model_dump_json(),
                     file=asset_file,
                 )
@@ -635,7 +635,7 @@ def finalize(
                     if result is not None
                     else cached.cer
                 ),
-                mos=result.get_mos_unwrap() if result is not None else cached.mos,
+                mos=result.get_utmosv2_unwrap() if result is not None else cached.mos,
                 sim=float(sim),
                 checksum=Checksum.from_disk(config, entry.name),
             )

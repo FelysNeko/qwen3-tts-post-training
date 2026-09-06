@@ -376,7 +376,10 @@ def _rollout_and_submit(
             t_max=t_max,
         )
         rid = scorer.submit(
-            [ScoreItem(wav_path=str(p)) for p in g.wavs], asr=True, mos=True, sv=True
+            [ScoreItem(wav_path=str(p)) for p in g.wavs],
+            asr=True,
+            utmosv2=True,
+            sv=True,
         )
         pending.append((g, rid))
     return pending, time.monotonic() - t0
@@ -425,7 +428,7 @@ def _collect_scores(
                 device=cfg.device,
             )
             g.mos = torch.tensor(
-                [r.get_mos_unwrap() for r in results],
+                [r.get_utmosv2_unwrap() for r in results],
                 dtype=torch.float32,
                 device=cfg.device,
             )

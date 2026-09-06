@@ -12,7 +12,7 @@ import librosa
 import numpy as np
 import torch
 
-from scorer.utmos.config import DATASET_MAP
+from scorer.vendor.utmos.config import DATASET_MAP
 
 
 def load_audio(sr_target: int, file) -> np.ndarray:

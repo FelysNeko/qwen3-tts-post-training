@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import AutoFeatureExtractor, AutoModel
 
-from scorer.utmos.config import DATASET_MAP
+from scorer.vendor.utmos.config import DATASET_MAP
 
 
 class _SSLEncoder(nn.Module):

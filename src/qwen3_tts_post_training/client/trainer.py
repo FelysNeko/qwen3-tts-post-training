@@ -57,10 +57,12 @@ class Client:
         self._http.close()
 
     def _send(
-        self, items: list[ScoreItem], asr: bool, mos: bool, sv: bool
+        self, items: list[ScoreItem], asr: bool, utmosv2: bool, p835: bool, sv: bool
     ) -> int | None:
         """POST /request once; None on transport failure or server 5xx."""
-        payload = ScoreRequest(items=items, asr=asr, mos=mos, sv=sv).model_dump()
+        payload = ScoreRequest(
+            items=items, asr=asr, utmosv2=utmosv2, p835=p835, sv=sv
+        ).model_dump()
         try:
             r = self._http.post(f"{self.url}/request", json=payload)
         except httpx.TransportError:
@@ -73,7 +75,8 @@ class Client:
         self,
         items: list[ScoreItem],
         asr: bool = False,
-        mos: bool = False,
+        utmosv2: bool = False,
+        p835: bool = False,
         sv: bool = False,
     ) -> int:
         """Register a batch and return a local handle (≥1; -1 for empty
@@ -83,7 +86,11 @@ class Client:
             return -1
         with self._lock:
             handle = next(self._next_handle)
-            self._handles[handle] = (items, {"asr": asr, "mos": mos, "sv": sv}, None)
+            self._handles[handle] = (
+                items,
+                {"asr": asr, "utmosv2": utmosv2, "p835": p835, "sv": sv},
+                None,
+            )
         return handle
 
     def poll(self, handle: int) -> list[ScoreResult] | None:
@@ -130,14 +137,15 @@ class Client:
         self,
         items: list[ScoreItem],
         asr: bool = False,
-        mos: bool = False,
+        utmosv2: bool = False,
+        p835: bool = False,
         sv: bool = False,
     ) -> list[ScoreResult]:
         """Blocking convenience: submit + poll until results (infinite
         patience — scorer downtime and restarts are survived transparently)."""
         if not items:
             return []
-        handle = self.submit(items, asr=asr, mos=mos, sv=sv)
+        handle = self.submit(items, asr=asr, utmosv2=utmosv2, p835=p835, sv=sv)
         while (results := self.poll(handle)) is None:
             time.sleep(self.poll_interval)
         return results

@@ -1,8 +1,8 @@
 """Probe: preprocess pipeline (STATUS.md §16) — offline sections.
 
-1. Protocol: `ScoreRequest.fields` is REQUIRED (missing raises); field
-    subsets round-trip; unrequested ScoreResult fields are None while
-    `get_*_unwrap` assert-crashes on them; nested ScoreResponse round-trip.
+1. Protocol: the bool wire (asr/utmosv2/p835/sv) round-trips; unrequested
+    ScoreResult fields are None while `get_*_unwrap` assert-crashes on them;
+    nested ScoreResponse round-trip (req_id + Timing with default stages).
 2. Reward injection: sv_center/sv_scale have NO defaults — bare RewardConfig()
     raises; a metrics.json holding the OLD playground pair (0.8585/0.0966)
     bit-exactly reproduces the explicit same pair through reward_v3; a
@@ -44,7 +44,6 @@ assert repo_root() == REPO
 
 from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import (
-    ScoreField,
     ScoreItem,
     ScoreRequest,
     ScoreResponse,
@@ -67,66 +66,69 @@ def section_protocol() -> None:
         wav_path="/x.wav",
         embedding=[0.1, 0.2],
         transcript="你好",
-        cer=0.0,
-        mos=2.8,
+        utmosv2=2.8,
+        p835=3.1,
     )
     full_rt = ScoreResult.model_validate(full.model_dump(mode="json"))
     check(
         "full round-trip",
-        full_rt.get_embedding_unwrap() == [0.1, 0.2] and full_rt.mos == 2.8,
+        full_rt.get_embedding_unwrap() == [0.1, 0.2]
+        and full_rt.utmosv2 == 2.8
+        and full_rt.get_p835_unwrap() == 3.1,
     )
 
-    partial = ScoreResult(wav_path="/x.wav", cer=0.5)
+    partial = ScoreResult(wav_path="/x.wav")
     check(
         "unrequested fields None",
         partial.embedding is None
         and partial.transcript is None
-        and partial.mos is None,
+        and partial.utmosv2 is None
+        and partial.p835 is None,
     )
-    check("unwrap returns requested value", partial.get_cer_unwrap() == 0.5)
     try:
-        partial.get_embedding_unwrap()
+        partial.get_utmosv2_unwrap()
         check("unwrap on unrequested raises", False)
     except AssertionError:
         check("unwrap on unrequested raises", True)
 
-    # fields is REQUIRED — no implicit score-everything default
-    try:
-        ScoreRequest(id=1, items=[ScoreItem(wav_path="/x.wav", text="t")])
-        check("missing fields raises", False)
-    except ValidationError:
-        check("missing fields raises", True)
-
-    subset = {ScoreField.EMBEDDING, ScoreField.CER}
-    req2 = ScoreRequest(
-        id=1, items=[ScoreItem(wav_path="/x.wav", text="t")], fields=subset
+    # services are per-bool: all-False is valid and scores nothing
+    req = ScoreRequest(items=[ScoreItem(wav_path="/x.wav")])
+    req_rt = ScoreRequest.model_validate(req.model_dump())
+    check(
+        "bool wire round-trip (all False default)",
+        req_rt.model_dump()
+        == {
+            "items": [{"wav_path": "/x.wav"}],
+            "asr": False,
+            "utmosv2": False,
+            "p835": False,
+            "sv": False,
+        },
     )
-    req2_rt = ScoreRequest.model_validate(req2.model_dump())
-    check("fields frozenset round-trip", req2_rt.fields == subset)
-
-    # the wire path is zmq send_json (plain json.dumps) — python-mode dumps
-    # keep the frozenset and crash there; the client must use mode="json"
-    json.dumps(req2.model_dump(mode="json"))
+    json.dumps(req.model_dump(mode="json"))
     check("request wire-serializable (mode=json)", True)
 
-    # nested response round-trip through the scorer -> client hop
+    # nested response round-trip through the scorer -> client hop; Timing
+    # carries the two MOS stages with defaults for unrun services
     resp = ScoreResponse(
-        id=1,
+        req_id=1,
         results=[full, partial],
-        timing=Timing(sv=0.0, asr=0.0, mos=0.0),
+        timing=Timing(sv=0.0, asr=0.0, p835=1.5),
         rss_mb=0,
     )
     resp_rt = ScoreResponse.model_validate(resp.model_dump(mode="json"))
     check(
         "nested response round-trip",
         resp_rt.results[0].get_embedding_unwrap() == [0.1, 0.2]
-        and resp_rt.results[1].cer == 0.5,
+        and resp_rt.results[1].utmosv2 is None
+        and resp_rt.timing.utmosv2 == 0.0
+        and resp_rt.timing.p835 == 1.5,
     )
 
     check(
-        "ScoreField values are result keys",
-        {field.value for field in ScoreField}
-        == set(ScoreResult.model_fields) - {"wav_path"},
+        "ScoreResult fields are exactly the wire domain",
+        set(ScoreResult.model_fields)
+        == {"wav_path", "embedding", "transcript", "utmosv2", "p835"},
     )
 
 
@@ -300,7 +302,9 @@ def section_offline_stages(tmp: Path) -> None:
         (config.layout.enhanced_dir / f"{name}.wav").write_bytes(
             (corpus / f"{name}.wav").read_bytes()
         )
-        np.save(config.layout.codes_dir / f"{name}.npy", np.zeros((3, 16), dtype=np.int32))
+        np.save(
+            config.layout.codes_dir / f"{name}.npy", np.zeros((3, 16), dtype=np.int32)
+        )
         np.save(config.layout.embedding_dir / f"{name}.npy", vector)
         return AssetEntry(
             name=name,
@@ -347,7 +351,8 @@ def section_offline_stages(tmp: Path) -> None:
     removed = prune_foreign(cache, config.layout.embedding_dir, ".npy")
     check(
         "prune removes foreign embeddings",
-        removed == ("ghost",) and not (config.layout.embedding_dir / "ghost.npy").exists(),
+        removed == ("ghost",)
+        and not (config.layout.embedding_dir / "ghost.npy").exists(),
     )
 
     # centroid materialization: recompute + persist on pool change, reuse
@@ -372,7 +377,9 @@ def section_offline_stages(tmp: Path) -> None:
 
     finalize(cache, {}, name_to_norms, centroid, "probe")
     metrics = json.loads(config.layout.metrics_json.read_text(encoding="utf-8"))
-    rows = [json.loads(line) for line in config.layout.asset_jsonl.read_text().splitlines()]
+    rows = [
+        json.loads(line) for line in config.layout.asset_jsonl.read_text().splitlines()
+    ]
     check(
         "finalize recomputes sims (identical when pool unchanged)",
         all(row["sim"] == float(sim) for row, sim in zip(rows, hand_sims)),
@@ -458,7 +465,9 @@ def section_offline_stages(tmp: Path) -> None:
         drifted_vectors.astype(np.float64), axis=1, keepdims=True
     )
     drift_sims = drift_norms @ drift_centroid
-    rows = [json.loads(line) for line in config.layout.asset_jsonl.read_text().splitlines()]
+    rows = [
+        json.loads(line) for line in config.layout.asset_jsonl.read_text().splitlines()
+    ]
     check(
         "embedding drift refreshes every sim (text facts untouched)",
         np.allclose([row["sim"] for row in rows], drift_sims, atol=1e-12)

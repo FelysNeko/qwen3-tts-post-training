@@ -97,7 +97,11 @@ class Scoreboard:
             rid, req = self._q.get()
             try:
                 results, timing = score_fn(
-                    req.items, asr=req.asr, mos=req.mos, sv=req.sv
+                    req.items,
+                    asr=req.asr,
+                    utmosv2=req.utmosv2,
+                    p835=req.p835,
+                    sv=req.sv,
                 )
                 error = None
             except Exception as e:
@@ -126,7 +130,9 @@ class Scoreboard:
         ).start()
 
 
-def create_app(score_fn: Callable, start_thread: bool = True) -> tuple[FastAPI, Scoreboard]:
+def create_app(
+    score_fn: Callable, start_thread: bool = True
+) -> tuple[FastAPI, Scoreboard]:
     """Build the app around a `score_fn(items, asr, mos, sv) ->
     (results, timing)`. Returns the board too, so probes can drive it
     directly (start_thread=False) instead of loading real models."""
@@ -167,14 +173,20 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--asr-model", default="Qwen/Qwen3-ASR-1.7B-hf")
     parser.add_argument("--asr-batch", type=int, default=8)
-    parser.add_argument("--mos-fold", type=int, default=0)
-    parser.add_argument("--mos-seed", type=int, default=42)
-    parser.add_argument("--mos-reps", type=int, default=8)
+    parser.add_argument("--utmosv2-fold", type=int, default=0)
+    parser.add_argument("--utmosv2-seed", type=int, default=42)
+    parser.add_argument("--utmosv2-reps", type=int, default=8)
     parser.add_argument(
         "--gpu-mel",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="build UTMOS mel spectrograms on GPU (default on; ~20x faster, MOS within ~0.03 of the librosa path)",
+        help="build UTMOSv2 mel spectrograms on GPU (default on; ~20x faster, MOS within ~0.03 of the librosa path)",
+    )
+    parser.add_argument(
+        "--p835-workers",
+        type=int,
+        default=4,
+        help="P.835 clip-level scoring concurrency (default 4; native paths release the GIL so threads scale — measured ~0.76→0.41s/clip at 4 workers, sublinear past that due to self-tiled multi-hop onnx passes + spinning-thread contention)",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

@@ -1,10 +1,10 @@
 """w100 四臂打分(双 scorer 条目半切,方案 B)。
 
 用法:python w100_score.py <half>
-    half 0: bind 5555/5556,偶数全局组;half 1: bind 5557/5558,奇数全局组。
-    同句恒定同进程 → MOS 进程偏移在臂间差分中相消。
+    half 0: HTTP 8000,偶数全局组;half 1: HTTP 8001,奇数全局组。
+    同句恒定同进程 → UTMOSv2 进程偏移在臂间差分中相消(p835 确定性,无此约束)。
 报告:runs/hp17b_w100_{arm}_eval/report_h{0|1}.json,组键 {voice}/{cat}_{pi:02d},
-    take 行 {dur, mos, cer, sim:{voice:..}} —— 与 w50 报告同构,分析脚本直接复用。
+    take 行 {dur, utmosv2, p835, cer, sim:{voice:..}} —— 与 w50 报告同构,分析脚本直接复用。
 断点续:启动时读已有 report,组键齐全即跳过;每组完成即 flush。
 """
 
@@ -84,7 +84,11 @@ for gi, (arm, voice, cat, pi, text) in enumerate(GROUPS):
         continue
     wavs = [eval_dir(arm) / f"{voice}/{cat}_{pi:02d}_{k}.wav" for k in range(4)]
     results = client.score(
-        [ScoreItem(wav_path=str(w)) for w in wavs], asr=True, mos=True, sv=True
+        [ScoreItem(wav_path=str(w)) for w in wavs],
+        asr=True,
+        utmosv2=True,
+        p835=True,
+        sv=True,
     )
     rows = []
     for w, r in zip(wavs, results):
@@ -92,7 +96,8 @@ for gi, (arm, voice, cat, pi, text) in enumerate(GROUPS):
         rows.append(
             {
                 "dur": sf.info(w).duration,
-                "mos": r.get_mos_unwrap(),
+                "utmosv2": r.get_utmosv2_unwrap(),
+                "p835": r.get_p835_unwrap(),
                 "cer": cer(normalize(text), normalize(r.get_transcript_unwrap())),
                 "sim": {v: float(s) for v, s in zip(VOICES, emb @ CENT.T)},
             }

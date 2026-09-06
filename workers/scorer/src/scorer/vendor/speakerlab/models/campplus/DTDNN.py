@@ -7,7 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from scorer.speakerlab.models.campplus.layers import (
+from scorer.vendor.speakerlab.models.campplus.layers import (
     DenseLayer,
     StatsPool,
     TDNNLayer,

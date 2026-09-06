@@ -8,7 +8,7 @@ the caller derives similarities against its own centroid
 (`reward.text.cer`). Validated with pydantic — no manual json building.
 
 Wire (async request/lookup, crash-tolerant by construction):
-- POST /request  {items, asr, mos, sv} -> {req_id}   (queued server-side)
+- POST /request  {items, asr, utmosv2, p835, sv} -> {req_id}   (queued server-side)
 - POST /lookup   {req_id} -> 200 ready (CONSUMED, once) / 202 in flight /
   404 unknown id (never existed, already consumed, or scorer restarted) /
   500 scored-with-error (consumed; all-None results + `error` text)
@@ -40,7 +40,8 @@ class ScoreResult(BaseModel):
     wav_path: str
     embedding: list[float] | None = None
     transcript: str | None = None
-    mos: float | None = None
+    utmosv2: float | None = None
+    p835: float | None = None
 
     def get_embedding_unwrap(self) -> list[float]:
         embedding = self.embedding
@@ -52,20 +53,27 @@ class ScoreResult(BaseModel):
         assert transcript is not None, "transcript was not requested from the scorer"
         return transcript
 
-    def get_mos_unwrap(self) -> float:
-        mos = self.mos
-        assert mos is not None, "mos was not requested from the scorer"
-        return mos
+    def get_utmosv2_unwrap(self) -> float:
+        utmosv2 = self.utmosv2
+        assert utmosv2 is not None, "utmosv2 was not requested from the scorer"
+        return utmosv2
+
+    def get_p835_unwrap(self) -> float:
+        p835 = self.p835
+        assert p835 is not None, "p835 was not requested from the scorer"
+        return p835
 
 
 class ScoreRequest(BaseModel):
     """POST /request body: what to score and which services to run (a
     service left False is simply not run — an all-False request scores
-    nothing and returns all-None results)."""
+    nothing and returns all-None results). `utmosv2` is the UTMOSv2 MOS,
+    `p835` the P.835 DNSMOS calibrated OVRL — independent stages."""
 
     items: list[ScoreItem]
     asr: bool = False
-    mos: bool = False
+    utmosv2: bool = False
+    p835: bool = False
     sv: bool = False
 
 
@@ -78,7 +86,8 @@ class LookupRequest(BaseModel):
 class Timing(BaseModel):
     sv: float
     asr: float
-    mos: float
+    utmosv2: float = 0.0
+    p835: float = 0.0
 
 
 class ScoreResponse(BaseModel):

@@ -41,7 +41,6 @@ dev = [
 # and format (`lint.per-file-ignores` alone does NOT protect against
 # `ruff format`)
 extend-exclude = [
-    "workers/scorer/src/scorer/speakerlab",
-    "workers/scorer/src/scorer/utmos",
+    "workers/scorer/src/scorer/vendor",
     "workers/preprocess/src/preprocess/clearvoice",
 ]
