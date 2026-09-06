@@ -29,7 +29,10 @@ CATS_FILTER = (
 )
 TAG = sys.argv[sys.argv.index("--tag") + 1] if "--tag" in sys.argv else ""
 
-with open(ROOT / "probes/tmp/general.json") as f:
+GENERAL = ROOT / "archive/general.json"
+if not GENERAL.exists():
+    GENERAL = ROOT / "probes/tmp/general.json"
+with open(GENERAL) as f:
     CATS = json.load(f)
 BUDGET = {c: (1024 if c == "long" else 384) for c in CATS}
 VOICES = ["cyrene", "castorice", "aglaea", "hyacine", "cipher", "hysilens", "cerydra"]

@@ -1,7 +1,7 @@
-"""w100 四臂打分(双 scorer 条目半切,方案 B)。
+"""w100 打分(双 scorer 条目半切,方案 B;单 scorer 单臂时用 "all" 全量)。
 
-用法:python w100_score.py <half>
-    half 0: HTTP 8000,偶数全局组;half 1: HTTP 8001,奇数全局组。
+用法:python w100_score.py <half|all>
+    0: HTTP 8000,偶数全局组;1: HTTP 8001,奇数全局组;all: HTTP 8000,全量。
     同句恒定同进程 → UTMOSv2 进程偏移在臂间差分中相消(p835 确定性,无此约束)。
 报告:runs/hp17b_w100_{arm}_eval/report_h{0|1}.json,组键 {voice}/{cat}_{pi:02d},
     take 行 {dur, utmosv2, p835, cer, sim:{voice:..}} —— 与 w50 报告同构,分析脚本直接复用。
@@ -18,8 +18,10 @@ import soundfile as sf
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-HALF = int(sys.argv[1])
-URL = f"http://127.0.0.1:{8000 if HALF == 0 else 8001}"
+HALF_ARG = sys.argv[1] if len(sys.argv) > 1 else "all"
+URL = f"http://127.0.0.1:{8000 if HALF_ARG != "1" else 8001}"
+SKIP = int(HALF_ARG) if HALF_ARG in ("0", "1") else None
+TAG = "0" if HALF_ARG == "all" else HALF_ARG
 
 from qwen3_tts_post_training.cache import CacheLayout
 from qwen3_tts_post_training.client.protocol import ScoreItem
@@ -27,11 +29,13 @@ from qwen3_tts_post_training.client.trainer import Client
 from qwen3_tts_post_training.text import cer, normalize
 
 ARMS = [
-    "d_ep1=runs/d_ep1",
-    "off=runs/sft_official/export",
+    "d_ep1=runs/1788731625/export",
 ]
 VOICES = ["cyrene", "castorice", "aglaea", "hyacine", "cipher", "hysilens", "cerydra"]
-with open(ROOT / "probes/tmp/general.json") as f:
+GENERAL = ROOT / "archive/general.json"
+if not GENERAL.exists():
+    GENERAL = ROOT / "probes/tmp/general.json"
+with open(GENERAL) as f:
     CATS = json.load(f)
 PROMPTS = [(c, i, t) for c, items in CATS.items() for i, t in enumerate(items)]
 
@@ -63,7 +67,7 @@ GROUPS = [
 
 REPORTS = {arm: {} for arm in ARMS}
 for arm in ARMS:
-    p = eval_dir(arm) / f"report_h{HALF}.json"
+    p = eval_dir(arm) / f"report_h{TAG}.json"
     if p.exists():
         with open(p) as f:
             REPORTS[arm] = json.load(f)["groups"]
@@ -71,13 +75,13 @@ for arm in ARMS:
 
 def flush() -> None:
     for arm in ARMS:
-        p = eval_dir(arm) / f"report_h{HALF}.json"
+        p = eval_dir(arm) / f"report_h{TAG}.json"
         p.write_text(json.dumps({"groups": REPORTS[arm]}, ensure_ascii=False))
 
 
 client = Client(url=URL, poll_interval=2.0)
 for gi, (arm, voice, cat, pi, text) in enumerate(GROUPS):
-    if gi % 2 != HALF:
+    if SKIP is not None and gi % 2 != SKIP:
         continue
     key = f"{voice}/{cat}_{pi:02d}"
     if key in REPORTS[arm]:
@@ -104,6 +108,6 @@ for gi, (arm, voice, cat, pi, text) in enumerate(GROUPS):
         )
     REPORTS[arm][key] = rows
     flush()
-    print(f"h{HALF} {arm}/{key} done", flush=True)
+    print(f"h{TAG} {arm}/{key} done", flush=True)
 
-print(f"SCORE_H{HALF}_DONE", flush=True)
+print(f"SCORE_H{TAG}_DONE", flush=True)

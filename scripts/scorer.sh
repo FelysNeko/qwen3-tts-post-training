@@ -1,0 +1,11 @@
+setsid workers/scorer/.venv/bin/python workers/scorer/main.py \
+  --device cuda:0 \
+  --asr-model Qwen/Qwen3-ASR-1.7B-hf \
+  --asr-batch 8 \
+  --utmosv2-fold 0 \
+  --utmosv2-seed 42 \
+  --utmosv2-reps 8 \
+  --gpu-mel \
+  --p835-workers 4 \
+  --host 127.0.0.1 \
+  --port 8000 \
