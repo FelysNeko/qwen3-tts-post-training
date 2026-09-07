@@ -94,7 +94,7 @@ def main() -> None:
     grpo.add_argument(
         "--sampler-impl", default=None, choices=["hf", "fast", "compiled", "graphed"]
     )
-    grpo.add_argument("--variant", default=None, choices=["vanilla", "dr", "gspo"])
+    grpo.add_argument("--variant", default=None, choices=["fish", "dr", "gspo"])
     grpo.add_argument("--kl-beta", type=float, default=None)
     grpo.add_argument("--logprob-micro", type=int, default=None)
     grpo.add_argument(

@@ -1,12 +1,24 @@
 """GRPO family training losses — pure torch, no model, switchable variants.
 
-The three algorithms (design truth source: MD §七 + §4.3 of Fish S2 report,
+The four algorithms (design truth source: MD §七 + §4.3 of Fish S2 report,
 arXiv:2603.08823):
 
+- "fish"     A = R − mean; PLAIN policy gradient A·log π_θ + β·KL — no
+             importance ratio, no clip (Fish S2 §4.3 Eq. 6). Legal ONLY in
+             single-pass training (one optimizer update per rollout batch:
+             the true IS ratio π_θ/π_old is identically 1 during the update,
+             so there is nothing to correct). DEFAULT. With no ref-anchored
+             clip gate, the only brakes are β·KL, grad clip and LR warmup.
 - "vanilla"  A = (R − mean) / (std + eps); per-token clipped ratio loss.
-             DeepSeekMath / FlowTTS-GRPO.
+             DeepSeekMath / FlowTTS-GRPO. LEGACY — needs a std-normalized
+             advantage the pipelined rollout never computes (it pins
+             A = R − mean), so it is unreachable from the trainer loop and
+             kept only for direct grpo_loss users.
 - "dr"       A = R − mean  (NO std division — low-variance groups don't get
              amplified); same per-token clipped ratio loss. Fish S2 / MD §7.
+             The clip anchors at the FROZEN REF (log π_θ − log π_ref), so in
+             single-pass it is a per-token drift gate against the SFT base,
+             not an IS correction.
 - "gspo"     No per-token clip; sequence-level IS ratio
              ρ_seq = Π_t ρ_t = exp(Σ_t log-ratio_t) weights the advantage
              (Qwen3-TTS official route, arXiv:2601.15621).
@@ -14,7 +26,7 @@ arXiv:2603.08823):
 DAPO Clip-Higher is layered on the clipped variants (GLM validated): decoupled
 ε_low/ε_high with ε_high > ε_low. KL via the Schulman estimator
 kl_t = ρ_t − 1 − log ρ_t (per token, non-negative, ≈ x²/2 + x³/6 for small
-log-ratio x).
+log-ratio x) — fish keeps this term (the +β·D_KL of Fish S2 Eq. 6).
 
 Group resampling criterion uses SV/WER variance ONLY (MOS excluded — GLM EMO
 lesson: a bimodal r_mos makes "all-1" groups look zero-variance while being
@@ -28,6 +40,7 @@ from typing import NamedTuple
 
 import torch
 
+ADV_FISH = "fish"
 ADV_VANILLA = "vanilla"
 ADV_DR = "dr"
 VARIANT_GSPO = "gspo"
@@ -35,7 +48,7 @@ VARIANT_GSPO = "gspo"
 
 @dataclass
 class GRPOConfig:
-    variant: str = ADV_DR  # "vanilla" | "dr" | "gspo"
+    variant: str = ADV_FISH  # "fish" (default) | "dr" | "gspo" | "vanilla" (legacy)
     dapo_clip: bool = True  # decoupled ε_low/ε_high (clip-higher)
     eps_low: float = 0.2
     eps_high: float = 0.3
@@ -202,6 +215,23 @@ def _gspo_loss(
     }
 
 
+def _fish_loss(
+    log_probs: torch.Tensor,
+    advantage: torch.Tensor,
+    mask: torch.Tensor,
+    cfg: GRPOConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Fish S2 §4.3 Eq. 6 policy term: −A·log π_θ (masked, column-weighted
+    mean) — no importance ratio, no clip. The ref log-probs are NOT part of
+    the policy term (the true IS ratio is identically 1 in single-pass);
+    the KL term in `grpo_loss` still uses them (the +β·D_KL of Eq. 6)."""
+    col_w = column_weights(mask, cfg)
+    w = mask * col_w
+    adv = advantage.unsqueeze(-1)
+    loss = -(adv * log_probs * w).sum() / w.sum().clamp_min(1e-12)
+    return loss, {"weight_mass": w.sum()}
+
+
 def grpo_loss(
     log_probs: torch.Tensor,
     ref_log_probs: torch.Tensor,
@@ -248,6 +278,8 @@ def grpo_loss(
 
     if cfg.variant == VARIANT_GSPO:
         policy_loss, info = _gspo_loss(log_probs, ref_log_probs, A, mask, cfg)
+    elif cfg.variant == ADV_FISH:
+        policy_loss, info = _fish_loss(log_probs, A, mask, cfg)
     elif cfg.variant in (ADV_DR, ADV_VANILLA):
         policy_loss, info = _clipped_loss(log_probs, ref_log_probs, A, mask, cfg)
     else:
