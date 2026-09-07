@@ -54,11 +54,13 @@ def export_dir(arm: str) -> Path:
         return ROOT / d
     return ROOT / f"runs/hp17b_w100_{arm}/export"
 
+
 def eval_root(arm: str) -> Path:
     name = arm.split("=", 1)[0]
     if "=" in arm:
         return ROOT / f"runs/{name}_eval"
     return ROOT / f"runs/hp17b_w100_{name}_eval"
+
 
 for arm in ARMS:
     out_root = eval_root(arm)

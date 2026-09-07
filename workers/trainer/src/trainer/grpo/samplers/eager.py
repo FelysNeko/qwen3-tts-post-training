@@ -98,9 +98,7 @@ class EagerSampler(Sampler):
             )
         )
         spk_e = self.codec_emb(
-            torch.tensor(
-                [[tc.spk_id[speaker.lower()]]], device=dev, dtype=dtype_ids
-            )
+            torch.tensor([[tc.spk_id[speaker.lower()]]], device=dev, dtype=dtype_ids)
         )
         pre1 = self.codec_emb(
             torch.tensor(

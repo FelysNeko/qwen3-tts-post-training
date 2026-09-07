@@ -19,7 +19,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 HALF_ARG = sys.argv[1] if len(sys.argv) > 1 else "all"
-URL = f"http://127.0.0.1:{8000 if HALF_ARG != "1" else 8001}"
+URL = f"http://127.0.0.1:{8000 if HALF_ARG != '1' else 8001}"
 SKIP = int(HALF_ARG) if HALF_ARG in ("0", "1") else None
 TAG = "0" if HALF_ARG == "all" else HALF_ARG
 

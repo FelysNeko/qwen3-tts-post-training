@@ -470,9 +470,7 @@ def _score_groups(
             cer=g.cer,
             sim=g.sim,
         )
-        g.R, g.bd = reward_v3(
-            g.sim, g.cer, g.mos, reward_cfgs[g.speaker], p835=g.p835
-        )
+        g.R, g.bd = reward_v3(g.sim, g.cer, g.mos, reward_cfgs[g.speaker], p835=g.p835)
         trainable.append(g)
     return trainable
 

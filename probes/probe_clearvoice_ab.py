@@ -72,11 +72,15 @@ def main() -> None:
     if not (target / "last_best_checkpoint").is_file():
         from huggingface_hub import snapshot_download
 
-        snapshot_download(repo_id="alibabasglab/MossFormer2_SE_48K", local_dir=str(target))
+        snapshot_download(
+            repo_id="alibabasglab/MossFormer2_SE_48K", local_dir=str(target)
+        )
     cwd = os.getcwd()
     os.chdir(pip_root)
     try:
-        pip_cv = ClearVoice(task="speech_enhancement", model_names=["MossFormer2_SE_48K"])
+        pip_cv = ClearVoice(
+            task="speech_enhancement", model_names=["MossFormer2_SE_48K"]
+        )
         pip_model = pip_cv.models[0]
         pip_model.device = torch.device(DEVICE)
         pip_model.model.to(DEVICE)

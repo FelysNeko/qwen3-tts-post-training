@@ -137,7 +137,9 @@ def main() -> None:
         # allocator segments (§47: micro=4 OOM'd with 1.58G stranded in
         # reserved-but-unallocated under the default allocator)
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        logger.info("env PYTORCH_CUDA_ALLOC_CONF=%s", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
+        logger.info(
+            "env PYTORCH_CUDA_ALLOC_CONF=%s", os.environ["PYTORCH_CUDA_ALLOC_CONF"]
+        )
         cfg = TrainConfig(**overrides)
         _log_config("grpo", cfg)
         run_grpo(cfg)
