@@ -2,10 +2,12 @@
 
 Crash-tolerant by construction, per the async request/lookup wire protocol:
 
-- `submit` NEVER raises on scorer downtime — it hands back a local handle and
-  keeps the payload buffered; the first `poll` on that handle performs the
-  POST /request (retrying each round) once the scorer is reachable. Startup
-  order is therefore irrelevant.
+- `submit` NEVER raises on scorer downtime — it POSTs eagerly on a
+  short-timeout client (a dead scorer costs ~1s per submit, never an
+  exception) and keeps the payload buffered on failure; `poll` retries the
+  send each round until the scorer is reachable. Startup order is therefore
+  irrelevant, and the POST lands *during* the caller's next rollout instead
+  of at the first poll (the rollout∥score overlap lives exactly here).
 - `poll` translates every lookup outcome: 200 → results (handle consumed);
   202 → None (keep waiting); 404 (unknown/already consumed — e.g. the scorer
   restarted) and 500 (scored-with-error) → transparent re-send under a fresh
@@ -38,13 +40,19 @@ logger = logging.getLogger(__name__)
 
 
 class Client:
-    """Handle-based batch client: submit (buffering) + poll (auto-resend)."""
+    """Handle-based batch client: eager submit (short-timeout POST, buffered
+    retry on failure) + poll (auto-resend)."""
 
     def __init__(self, url: str = "http://127.0.0.1:8000", poll_interval: float = 2.0):
         self.url = url.rstrip("/")
         self.poll_interval = poll_interval
         self._http = httpx.Client(
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=30.0)
+        )
+        # submit-time POSTs must never stall the rollout loop: a dead scorer
+        # costs ~1s per submit here, then the poll loop owns the retries.
+        self._submit_http = httpx.Client(
+            timeout=httpx.Timeout(connect=1.0, read=5.0, write=5.0, pool=5.0)
         )
         self._lock = threading.Lock()
         self._handles: dict[
@@ -55,16 +63,24 @@ class Client:
 
     def close(self) -> None:
         self._http.close()
+        self._submit_http.close()
 
     def _send(
-        self, items: list[ScoreItem], asr: bool, utmosv2: bool, p835: bool, sv: bool
+        self,
+        items: list[ScoreItem],
+        asr: bool,
+        utmosv2: bool,
+        p835: bool,
+        sv: bool,
+        http: httpx.Client | None = None,
     ) -> int | None:
         """POST /request once; None on transport failure or server 5xx."""
+        client = http or self._http
         payload = ScoreRequest(
             items=items, asr=asr, utmosv2=utmosv2, p835=p835, sv=sv
         ).model_dump()
         try:
-            r = self._http.post(f"{self.url}/request", json=payload)
+            r = client.post(f"{self.url}/request", json=payload)
         except httpx.TransportError:
             return None
         if r.status_code != 200:
@@ -79,9 +95,11 @@ class Client:
         p835: bool = False,
         sv: bool = False,
     ) -> int:
-        """Register a batch and return a local handle (≥1; -1 for empty
-        items). Never raises on scorer downtime — the POST happens on the
-        first poll instead."""
+        """Register a batch, POST it eagerly, and return a local handle
+        (≥1; -1 for empty items). Never raises on scorer downtime — the
+        eager send runs on the short-timeout client (~1s worst case) and,
+        on failure, the payload stays buffered for the poll loop to retry
+        under its regular timeouts."""
         if not items:
             return -1
         with self._lock:
@@ -91,6 +109,22 @@ class Client:
                 {"asr": asr, "utmosv2": utmosv2, "p835": p835, "sv": sv},
                 None,
             )
+        rid = self._send(
+            items,
+            asr=asr,
+            utmosv2=utmosv2,
+            p835=p835,
+            sv=sv,
+            http=self._submit_http,
+        )
+        if rid is not None:
+            with self._lock:
+                if handle in self._handles:
+                    self._handles[handle] = (
+                        items,
+                        {"asr": asr, "utmosv2": utmosv2, "p835": p835, "sv": sv},
+                        rid,
+                    )
         return handle
 
     def poll(self, handle: int) -> list[ScoreResult] | None:
