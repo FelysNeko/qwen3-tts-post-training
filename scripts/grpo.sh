@@ -19,19 +19,19 @@ setsid workers/trainer/.venv/bin/python workers/trainer/main.py grpo \
   --group-size 8 \
   --num-steps 400 \
   --seed 0 \
-  --token-budget 1024 \
-  --token-budget-infer 1024 \
+  --token-budget 896 \
+  --token-budget-infer 896 \
   --temperature 0.9 \
   --top-k 50 \
   --sampler-impl graphed \
-  --variant dr \
+  --variant fish \
   --kl-beta 0.001 \
-  --logprob-micro 0 \
-  --lr 1e-5 \
+  --logprob-micro 2 \
+  --lr 1e-6 \
   --warmup-steps 20 \
   --weight-decay 0.01 \
   --grad-clip 1.0 \
-  --lam-mos 0.2 \
+  --lam-mos 0.0 \
   --lam-p835 0.0 \
   --mos-role floor \
   --scorer-url http://127.0.0.1:8000 \
@@ -42,9 +42,13 @@ setsid workers/trainer/.venv/bin/python workers/trainer/main.py grpo \
 echo "setsid pid $! @ $dir"
 
 # ---- four-arm MOS-ablation differentials (edit the flags above) ----
-# arm 2 (P835 driver): --num-steps 400 --lr 1e-5 --ckpt-every 2 --lam-mos 0 --lam-p835 0.4 --out-dir runs/grpo_arm2_p835
-# arm 1 (no MOS):      --num-steps 400 --lr 1e-5 --ckpt-every 2 --lam-mos 0 --lam-p835 0 --out-dir runs/grpo_arm1_nomos
-# arm 3 (raw UTMOS):   --num-steps 400 --lr 1e-5 --ckpt-every 2 --lam-mos 0.2 --mos-role raw --out-dir runs/grpo_arm3_rawmos
-# arm 4 (defaults):    --num-steps 400 --lr 1e-5 --ckpt-every 2 --out-dir runs/grpo_arm4_default
+# baseline (dr, DONE): this exact config with --variant dr —
+#   arm 1 vs it isolates the loss form (fish vs dr, same reward/seed/lr)
+# all arms: lr/warmup/clip stay at baseline values (1e-6/20/1.0) — arms
+#   differ ONLY in reward composition
+# arm 2 (P835 driver): --lam-mos 0 --lam-p835 0.4
+# arm 1 (no MOS):      --lam-mos 0 --lam-p835 0     (fish twin of the dr baseline)
+# arm 3 (raw UTMOS):   --lam-mos 0.2 --mos-role raw
+# arm 4 (defaults):    (no reward-flag edits)
 # run order: 2 -> 1 -> 4 -> 3 (serial)
 # single-GPU server: --device cuda:0 (shares the card with the scorer, ~21G/24G; dual-GPU keeps cuda:1)
