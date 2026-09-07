@@ -439,7 +439,7 @@ def _build_monitor(
         "mos_dead_frac": round(
             torch.stack(
                 [
-                    (b.std_mos < reward_cfgs[g.speaker].mos_flameout_eps).float()
+                    (b.std_mos < reward_cfgs[g.prompt.speaker].mos_flameout_eps).float()
                     for b, (_, _, g) in zip(bds, trained)
                 ]
             )
@@ -450,7 +450,7 @@ def _build_monitor(
         "p835_dead_frac": round(
             torch.stack(
                 [
-                    (b.std_p835 < reward_cfgs[g.speaker].p835_flameout_eps).float()
+                    (b.std_p835 < reward_cfgs[g.prompt.speaker].p835_flameout_eps).float()
                     for b, (_, _, g) in zip(bds, trained)
                 ]
             )
